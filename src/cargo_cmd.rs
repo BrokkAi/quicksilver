@@ -317,15 +317,18 @@ pub fn nextest_available() -> bool {
 }
 
 pub fn write_nextest_config(index: &Path) -> Result<PathBuf> {
-    let path = index.join("nextest.toml");
-    let body = r#"
-[profile.quicksilver]
-slow-timeout = { period = "120s", terminate-after = 2 }
-fail-fast = false
+    write_nextest_config_junit(index, None)
+}
 
-[profile.quicksilver.junit]
-path = "junit.xml"
-"#;
+pub fn write_nextest_config_junit(index: &Path, junit: Option<&Path>) -> Result<PathBuf> {
+    let path = index.join("nextest.toml");
+    let junit_path = match junit {
+        Some(p) => p.display().to_string(),
+        None => "junit.xml".into(),
+    };
+    let body = format!(
+        "\n[profile.quicksilver]\nslow-timeout = {{ period = \"120s\", terminate-after = 2 }}\nfail-fast = false\n\n[profile.quicksilver.junit]\npath = \"{junit_path}\"\n"
+    );
     crate::util::write_atomic(&path, body.trim_start())?;
     Ok(path)
 }

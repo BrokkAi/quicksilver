@@ -1,6 +1,6 @@
 use crate::cargo_cmd::{
     apply_build_env, apply_package_select, cargo_profile_args, covering_seeds, load_metadata,
-    package_dir_rel, package_select, relative_to_target, reverse_dependents, write_nextest_config,
+    package_dir_rel, package_select, relative_to_target, reverse_dependents,
 };
 use crate::config::Config;
 use crate::exec::process::{WaitResult, run_command_timeout};
@@ -342,8 +342,31 @@ fn run_union_coverage(
     let _ = fs::remove_dir_all(&prof_root);
     fs::create_dir_all(&prof_root)?;
     let pattern = prof_root.join("%p_%m.profraw");
-    let config_path = write_nextest_config(&paths.index)?;
+    let junit = paths.index.join("stage-a-junit.xml");
+    let _ = fs::remove_file(&junit);
+    let config_path = crate::cargo_cmd::write_nextest_config_junit(&paths.index, Some(&junit))?;
     let meta = load_metadata(&paths.baseline)?;
+    let llvm_profdata = find_llvm_tool("llvm-profdata")?;
+    let llvm_cov = find_llvm_tool("llvm-cov")?;
+    let merged = paths.index.join("union.profdata");
+    let _ = fs::remove_file(&merged);
+
+    // Drain profraw into a running merge so 12k instrumented tests cannot
+    // fill the scratch filesystem (last run: 189G then ENOSPC).
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let drain = {
+        let stop = Arc::clone(&stop);
+        let prof_root = prof_root.clone();
+        let merged = merged.clone();
+        let llvm_profdata = llvm_profdata.clone();
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = drain_profraw(&prof_root, &merged, &llvm_profdata, Duration::from_secs(3));
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            let _ = drain_profraw(&prof_root, &merged, &llvm_profdata, Duration::ZERO);
+        })
+    };
 
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
@@ -357,35 +380,22 @@ fn run_union_coverage(
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     let status = cmd.status().context("stage A cargo nextest run")?;
-    let junit = paths
-        .baseline_cov
-        .join("nextest")
-        .join("quicksilver")
-        .join("junit.xml");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = drain.join();
+    let junit = if junit.is_file() {
+        junit
+    } else {
+        paths
+            .baseline_cov
+            .join("nextest")
+            .join("quicksilver")
+            .join("junit.xml")
+    };
     check_stage_a_pass_count(tests, baseline, &junit, status.success())?;
 
-    let mut raws = Vec::new();
-    if let Ok(rd) = fs::read_dir(&prof_root) {
-        for e in rd.flatten() {
-            if e.file_name().to_string_lossy().ends_with(".profraw") {
-                raws.push(e.path());
-            }
-        }
-    }
-    if raws.is_empty() {
+    if !merged.is_file() {
         let _ = fs::remove_dir_all(&prof_root);
-        bail!("stage A produced no profraw");
-    }
-
-    let llvm_profdata = find_llvm_tool("llvm-profdata")?;
-    let llvm_cov = find_llvm_tool("llvm-cov")?;
-    let merged = paths.index.join("union.profdata");
-    let mut merge = Command::new(&llvm_profdata);
-    merge.arg("merge").arg("--sparse").arg("-o").arg(&merged);
-    merge.args(&raws);
-    let st = merge.status().context("stage A llvm-profdata merge")?;
-    if !st.success() {
-        bail!("stage A llvm-profdata merge failed");
+        bail!("stage A produced no merged profdata");
     }
 
     let ws_root = paths
@@ -460,6 +470,62 @@ fn check_stage_a_pass_count(
         );
     }
     Ok(())
+}
+
+fn drain_profraw(
+    prof_root: &Path,
+    acc: &Path,
+    llvm_profdata: &Path,
+    min_age: Duration,
+) -> Result<usize> {
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(min_age)
+        .unwrap_or(std::time::UNIX_EPOCH);
+    let mut raws = Vec::new();
+    if let Ok(rd) = fs::read_dir(prof_root) {
+        for e in rd.flatten() {
+            let path = e.path();
+            if !path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".profraw"))
+            {
+                continue;
+            }
+            let Ok(meta) = e.metadata() else { continue };
+            let fresh = meta
+                .modified()
+                .ok()
+                .is_some_and(|m| min_age > Duration::ZERO && m > cutoff);
+            if fresh {
+                continue;
+            }
+            raws.push(path);
+            if raws.len() >= 128 {
+                break;
+            }
+        }
+    }
+    if raws.is_empty() {
+        return Ok(0);
+    }
+    let tmp = acc.with_extension("tmp");
+    let mut merge = Command::new(llvm_profdata);
+    merge.arg("merge").arg("--sparse").arg("-o").arg(&tmp);
+    if acc.is_file() {
+        merge.arg(acc);
+    }
+    merge.args(&raws);
+    let st = merge.status().context("incremental llvm-profdata merge")?;
+    if !st.success() {
+        let _ = fs::remove_file(&tmp);
+        bail!("incremental llvm-profdata merge failed");
+    }
+    fs::rename(&tmp, acc)?;
+    for r in &raws {
+        let _ = fs::remove_file(r);
+    }
+    Ok(raws.len())
 }
 
 fn unique_binaries(tests: &[TestInfo], target_dir: &Path) -> Vec<PathBuf> {
