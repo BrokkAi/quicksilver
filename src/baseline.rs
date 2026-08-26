@@ -57,9 +57,6 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         let start = Instant::now();
         let status = cmd.status().context("cargo nextest run")?;
         last_secs = start.elapsed().as_secs_f64();
-        if !status.success() {
-            bail!("red baseline: cargo nextest run failed. Mutation results are meaningless against a failing suite.");
-        }
         let junit = paths
             .baseline
             .join("target")
@@ -72,7 +69,38 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
             paths.index.join("junit.xml")
         };
         if junit.is_file() {
-            last_tests = parse_junit(&fs::read_to_string(&junit)?, &meta)?;
+            let xml = fs::read_to_string(&junit)?;
+            last_tests = parse_junit(&xml, &meta)?;
+            let seeds = crate::cargo_cmd::covering_seeds(cfg);
+            let failed = junit_failures(&xml);
+            let seed_fails: Vec<_> = failed
+                .iter()
+                .filter(|(pkg, _)| seeds.is_empty() || seeds.iter().any(|s| s == pkg))
+                .cloned()
+                .collect();
+            if !seed_fails.is_empty() {
+                bail!(
+                    "red baseline: {} failing tests in {:?}: {} … Mutation results are meaningless against a failing suite.",
+                    seed_fails.len(),
+                    seeds,
+                    seed_fails
+                        .iter()
+                        .take(5)
+                        .map(|(_, n)| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            if !failed.is_empty() {
+                tracing::warn!(
+                    "{} reverse-dep tests failed (not in {:?}); keeping timings. first: {}",
+                    failed.len(),
+                    seeds,
+                    failed[0].1
+                );
+            }
+        } else if !status.success() {
+            bail!("red baseline: cargo nextest run failed and produced no junit.xml");
         }
     }
     let json = serde_json::to_vec_pretty(&last_tests)?;
@@ -104,6 +132,36 @@ pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<Tes
         });
     }
     Ok(tests)
+}
+
+/// (package, test name) for testcases that contain a failure or error.
+pub fn junit_failures(xml: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(idx) = rest.find("<testcase") {
+        rest = &rest[idx..];
+        let tag_end = rest.find('>').unwrap_or(rest.len());
+        let tag = &rest[..tag_end];
+        let self_close = tag.trim_end().ends_with('/') || rest.as_bytes().get(tag_end.saturating_sub(1)) == Some(&b'/');
+        let name = attr(tag, "name").unwrap_or_default();
+        let classname = attr(tag, "classname").unwrap_or_default();
+        let package = classname
+            .split("::")
+            .next()
+            .unwrap_or(classname.as_str())
+            .to_string();
+        let body = if self_close || rest[tag_end..].starts_with("/>") {
+            ""
+        } else {
+            let close = rest.find("</testcase>").unwrap_or(rest.len());
+            &rest[..close]
+        };
+        if !name.is_empty() && (body.contains("<failure") || body.contains("<error")) {
+            out.push((package, name));
+        }
+        rest = &rest[tag_end.min(rest.len()) + 1..];
+    }
+    out
 }
 
 fn junit_cases(xml: &str) -> Vec<(String, String, f64)> {
@@ -269,6 +327,22 @@ mod tests {
         assert_eq!(tests[2].package, "tiny_a");
         assert_eq!(tests[2].id, "tiny_a::integration::it_works");
         assert_eq!(tests[2].duration_secs, 1.5);
+    }
+
+    #[test]
+    fn junit_failures_reads_nested_failure_and_package() {
+        let xml = r#"
+<testsuite>
+  <testcase name="ok" classname="brokk-bifrost-core" time="0.1"/>
+  <testcase name="large_rust_file_definition_and_hover_stay_interactive" classname="brokk-bifrost::suite_issues" time="9.3">
+    <failure message="took 8s"/>
+  </testcase>
+</testsuite>
+"#;
+        let failed = junit_failures(xml);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].0, "brokk-bifrost");
+        assert!(failed[0].1.contains("large_rust_file"));
     }
 
     fn emptyish_metadata() -> cargo_metadata::Metadata {

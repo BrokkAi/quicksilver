@@ -315,6 +315,7 @@ pub fn write_nextest_config(index: &Path) -> Result<PathBuf> {
     let body = r#"
 [profile.quicksilver]
 slow-timeout = { period = "120s", terminate-after = 2 }
+fail-fast = false
 
 [profile.quicksilver.junit]
 path = "junit.xml"
