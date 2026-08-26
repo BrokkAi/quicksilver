@@ -10,6 +10,7 @@ pub mod index;
 pub mod outcome;
 pub mod plan;
 pub mod report;
+pub mod schema;
 pub mod scratch;
 pub mod types;
 pub mod util;
@@ -39,6 +40,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Index(_) => cmd_index(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
+        cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
     }
 }
 
@@ -78,13 +80,105 @@ fn cmd_index(common: &cli::CommonOpts) -> Result<i32> {
 }
 
 fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
-    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
+    let extras = ConfigExtras {
+        schema: args.schema,
+        schema_max_rounds: args.schema_max_rounds,
+        schema_batch_size: args.schema_batch_size,
+        diff_against: args.diff_against.clone(),
+        identity_sample: args.identity_sample,
+        ..ConfigExtras::default()
+    };
+    let (cfg, _) = engine::config_from_cli(common, extras)?;
     let prepared = engine::prepare(cfg, args.skip_baseline, false)?;
     let _ = engine::maybe_preflight(&prepared)?;
-    let (outcomes, _builds) = engine::run_prepared(&prepared, args.limit, None)?;
+    let (outcomes, _builds) = if prepared.cfg.schema {
+        engine::run_schema(&prepared, args.limit, None)?
+    } else {
+        engine::run_prepared(&prepared, args.limit, None)?
+    };
+    if prepared.cfg.schema {
+        crate::report::print_exhaustive(&outcomes);
+        if let Some(path) = &prepared.cfg.diff_against {
+            let diffs = crate::schema::gate_differential(path, &outcomes)?;
+            if !diffs.is_empty() {
+                eprintln!("differential gate failed: {} disagreements", diffs.len());
+                for d in &diffs {
+                    eprintln!("  {}  {}  v1={:?} v2={:?}", d.mutant_id, d.fqn, d.v1, d.v2);
+                }
+                engine::write_outputs(&prepared.cfg, &outcomes, None)?;
+                return Ok(2);
+            }
+            eprintln!("differential gate: {} v1 verdicts matched", outcomes.len());
+        }
+    }
     engine::write_outputs(&prepared.cfg, &outcomes, None)?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
+}
+
+fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) -> Result<i32> {
+    let extras = ConfigExtras {
+        sample: args.sample,
+        sample_seed: args.sample_seed,
+        resume: false,
+        ..ConfigExtras::default()
+    };
+    let (cfg, _) = engine::config_from_cli(common, extras)?;
+    let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
+    let _ = engine::maybe_preflight(&prepared)?;
+    let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
+    let covered: Vec<_> = sample
+        .iter()
+        .filter(|m| {
+            prepared
+                .index
+                .union_covers(&m.path, m.start_line, m.end_line)
+        })
+        .cloned()
+        .collect();
+    crate::index::stage_b_for_mutants(
+        &prepared.cfg,
+        &prepared.paths,
+        &mut prepared.index,
+        &covered,
+    )?;
+    eprintln!(
+        "audit-selection: {} covered mutants (of {} sampled)",
+        covered.len(),
+        sample.len()
+    );
+    prepared.cfg.resume = false;
+    let (selected, _) = engine::run_prepared(&prepared, 0, Some(&covered))?;
+    let jsonl = prepared.paths.state.join("outcomes.jsonl");
+    if jsonl.is_file() {
+        let _ = std::fs::rename(&jsonl, prepared.paths.state.join("audit-selected.jsonl"));
+    }
+    let full_plan = crate::plan::plan_full_suite(
+        &covered,
+        &prepared.index,
+        &prepared.baseline,
+        prepared.cfg.shard,
+        prepared.cfg.build_jobs,
+    );
+    let cancel = engine::install_ctrlc();
+    let full_exec = crate::exec::execute(
+        &prepared.cfg,
+        &prepared.paths,
+        std::sync::Arc::clone(&prepared.backend),
+        full_plan,
+        cancel,
+        0,
+    )?;
+    let report = crate::report::audit_compare(&selected, &full_exec.outcomes);
+    crate::report::print_audit(&report);
+    if let Some(path) = &prepared.cfg.json {
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
+    }
+    Ok(if report.selected_missed_full_caught > 0 {
+        1
+    } else {
+        0
+    })
 }
 
 fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32> {
@@ -112,7 +206,10 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         &mut prepared.index,
         &covered_sample,
     )?;
-    eprintln!("running sample of {} mutants through the pipeline", sample.len());
+    eprintln!(
+        "running sample of {} mutants through the pipeline",
+        sample.len()
+    );
     let (outcomes, builds) = engine::run_prepared(&prepared, 0, Some(&sample))?;
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
     report.sample_counts.builds = builds as usize;

@@ -2,10 +2,10 @@ use crate::cargo_cmd::{load_metadata, package_for_path};
 use crate::types::Mutant;
 use crate::util::{hex, line_col_to_offset};
 use anyhow::{Context, Result};
-use brokk_bifrost_analysis::diff_analysis::{
-    AnalyzeDiffParams, DiffAnalysisOptions, analyze_diff_at_root,
-};
 use brokk_bifrost_analysis::analyzer::test_paths;
+use brokk_bifrost_analysis::diff_analysis::{
+    analyze_diff_at_root, AnalyzeDiffParams, DiffAnalysisOptions,
+};
 use brokk_bifrost_analysis::{
     AnalyzerConfig, CodeUnitType, FilesystemProject, Language, WorkspaceAnalyzer,
 };
@@ -27,6 +27,15 @@ pub enum ReturnKind {
     Option,
     Result,
     Vec,
+    /// `-> !`. No replacements; skipped at discovery.
+    Never,
+    /// `&T` / `&mut T` other than `&str`. Structurally unviable under schemata.
+    Ref,
+    /// `-> impl Trait`. Structurally unviable under schemata.
+    ImplTrait,
+    /// `-> dyn Trait` (and `-> &dyn Trait` is Ref wrapping dyn; this is the
+    /// bare trait object). Structurally unviable under schemata.
+    Dyn,
     Other,
 }
 
@@ -40,8 +49,18 @@ impl ReturnKind {
             Self::Option => "option",
             Self::Result => "result",
             Self::Vec => "vec",
+            Self::Never => "never",
+            Self::Ref => "ref",
+            Self::ImplTrait => "impl_trait",
+            Self::Dyn => "dyn",
             Self::Other => "other",
         }
+    }
+
+    /// v2 pre-filter: these kinds cannot typecheck a `return Default::default()`
+    /// (or any of our operators) in the inserted prologue.
+    pub fn schema_prefiltered(self) -> bool {
+        matches!(self, Self::Ref | Self::ImplTrait | Self::Dyn)
     }
 
     pub fn replacements(self) -> &'static [&'static str] {
@@ -53,9 +72,14 @@ impl ReturnKind {
             Self::Option => &["{ None }", "{ Some(Default::default()) }"],
             Self::Result => &["{ Ok(Default::default()) }"],
             Self::Vec => &["{ vec![] }"],
-            Self::Other => &["{ Default::default() }"],
+            Self::Never => &[],
+            Self::Ref | Self::ImplTrait | Self::Dyn | Self::Other => &["{ Default::default() }"],
         }
     }
+}
+
+pub fn kind_is_schema_prefiltered(label: &str) -> bool {
+    matches!(label, "ref" | "impl_trait" | "dyn")
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +99,8 @@ pub fn discover(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
     };
 
     let project = Arc::new(
-        FilesystemProject::new(root).with_context(|| format!("FilesystemProject {}", root.display()))?,
+        FilesystemProject::new(root)
+            .with_context(|| format!("FilesystemProject {}", root.display()))?,
     );
     let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
         .map_err(|e| anyhow::anyhow!("WorkspaceAnalyzer::build_ephemeral: {e}"))?;
@@ -297,7 +322,12 @@ fn block_offsets(snippet: &str, block: &Block) -> Result<(usize, usize)> {
 
 fn has_skip(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
-        let segs: Vec<String> = a.path().segments.iter().map(|s| s.ident.to_string()).collect();
+        let segs: Vec<String> = a
+            .path()
+            .segments
+            .iter()
+            .map(|s| s.ident.to_string())
+            .collect();
         segs == ["quicksilver", "skip"] || segs == ["mutants", "skip"]
     })
 }
@@ -341,13 +371,15 @@ pub fn classify_type(ty: &Type) -> ReturnKind {
         Type::Tuple(t) if t.elems.is_empty() => ReturnKind::Unit,
         Type::Paren(p) => classify_type(&p.elem),
         Type::Group(g) => classify_type(&g.elem),
-        Type::Never(_) => ReturnKind::Other,
+        Type::Never(_) => ReturnKind::Never,
+        Type::ImplTrait(_) => ReturnKind::ImplTrait,
+        Type::TraitObject(_) => ReturnKind::Dyn,
         Type::Reference(r) => {
             let inner = r.elem.to_token_stream().to_string().replace(' ', "");
             if inner == "str" {
                 ReturnKind::Stringy
             } else {
-                ReturnKind::Other
+                ReturnKind::Ref
             }
         }
         Type::Path(p) => classify_path(p),
@@ -451,11 +483,9 @@ mod tests {
 
     #[test]
     fn skips_empty_and_todo() {
-        assert!(
-            mutants_from_snippet("p", "a.rs", "p::e", "fn e() {}", 0, 1)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(mutants_from_snippet("p", "a.rs", "p::e", "fn e() {}", 0, 1)
+            .unwrap()
+            .is_empty());
         assert!(
             mutants_from_snippet("p", "a.rs", "p::t", "fn t() { todo!() }", 0, 1)
                 .unwrap()
@@ -480,9 +510,13 @@ mod tests {
     #[test]
     fn skips_quicksilver_attr() {
         let s = "#[quicksilver::skip]\nfn x() -> i32 { 1 }";
-        assert!(mutants_from_snippet("p", "a.rs", "p::x", s, 0, 1).unwrap().is_empty());
+        assert!(mutants_from_snippet("p", "a.rs", "p::x", s, 0, 1)
+            .unwrap()
+            .is_empty());
         let s = "#[mutants::skip]\nfn x() -> i32 { 1 }";
-        assert!(mutants_from_snippet("p", "a.rs", "p::x", s, 0, 1).unwrap().is_empty());
+        assert!(mutants_from_snippet("p", "a.rs", "p::x", s, 0, 1)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -515,7 +549,92 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(m.iter().any(|x| x.replacement.contains("Ok(Default::default())")));
+        assert!(m
+            .iter()
+            .any(|x| x.replacement.contains("Ok(Default::default())")));
+    }
+
+    #[test]
+    fn classifies_ref_impl_trait_dyn_never() {
+        let r = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::as_ref",
+            "fn as_ref(x: &i32) -> &i32 { x }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(r[0].return_kind, "ref");
+        let m = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::as_mut",
+            "fn as_mut(x: &mut i32) -> &mut i32 { x }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(m[0].return_kind, "ref");
+        let i = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::as_impl",
+            "fn as_impl() -> impl std::fmt::Display { 1 }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(i[0].return_kind, "impl_trait");
+        let d = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::as_dyn",
+            "fn as_dyn() -> &'static dyn std::fmt::Debug { &() }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(d[0].return_kind, "ref");
+        let bare = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::box_dyn",
+            "fn box_dyn() -> Box<dyn std::fmt::Debug> { Box::new(()) }",
+            0,
+            1,
+        )
+        .unwrap();
+        // Box<dyn ...> is a path ending in Box, not a bare trait object.
+        assert_eq!(bare[0].return_kind, "other");
+        let n = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::diverge",
+            "fn diverge() -> ! { loop {} }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert!(n.is_empty(), "-> ! is skipped");
+        assert!(kind_is_schema_prefiltered("ref"));
+        assert!(kind_is_schema_prefiltered("impl_trait"));
+        assert!(kind_is_schema_prefiltered("dyn"));
+        assert!(!kind_is_schema_prefiltered("number"));
+    }
+
+    #[test]
+    fn async_fn_is_not_skipped() {
+        let m = mutants_from_snippet(
+            "p",
+            "a.rs",
+            "p::add_async",
+            "async fn add_async(a: i32, b: i32) -> i32 { a + b }",
+            0,
+            1,
+        )
+        .unwrap();
+        assert!(m.iter().any(|x| x.replacement.contains('0')));
     }
 
     #[test]

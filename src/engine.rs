@@ -1,6 +1,6 @@
-use crate::baseline::{prepare_baseline, preflight_recompile_count};
-use crate::config::{Config, ConfigExtras, FileConfig, merge_config};
-use crate::discover::{DiscoverFilter, discover};
+use crate::baseline::{preflight_recompile_count, prepare_baseline};
+use crate::config::{merge_config, Config, ConfigExtras, FileConfig};
+use crate::discover::{discover, DiscoverFilter};
 use crate::estimate::{self, EstimateReport};
 use crate::exec::execute;
 use crate::index::{self, CoverageIndex};
@@ -150,13 +150,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
             .collect();
         index::stage_b_for_mutants(&cfg, &paths, &mut index, &covered)?;
     }
-    let plan = plan::plan(
-        &mutants,
-        &index,
-        &baseline,
-        cfg.shard,
-        cfg.build_jobs,
-    );
+    let plan = plan::plan(&mutants, &index, &baseline, cfg.shard, cfg.build_jobs);
     eprintln!(
         "plan: {} to build, {} not covered",
         plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>(),
@@ -193,6 +187,34 @@ pub fn run_prepared(
         prepared.plan.clone()
     };
     let exec = execute(
+        &prepared.cfg,
+        &prepared.paths,
+        Arc::clone(&prepared.backend),
+        plan,
+        cancel,
+        limit,
+    )?;
+    Ok((exec.outcomes, exec.builds))
+}
+
+pub fn run_schema(
+    prepared: &Prepared,
+    limit: usize,
+    sample: Option<&[Mutant]>,
+) -> Result<(Vec<Outcome>, u64)> {
+    let cancel = install_ctrlc();
+    let plan = if let Some(sample) = sample {
+        plan::plan(
+            sample,
+            &prepared.index,
+            &prepared.baseline,
+            prepared.cfg.shard,
+            prepared.cfg.build_jobs,
+        )
+    } else {
+        prepared.plan.clone()
+    };
+    let exec = crate::exec::schema::execute(
         &prepared.cfg,
         &prepared.paths,
         Arc::clone(&prepared.backend),

@@ -1,10 +1,10 @@
 use crate::outcome::OutcomeCounts;
-use crate::plan::{Plan, mean_t_sel, scoped_len, unique_packages};
+use crate::plan::{mean_t_sel, scoped_len, unique_packages, Plan};
 use crate::types::{BaselineReport, Mutant};
 use crate::util::format_duration;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EstimateReport {
     pub sampled_scope: String,
     pub sample_size: usize,
@@ -23,10 +23,27 @@ pub struct EstimateReport {
     pub t_v2_secs: f64,
     pub schema_batches: usize,
     pub sample_counts: SampleCounts,
+    #[serde(default)]
+    pub by_return_kind: Vec<KindBreakdown>,
     pub assumptions: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Default)]
+/// Per-return-kind counts from the executed sample. This is the input that
+/// prunes v2's operator set (structurally unviable kinds at ~100%).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KindBreakdown {
+    pub return_kind: String,
+    pub n: usize,
+    pub unviable: usize,
+    pub unviable_rate: f64,
+    pub caught: usize,
+    pub missed: usize,
+    pub not_covered: usize,
+    pub errored: usize,
+    pub timeout: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SampleCounts {
     pub caught: usize,
     pub missed: usize,
@@ -59,7 +76,11 @@ pub fn compute(
     let t_build = if baseline.package_costs.is_empty() {
         2.0
     } else {
-        baseline.package_costs.iter().map(|p| p.rebuild_secs).sum::<f64>()
+        baseline
+            .package_costs
+            .iter()
+            .map(|p| p.rebuild_secs)
+            .sum::<f64>()
             / baseline.package_costs.len() as f64
     };
     let t_sel = mean_t_sel(t_sel_plan);
@@ -77,6 +98,7 @@ pub fn compute(
         + n as f64 * covered_frac * t_sel / j_test.max(1) as f64;
 
     let counts = OutcomeCounts::from_outcomes(sample_outcomes);
+    let by_return_kind = kind_breakdown(sample_outcomes);
     EstimateReport {
         sampled_scope: sampled_scope.clone(),
         sample_size,
@@ -103,6 +125,7 @@ pub fn compute(
             timeout: counts.timeout,
             builds: counts.builds,
         },
+        by_return_kind,
         assumptions: vec![
             format!("N = {n} is exact from discovery inside scope `{sampled_scope}` (out-of-scope mutants are excluded, not filed as NotCovered)."),
             format!("t_suite = {:.3}s is the workspace nextest wall clock (cargo-mutants runs the whole suite, not only -p scope).", t_suite),
@@ -122,6 +145,7 @@ pub fn compute(
             format!(
                 "T_v2 treats one schema compile per crate that has covered mutants ({projected_batches} batches), not one per function. That is a proxy, not a measured schemata run."
             ),
+            "Unviable rate by return kind is from the executed sample. Kinds at ~100% (ref, impl_trait, dyn) are the v2 pre-filter.".into(),
             "Coverage index can under-report tests that spawn other processes. LLVM_PROFILE_FILE uses %p.".into(),
         ],
     }
@@ -132,10 +156,7 @@ pub fn render(report: &EstimateReport) -> String {
     s.push_str("=== cargo-quicksilver estimate ===\n\n");
     s.push_str(&format!("Sampled scope: {}\n", report.sampled_scope));
     s.push_str(&format!("Sample size: {} mutants\n", report.sample_size));
-    s.push_str(&format!(
-        "N (mutants): {}  [exact]\n\n",
-        report.n_exact
-    ));
+    s.push_str(&format!("N (mutants): {}  [exact]\n\n", report.n_exact));
     s.push_str("Measured inputs:\n");
     s.push_str(&format!(
         "  f_nc (not covered): {:.3}  [census of {}]\n",
@@ -181,15 +202,86 @@ pub fn render(report: &EstimateReport) -> String {
         "  NotCovered: {}\n",
         report.sample_counts.not_covered
     ));
-    s.push_str(&format!("  Unviable:   {}\n", report.sample_counts.unviable));
+    s.push_str(&format!(
+        "  Unviable:   {}\n",
+        report.sample_counts.unviable
+    ));
     s.push_str(&format!("  Errored:    {}\n", report.sample_counts.errored));
     s.push_str(&format!("  Timeout:    {}\n", report.sample_counts.timeout));
-    s.push_str(&format!("  Builds:     {}\n\n", report.sample_counts.builds));
+    s.push_str(&format!(
+        "  Builds:     {}\n\n",
+        report.sample_counts.builds
+    ));
+    if !report.by_return_kind.is_empty() {
+        s.push_str("Unviable rate by return kind (sample):\n");
+        s.push_str(&format!(
+            "  {:<12} {:>6} {:>9} {:>8} {:>7} {:>7}\n",
+            "kind", "n", "unviable", "rate", "caught", "missed"
+        ));
+        for k in &report.by_return_kind {
+            s.push_str(&format!(
+                "  {:<12} {:>6} {:>9} {:>8.3} {:>7} {:>7}\n",
+                k.return_kind, k.n, k.unviable, k.unviable_rate, k.caught, k.missed
+            ));
+        }
+        s.push('\n');
+    }
     s.push_str("Assumptions:\n");
     for a in &report.assumptions {
         s.push_str(&format!("  - {a}\n"));
     }
     s
+}
+
+pub fn kind_breakdown(outcomes: &[crate::types::Outcome]) -> Vec<KindBreakdown> {
+    use crate::types::VerdictKind;
+    use std::collections::BTreeMap;
+    #[derive(Default)]
+    struct Acc {
+        n: usize,
+        unviable: usize,
+        caught: usize,
+        missed: usize,
+        not_covered: usize,
+        errored: usize,
+        timeout: usize,
+    }
+    let mut map: BTreeMap<String, Acc> = BTreeMap::new();
+    for o in outcomes {
+        let e = map.entry(o.mutant.return_kind.clone()).or_default();
+        e.n += 1;
+        match o.kind {
+            VerdictKind::Unviable => e.unviable += 1,
+            VerdictKind::Caught => e.caught += 1,
+            VerdictKind::Missed => e.missed += 1,
+            VerdictKind::NotCovered => e.not_covered += 1,
+            VerdictKind::Errored => e.errored += 1,
+            VerdictKind::Timeout => e.timeout += 1,
+        }
+    }
+    let mut rows: Vec<KindBreakdown> = map
+        .into_iter()
+        .map(|(return_kind, a)| KindBreakdown {
+            unviable_rate: if a.n == 0 {
+                0.0
+            } else {
+                a.unviable as f64 / a.n as f64
+            },
+            return_kind,
+            n: a.n,
+            unviable: a.unviable,
+            caught: a.caught,
+            missed: a.missed,
+            not_covered: a.not_covered,
+            errored: a.errored,
+            timeout: a.timeout,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.n.cmp(&a.n)
+            .then_with(|| a.return_kind.cmp(&b.return_kind))
+    });
+    rows
 }
 
 pub fn sample_mutants(mutants: &[Mutant], n: usize, seed: u64) -> Vec<Mutant> {
@@ -276,7 +368,18 @@ mod tests {
             failed_test_ids: Vec::new(),
         };
         let n = crate::plan::scoped_len(&plan);
-        let report = compute(n, &plan, &plan, &baseline, &[] as &[Outcome], 2, 4, 16, "a+b".into(), 0);
+        let report = compute(
+            n,
+            &plan,
+            &plan,
+            &baseline,
+            &[] as &[Outcome],
+            2,
+            4,
+            16,
+            "a+b".into(),
+            0,
+        );
         assert_eq!(n, 36);
         // 1 not covered / 36 in-scope — not 0 because we did not file other crates as NC.
         assert!((report.f_nc - 1.0 / 36.0).abs() < 1e-9);
@@ -307,5 +410,26 @@ mod tests {
         let b = compute(100, &plan, &plan, &baseline, &[], 5, 5, 50, "a".into(), 0);
         assert!(b.t_mutants_secs < a.t_mutants_secs);
         assert!((a.t_mutants_secs / b.t_mutants_secs - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unviable_rate_by_return_kind() {
+        let mut outcomes = Vec::new();
+        let mut m = mutant("a", "f");
+        m.return_kind = "ref".into();
+        outcomes.push(Outcome::unviable(m.clone(), "no".into()));
+        outcomes.push(Outcome::unviable(m, "no".into()));
+        let mut n = mutant("a", "g");
+        n.return_kind = "number".into();
+        outcomes.push(Outcome::caught(n, "t".into()));
+        let rows = kind_breakdown(&outcomes);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].return_kind, "ref");
+        assert_eq!(rows[0].n, 2);
+        assert_eq!(rows[0].unviable, 2);
+        assert!((rows[0].unviable_rate - 1.0).abs() < 1e-9);
+        assert_eq!(rows[1].return_kind, "number");
+        assert_eq!(rows[1].unviable, 0);
+        assert_eq!(rows[1].caught, 1);
     }
 }

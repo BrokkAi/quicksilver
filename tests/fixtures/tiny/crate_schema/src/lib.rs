@@ -1,0 +1,92 @@
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+pub fn identity<T>(x: T) -> T {
+    x
+}
+
+pub struct Unique(pub i32);
+
+pub fn unique() -> Unique {
+    Unique(7)
+}
+
+pub fn as_ref(x: &i32) -> &i32 {
+    x
+}
+
+pub fn as_mut(x: &mut i32) -> &mut i32 {
+    x
+}
+
+pub fn as_impl() -> impl std::fmt::Display {
+    42
+}
+
+pub fn as_dyn() -> &'static dyn std::fmt::Debug {
+    &()
+}
+
+pub async fn add_async(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn poll_ready<F: std::future::Future>(fut: F) -> F::Output {
+        use std::pin::pin;
+        use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn dummy(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            raw()
+        }
+        fn raw() -> RawWaker {
+            const VTABLE: RawWakerVTable = RawWakerVTable::new(clone, dummy, dummy, dummy);
+            RawWaker::new(std::ptr::null(), &VTABLE)
+        }
+        let waker = unsafe { Waker::from_raw(raw()) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("pending"),
+        }
+    }
+
+    #[test]
+    fn add_works() {
+        assert_eq!(add(2, 3), 5);
+    }
+
+    #[test]
+    fn identity_works() {
+        assert_eq!(identity(3), 3);
+    }
+
+    #[test]
+    fn unique_is_seven() {
+        assert_eq!(unique().0, 7);
+    }
+
+    #[test]
+    fn refs_work() {
+        let mut x = 1;
+        assert_eq!(*as_ref(&x), 1);
+        *as_mut(&mut x) = 2;
+        assert_eq!(x, 2);
+    }
+
+    #[test]
+    fn impl_and_dyn_work() {
+        let _ = format!("{}", as_impl());
+        let _ = format!("{:?}", as_dyn());
+    }
+
+    #[test]
+    fn add_async_works() {
+        assert_eq!(poll_ready(add_async(1, 2)), 3);
+    }
+}

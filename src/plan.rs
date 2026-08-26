@@ -8,6 +8,14 @@ pub struct Plan {
     pub not_covered: Vec<Mutant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestMode {
+    /// Tests the coverage index claims execute this mutant.
+    Impact,
+    /// Every catalogued test (the cargo-mutants full-suite ground truth).
+    FullSuite,
+}
+
 pub fn plan(
     mutants: &[Mutant],
     index: &CoverageIndex,
@@ -15,11 +23,59 @@ pub fn plan(
     shard: Option<(u32, u32)>,
     build_jobs: usize,
 ) -> Plan {
+    plan_with(
+        mutants,
+        index,
+        baseline,
+        shard,
+        build_jobs,
+        TestMode::Impact,
+    )
+}
+
+/// Same as `plan`, but every union-covered mutant runs the whole suite.
+pub fn plan_full_suite(
+    mutants: &[Mutant],
+    index: &CoverageIndex,
+    baseline: &BaselineReport,
+    shard: Option<(u32, u32)>,
+    build_jobs: usize,
+) -> Plan {
+    plan_with(
+        mutants,
+        index,
+        baseline,
+        shard,
+        build_jobs,
+        TestMode::FullSuite,
+    )
+}
+
+fn plan_with(
+    mutants: &[Mutant],
+    index: &CoverageIndex,
+    baseline: &BaselineReport,
+    shard: Option<(u32, u32)>,
+    build_jobs: usize,
+    mode: TestMode,
+) -> Plan {
     let cost_by_pkg: HashMap<&str, f64> = baseline
         .package_costs
         .iter()
         .map(|p| (p.package.as_str(), p.rebuild_secs))
         .collect();
+
+    let mut all_suite = if !baseline.tests.is_empty() {
+        baseline.tests.clone()
+    } else {
+        index.tests.clone()
+    };
+    all_suite.sort_by(|a, b| {
+        a.duration_secs
+            .partial_cmp(&b.duration_secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.name.cmp(&b.name))
+    });
 
     let mut not_covered = Vec::new();
     let mut covered = Vec::new();
@@ -28,7 +84,10 @@ pub fn plan(
             not_covered.push(m.clone());
             continue;
         }
-        let mut tests = index.tests_covering(&m.path, m.start_line, m.end_line);
+        let mut tests = match mode {
+            TestMode::Impact => index.tests_covering(&m.path, m.start_line, m.end_line),
+            TestMode::FullSuite => all_suite.clone(),
+        };
         tests.sort_by(|a, b| {
             a.duration_secs
                 .partial_cmp(&b.duration_secs)
@@ -111,7 +170,11 @@ pub fn mean_t_sel(plan: &Plan) -> f64 {
             n += 1.0;
         }
     }
-    if n == 0.0 { 0.0 } else { sum / n }
+    if n == 0.0 {
+        0.0
+    } else {
+        sum / n
+    }
 }
 
 pub fn unique_functions(plan: &Plan) -> usize {

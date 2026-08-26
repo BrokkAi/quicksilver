@@ -82,6 +82,14 @@ pub struct Config {
     pub zfs_remote: Option<String>,
     pub zfs_dataset: Option<String>,
     pub quiet: bool,
+    /// Build a mutant schema per crate instead of one compile per mutant.
+    pub schema: bool,
+    pub schema_max_rounds: u32,
+    /// 0 means one batch per crate (no split).
+    pub schema_batch_size: usize,
+    pub diff_against: Option<PathBuf>,
+    /// Identity-mutant gate sample per schema batch. 0 means every site.
+    pub identity_sample: usize,
 }
 
 impl Config {
@@ -93,10 +101,9 @@ impl Config {
         for name in ["quicksilver.toml", ".quicksilver.toml"] {
             let p = repo_root.join(name);
             if p.is_file() {
-                let text = std::fs::read_to_string(&p)
-                    .with_context(|| format!("read {}", p.display()))?;
-                return toml::from_str(&text)
-                    .with_context(|| format!("parse {}", p.display()));
+                let text =
+                    std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+                return toml::from_str(&text).with_context(|| format!("parse {}", p.display()));
             }
         }
         Ok(FileConfig::default())
@@ -104,9 +111,7 @@ impl Config {
 }
 
 pub fn parse_shard(s: &str) -> Result<(u32, u32)> {
-    let (k, n) = s
-        .split_once('/')
-        .context("--shard expects K/N")?;
+    let (k, n) = s.split_once('/').context("--shard expects K/N")?;
     let k: u32 = k.parse().context("shard K")?;
     let n: u32 = n.parse().context("shard N")?;
     anyhow::ensure!(n > 0 && k >= 1 && k <= n, "--shard K/N needs 1 <= K <= N");
@@ -203,6 +208,15 @@ pub fn merge_config(
             .or(file.zfs_dataset)
             .or_else(|| std::env::var("QS_ZFS_DATASET").ok()),
         quiet: extras.quiet,
+        schema: extras.schema,
+        schema_max_rounds: if extras.schema_max_rounds == 0 {
+            5
+        } else {
+            extras.schema_max_rounds
+        },
+        schema_batch_size: extras.schema_batch_size,
+        diff_against: extras.diff_against,
+        identity_sample: extras.identity_sample,
     })
 }
 
@@ -222,4 +236,9 @@ pub struct ConfigExtras {
     pub timeout_floor_ms: u64,
     pub strict_source_isolation: bool,
     pub quiet: bool,
+    pub schema: bool,
+    pub schema_max_rounds: u32,
+    pub schema_batch_size: usize,
+    pub diff_against: Option<PathBuf>,
+    pub identity_sample: usize,
 }

@@ -10,7 +10,9 @@ pub enum RunStatus {
     /// libtest assertion failure (exit 101). This is the only Caught signal.
     Failed,
     /// Non-101 nonzero exit (dynamic linker 127, abort, …). Not Caught.
-    Error { code: Option<i32> },
+    Error {
+        code: Option<i32>,
+    },
     Timeout,
 }
 
@@ -57,11 +59,24 @@ pub fn run_exact(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<RunStatus> {
+    run_exact_with_env(binary, test_name, cwd, timeout, &[])
+}
+
+pub fn run_exact_with_env(
+    binary: &Path,
+    test_name: &str,
+    cwd: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<RunStatus> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd);
     cmd.arg("--exact").arg(test_name);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     match run_command_timeout(cmd, timeout)
         .with_context(|| format!("spawn {}", binary.display()))?
     {
@@ -94,7 +109,9 @@ mod tests {
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::null());
         match run_command_timeout(cmd, Duration::from_secs(5)).unwrap() {
-            WaitResult::Exited(st) => assert_eq!(classify_exit(st), RunStatus::Error { code: Some(1) }),
+            WaitResult::Exited(st) => {
+                assert_eq!(classify_exit(st), RunStatus::Error { code: Some(1) })
+            }
             WaitResult::Timeout => panic!("false timed out"),
         }
     }

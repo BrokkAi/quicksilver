@@ -1,11 +1,11 @@
 use crate::cargo_cmd::{
-    crate_root_source, load_metadata, write_nextest_config, BuildResult, apply_build_env,
-    cargo_profile_args, count_compiling_units, dump_metadata_json, nextest_available,
+    apply_build_env, cargo_profile_args, count_compiling_units, crate_root_source,
+    dump_metadata_json, load_metadata, nextest_available, write_nextest_config, BuildResult,
 };
 use crate::config::Config;
 use crate::discover::{apply_mutant, restore_file};
 use crate::types::{BaselineReport, Mutant, PackageCost, Paths, TestInfo};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Stdio;
@@ -41,7 +41,11 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
     let mut last_failed_ids = Vec::new();
     let mut last_secs = 0.0;
     for run in 0..cfg.baseline_runs.max(1) {
-        info!("baseline cargo nextest run ({}/{})", run + 1, cfg.baseline_runs.max(1));
+        info!(
+            "baseline cargo nextest run ({}/{})",
+            run + 1,
+            cfg.baseline_runs.max(1)
+        );
         let mut cmd = crate::cargo_cmd::cargo_command();
         cmd.current_dir(&paths.baseline);
         cmd.env("CARGO_TARGET_DIR", &target);
@@ -264,11 +268,7 @@ fn touch(path: &Path) -> Result<()> {
 }
 
 /// Mutate one throwaway function, rebuild, count how many units recompiled.
-pub fn preflight_recompile_count(
-    cfg: &Config,
-    paths: &Paths,
-    mutant: &Mutant,
-) -> Result<u64> {
+pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -> Result<u64> {
     let target = paths.baseline.join("target");
     let original = apply_mutant(&paths.baseline, mutant)?;
     let mut cmd = crate::cargo_cmd::cargo_command();

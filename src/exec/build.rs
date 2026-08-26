@@ -53,65 +53,66 @@ pub fn build_one(
         anyhow::bail!("restore failed after build: {err:#}");
     }
     let run_dir = runs_root.join(&planned.mutant.id);
-            if run_dir.exists() {
-                let _ = fs::remove_dir_all(&run_dir);
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+    fs::create_dir_all(&run_dir)?;
+    let mut name_to_exe: HashMap<String, PathBuf> = HashMap::new();
+    for exe in parse_executables(&stdout, target_dir)
+        .into_iter()
+        .chain(executables)
+    {
+        if let Some(name) = exe.file_name() {
+            name_to_exe.insert(name.to_string_lossy().into_owned(), exe);
+        }
+    }
+    let mut tests = Vec::new();
+    for (i, t) in planned.tests.iter().enumerate() {
+        let dest_name = format!("bin{i}");
+        let src = match resolve_binary(target_dir, t, &name_to_exe) {
+            Ok(p) => p,
+            Err(err) => {
+                return Ok(Err(Outcome::unviable(
+                    planned.mutant.clone(),
+                    err.to_string(),
+                )));
             }
-            fs::create_dir_all(&run_dir)?;
-            let mut name_to_exe: HashMap<String, PathBuf> = HashMap::new();
-            for exe in parse_executables(&stdout, target_dir)
-                .into_iter()
-                .chain(executables)
-            {
-                if let Some(name) = exe.file_name() {
-                    name_to_exe.insert(name.to_string_lossy().into_owned(), exe);
-                }
-            }
-            let mut tests = Vec::new();
-            for (i, t) in planned.tests.iter().enumerate() {
-                let dest_name = format!("bin{i}");
-                let src = match resolve_binary(target_dir, t, &name_to_exe) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        return Ok(Err(Outcome::unviable(
-                            planned.mutant.clone(),
-                            err.to_string(),
-                        )));
-                    }
-                };
-                let dest = run_dir.join(&dest_name);
-                backend
-                    .clone_file(&src, &dest)
-                    .or_else(|_| {
-                        fs::copy(&src, &dest).map(|_| ()).context("copy test binary")
-                    })?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let mut perm = fs::metadata(&dest)?.permissions();
-                    perm.set_mode(0o755);
-                    fs::set_permissions(&dest, perm)?;
-                }
-                tests.push(ManifestTest {
-                    name: t.name.clone(),
-                    binary: dest_name,
-                    cwd_rel: t.cwd_rel.clone(),
-                });
-            }
-            let manifest = BinariesManifest {
-                mutant_id: planned.mutant.id.clone(),
-                tests,
-            };
-            fs::write(
-                run_dir.join("manifest.json"),
-                serde_json::to_vec_pretty(&manifest)?,
-            )?;
+        };
+        let dest = run_dir.join(&dest_name);
+        backend.clone_file(&src, &dest).or_else(|_| {
+            fs::copy(&src, &dest)
+                .map(|_| ())
+                .context("copy test binary")
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&dest)?.permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&dest, perm)?;
+        }
+        tests.push(ManifestTest {
+            name: t.name.clone(),
+            binary: dest_name,
+            cwd_rel: t.cwd_rel.clone(),
+            id: t.id.clone(),
+        });
+    }
+    let manifest = BinariesManifest {
+        mutant_id: planned.mutant.id.clone(),
+        tests,
+    };
+    fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
     Ok(Ok(BuiltMutant {
         planned: planned.clone(),
         run_dir,
     }))
 }
 
-fn resolve_binary(
+pub(crate) fn resolve_binary(
     target_dir: &Path,
     test: &crate::types::TestInfo,
     built: &HashMap<String, PathBuf>,
@@ -138,7 +139,8 @@ fn resolve_binary(
         }
     }
     if let Some((_, p)) = built.iter().find(|(n, _)| {
-        n.contains(&test.binary_name) || test.binary_name.is_empty() && n.contains(&test.package.replace('-', "_"))
+        n.contains(&test.binary_name)
+            || test.binary_name.is_empty() && n.contains(&test.package.replace('-', "_"))
     }) {
         return Ok(p.clone());
     }

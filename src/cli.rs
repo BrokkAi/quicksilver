@@ -120,6 +120,8 @@ pub enum Command {
     Index(IndexArgs),
     /// Clone-backend and build-environment diagnostics.
     Probe(ProbeArgs),
+    /// Compare impact-selected verdicts to full-suite verdicts.
+    AuditSelection(AuditSelectionArgs),
 }
 
 #[derive(Args, Debug)]
@@ -140,6 +142,33 @@ pub struct RunArgs {
     /// Maximum mutants to execute (after NotCovered filtering). 0 means no cap.
     #[arg(long, default_value_t = 0)]
     pub limit: usize,
+    #[arg(long, hide = true)]
+    pub skip_baseline: bool,
+    /// Mutant schemata: one compile per crate, then selected tests with QS_MUTANT.
+    #[arg(long)]
+    pub schema: bool,
+    /// Isolation rebuilds that map rustc diagnostics back to sites.
+    #[arg(long, default_value_t = 5)]
+    pub schema_max_rounds: u32,
+    /// Split a crate's sites when this many are exceeded. 0 = one batch per crate.
+    #[arg(long, default_value_t = 0)]
+    pub schema_batch_size: usize,
+    /// v1 `estimate --json` / run JSON to compare verdicts against (differential gate).
+    #[arg(long)]
+    pub diff_against: Option<PathBuf>,
+    /// Identity-mutant gate: sites to activate with the original-body variant.
+    /// 0 means every site in the batch.
+    #[arg(long, default_value_t = 8)]
+    pub identity_sample: usize,
+}
+
+#[derive(Args, Debug)]
+pub struct AuditSelectionArgs {
+    /// Covered mutants to run twice (selected tests vs the whole suite).
+    #[arg(long, default_value_t = 20)]
+    pub sample: usize,
+    #[arg(long, default_value_t = 1)]
+    pub sample_seed: u64,
     #[arg(long, hide = true)]
     pub skip_baseline: bool,
 }

@@ -123,6 +123,17 @@ impl Outcome {
         }
     }
 
+    /// Pre-filtered or otherwise never compiled.
+    pub fn unviable_skipped(mutant: Mutant, message: String) -> Self {
+        Self {
+            mutant,
+            kind: VerdictKind::Unviable,
+            test: None,
+            message: Some(message),
+            build: false,
+        }
+    }
+
     pub fn timeout(mutant: Mutant, test: String) -> Self {
         Self {
             mutant,

@@ -1,11 +1,11 @@
 use crate::config::Config;
-use crate::exec::build::{BuiltMutant, walk_batch};
+use crate::exec::build::{walk_batch, BuiltMutant};
 use crate::exec::test::{cleanup_run, run_mutant_tests};
 use crate::plan::Plan;
-use crate::scratch::{CloneBackend, ensure_worker};
+use crate::scratch::{ensure_worker, CloneBackend};
 use crate::types::{Outcome, Paths};
 use anyhow::Result;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,6 +14,7 @@ use tracing::info;
 
 pub mod build;
 pub mod process;
+pub mod schema;
 pub mod test;
 
 pub struct ExecResult {
@@ -218,7 +219,7 @@ pub fn execute(
     })
 }
 
-fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {
+pub(crate) fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -228,7 +229,7 @@ fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {
     Ok(())
 }
 
-fn load_resume(path: &std::path::Path) -> Result<Vec<Outcome>> {
+pub(crate) fn load_resume(path: &std::path::Path) -> Result<Vec<Outcome>> {
     if !path.is_file() {
         return Ok(Vec::new());
     }

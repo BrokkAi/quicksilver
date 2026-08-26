@@ -44,14 +44,12 @@ fn walkdir_lite(root: &Path) -> Vec<PathBuf> {
 pub fn setup_tiny() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     copy_tree(&fixture_src(), tmp.path());
-    assert!(
-        Command::new("git")
-            .args(["init"])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["init"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap()
+        .success());
     for (k, v) in [
         ("user.email", "qs@example.com"),
         ("user.name", "quicksilver"),
@@ -61,22 +59,18 @@ pub fn setup_tiny() -> tempfile::TempDir {
             .current_dir(tmp.path())
             .status();
     }
-    assert!(
-        Command::new("git")
-            .args(["add", "-A"])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "commit", "-m", "fixture"])
-            .current_dir(tmp.path())
-            .status()
-            .unwrap()
-            .success()
-    );
+    assert!(Command::new("git")
+        .args(["add", "-A"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["-c", "commit.gpgsign=false", "commit", "-m", "fixture"])
+        .current_dir(tmp.path())
+        .status()
+        .unwrap()
+        .success());
     tmp
 }
 
@@ -111,5 +105,10 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         zfs_remote: None,
         zfs_dataset: None,
         quiet: true,
+        schema: false,
+        schema_max_rounds: 5,
+        schema_batch_size: 0,
+        diff_against: None,
+        identity_sample: 0,
     }
 }

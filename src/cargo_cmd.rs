@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::types::Paths;
 use crate::util::fast_linker;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,8 @@ pub fn cargo_command() -> Command {
     cmd.arg("--config")
         .arg(r#"profile.quicksilver.inherits="dev""#);
     cmd.arg("--config").arg("profile.quicksilver.debug=0");
-    cmd.arg("--config").arg("profile.quicksilver.incremental=true");
+    cmd.arg("--config")
+        .arg("profile.quicksilver.incremental=true");
     cmd
 }
 
@@ -193,7 +194,8 @@ pub fn package_for_path(meta: &Metadata, rel: &str) -> Option<String> {
             rel == prefix || rel.starts_with(&format!("{prefix}/"))
         };
         if matches {
-            let score = prefix.chars().filter(|c| *c == '/').count() + usize::from(!prefix.is_empty());
+            let score =
+                prefix.chars().filter(|c| *c == '/').count() + usize::from(!prefix.is_empty());
             if best.as_ref().map(|(s, _)| score >= *s).unwrap_or(true) {
                 best = Some((score, pkg.name.to_string()));
             }
@@ -203,13 +205,19 @@ pub fn package_for_path(meta: &Metadata, rel: &str) -> Option<String> {
 }
 
 pub fn crate_root_source(meta: &Metadata, package: &str) -> Option<PathBuf> {
-    let pkg = meta.workspace_packages().into_iter().find(|p| p.name.as_str() == package)?;
+    let pkg = meta
+        .workspace_packages()
+        .into_iter()
+        .find(|p| p.name.as_str() == package)?;
     let mut lib = None;
     let mut bin = None;
     for t in &pkg.targets {
         let kinds: Vec<String> = t.kind.iter().map(|k| k.to_string()).collect();
         let path = t.src_path.as_std_path().to_path_buf();
-        if kinds.iter().any(|k| k == "lib" || k == "rlib" || k == "dylib" || k == "cdylib") {
+        if kinds
+            .iter()
+            .any(|k| k == "lib" || k == "rlib" || k == "dylib" || k == "cdylib")
+        {
             lib = Some(path);
             break;
         }
@@ -275,13 +283,65 @@ pub fn build_tests(
     } else {
         Vec::new()
     };
-    Ok(BuildResult { secs, executables, stdout: output.stdout })
+    Ok(BuildResult {
+        secs,
+        executables,
+        stdout: output.stdout,
+    })
 }
 
 pub struct BuildResult {
     pub secs: f64,
     pub executables: Vec<PathBuf>,
     pub stdout: Vec<u8>,
+}
+
+/// Like `build_tests` with `--message-format=json`, but does not bail on
+/// rustc failure — schema isolation needs the diagnostic spans.
+pub struct CapturedBuild {
+    pub success: bool,
+    pub secs: f64,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub executables: Vec<PathBuf>,
+}
+
+pub fn build_tests_captured(
+    root: &Path,
+    target_dir: &Path,
+    cfg: &Config,
+    packages: &[String],
+    coverage: bool,
+) -> Result<CapturedBuild> {
+    let mut cmd = cargo_command();
+    cmd.current_dir(root);
+    cmd.env("CARGO_TARGET_DIR", target_dir);
+    apply_build_env(&mut cmd, cfg, coverage);
+    cmd.arg("build").arg("--tests");
+    cmd.args(cargo_profile_args());
+    if packages.is_empty() {
+        cmd.arg("--workspace");
+    } else {
+        for p in packages {
+            cmd.arg("-p").arg(p);
+        }
+    }
+    cmd.arg("--message-format=json");
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    let start = Instant::now();
+    let output = cmd
+        .output()
+        .context("cargo build --tests --message-format=json")?;
+    let secs = start.elapsed().as_secs_f64();
+    let executables = parse_executables(&output.stdout, target_dir);
+    Ok(CapturedBuild {
+        success: output.status.success(),
+        secs,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        executables,
+    })
 }
 
 pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
@@ -306,10 +366,7 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
 }
 
 pub fn count_compiling_units(stderr: &str) -> u64 {
-    stderr
-        .lines()
-        .filter(|l| l.contains("Compiling "))
-        .count() as u64
+    stderr.lines().filter(|l| l.contains("Compiling ")).count() as u64
 }
 
 pub fn nextest_available() -> bool {
@@ -390,7 +447,10 @@ mod tests {
         assert!(d.contains("tiny_c"), "tiny_c links tiny_a: {d:?}");
         let php_like = reverse_dependents(&meta, &["tiny_b".into()]);
         assert!(php_like.contains("tiny_b"));
-        assert!(!php_like.contains("tiny_a"), "tiny_a does not depend on tiny_b: {php_like:?}");
+        assert!(
+            !php_like.contains("tiny_a"),
+            "tiny_a does not depend on tiny_b: {php_like:?}"
+        );
         assert!(!php_like.contains("tiny_c"));
     }
 

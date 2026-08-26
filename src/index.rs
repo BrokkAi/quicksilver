@@ -3,10 +3,10 @@ use crate::cargo_cmd::{
     package_dir_rel, package_select, relative_to_target, reverse_dependents,
 };
 use crate::config::Config;
-use crate::exec::process::{WaitResult, run_command_timeout};
+use crate::exec::process::{run_command_timeout, WaitResult};
 use crate::types::{BaselineReport, Mutant, Paths, TestInfo};
 use crate::util::{find_llvm_tool, rustc_verbose_version, sanitize_filename, sha256_file};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -45,6 +45,11 @@ pub struct CoverageIndex {
     /// when the requested set is a subset of this.
     #[serde(default)]
     pub stage_b_mutant_ids: BTreeSet<String>,
+    /// SHA-256 of the attributed mutant-id set. Combined with `cache_key`
+    /// this is the Stage B cache identity: a superset hit reuses, a partial
+    /// hit attributes only the missing ids and merges into `lines`.
+    #[serde(default)]
+    pub stage_b_ids_hash: String,
 }
 
 impl Default for CoverageIndex {
@@ -57,6 +62,7 @@ impl Default for CoverageIndex {
             lines: HashMap::new(),
             union: HashMap::new(),
             stage_b_mutant_ids: BTreeSet::new(),
+            stage_b_ids_hash: String::new(),
         }
     }
 }
@@ -206,6 +212,7 @@ fn build_index(
         lines: HashMap::new(),
         union,
         stage_b_mutant_ids: BTreeSet::new(),
+        stage_b_ids_hash: String::new(),
     };
     index.save(paths)?;
     Ok(index)
@@ -213,6 +220,10 @@ fn build_index(
 
 /// Per-test attribution for `mutants` only. Sound prunes: reverse-dep binaries
 /// and llvm-cov --sources limited to those files.
+///
+/// Cache key is `(index.cache_key, hash of attributed mutant ids)`. A
+/// superset hit reuses. A partial hit inverts only files of the missing ids
+/// and merges into `index.lines`.
 pub fn stage_b_for_mutants(
     cfg: &Config,
     paths: &Paths,
@@ -225,11 +236,37 @@ pub fn stage_b_for_mutants(
     let ids: BTreeSet<String> = mutants.iter().map(|m| m.id.clone()).collect();
     if stage_b_is_cached(index, &ids) {
         info!(
-            "reusing Stage B attribution ({} cached mutant ids)",
-            index.stage_b_mutant_ids.len()
+            "reusing Stage B attribution ({} cached mutant ids, hash {})",
+            index.stage_b_mutant_ids.len(),
+            if index.stage_b_ids_hash.len() >= 8 {
+                &index.stage_b_ids_hash[..8]
+            } else {
+                &index.stage_b_ids_hash
+            }
         );
         return Ok(());
     }
+    let missing = missing_stage_b_ids(index, &ids);
+    // Attribution is per source file, not per mutant span. Files already in
+    // `lines` do not need another invert.
+    let mut needed_files: BTreeSet<String> = mutants
+        .iter()
+        .filter(|m| missing.contains(&m.id))
+        .map(|m| m.path.clone())
+        .collect();
+    needed_files.retain(|f| !index.lines.contains_key(f));
+
+    if needed_files.is_empty() {
+        info!(
+            "stage B partial hit: {} new mutant ids already covered by cached files",
+            missing.len()
+        );
+        index.stage_b_mutant_ids.extend(ids);
+        index.stage_b_ids_hash = hash_mutant_ids(&index.stage_b_mutant_ids);
+        index.save(paths)?;
+        return Ok(());
+    }
+
     let meta = load_metadata(&paths.baseline)?;
     let seeds: Vec<String> = {
         let mut s = BTreeSet::new();
@@ -243,11 +280,7 @@ pub fn stage_b_for_mutants(
         .baseline
         .canonicalize()
         .unwrap_or_else(|_| paths.baseline.clone());
-    let mut source_set = BTreeSet::new();
-    for m in mutants {
-        source_set.insert(m.path.clone());
-    }
-    let sources: Vec<PathBuf> = source_set
+    let sources: Vec<PathBuf> = needed_files
         .iter()
         .map(|rel| ws_root.join(rel))
         .filter(|p| p.is_file())
@@ -260,20 +293,56 @@ pub fn stage_b_for_mutants(
         .map(|(i, t)| (i as u32, t.clone()))
         .collect();
     info!(
-        "stage B per-test attribution: {} tests, {} source files",
+        "stage B per-test attribution: {} tests, {} source files ({} missing mutant ids)",
         jobs.len(),
-        sources.len()
+        sources.len(),
+        missing.len()
     );
-    index.lines = invert_tests(cfg, paths, &jobs, &sources)?;
-    index.stage_b_mutant_ids = ids;
+    let fresh = invert_tests(cfg, paths, &jobs, &sources)?;
+    merge_line_maps(&mut index.lines, fresh);
+    index.stage_b_mutant_ids.extend(ids);
+    index.stage_b_ids_hash = hash_mutant_ids(&index.stage_b_mutant_ids);
     index.save(paths)?;
     Ok(())
 }
 
 fn stage_b_is_cached(index: &CoverageIndex, ids: &BTreeSet<String>) -> bool {
-    !index.lines.is_empty()
-        && !index.stage_b_mutant_ids.is_empty()
+    !index.stage_b_mutant_ids.is_empty()
         && ids.is_subset(&index.stage_b_mutant_ids)
+        && (index.stage_b_ids_hash.is_empty()
+            || index.stage_b_ids_hash == hash_mutant_ids(&index.stage_b_mutant_ids))
+}
+
+fn missing_stage_b_ids(index: &CoverageIndex, ids: &BTreeSet<String>) -> BTreeSet<String> {
+    ids.difference(&index.stage_b_mutant_ids).cloned().collect()
+}
+
+pub fn hash_mutant_ids(ids: &BTreeSet<String>) -> String {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    for id in ids {
+        h.update(id.as_bytes());
+        h.update([0]);
+    }
+    crate::util::hex(&h.finalize())
+}
+
+fn merge_line_maps(
+    dest: &mut HashMap<String, HashMap<u32, Vec<u32>>>,
+    src: HashMap<String, HashMap<u32, Vec<u32>>>,
+) {
+    for (file, lines) in src {
+        let e = dest.entry(file).or_default();
+        for (line, idxs) in lines {
+            let v = e.entry(line).or_default();
+            for i in idxs {
+                if !v.contains(&i) {
+                    v.push(i);
+                }
+            }
+            v.sort_unstable();
+        }
+    }
 }
 
 fn filter_reverse_dep_tests(
@@ -369,7 +438,8 @@ fn run_union_coverage(
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
         apply_package_select(&mut cmd, &package_select(cfg, &meta));
-        cmd.arg("--partition").arg(format!("count:{shard}/{n_shards}"));
+        cmd.arg("--partition")
+            .arg(format!("count:{shard}/{n_shards}"));
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         let status = cmd.status().context("stage A cargo nextest run")?;
@@ -428,7 +498,11 @@ fn check_stage_a_pass_ids(
         tracing::warn!("stage A produced no JUnit passes; skipping pass-count guard");
         return Ok(());
     }
-    let green_failed: HashSet<&str> = baseline.failed_test_ids.iter().map(String::as_str).collect();
+    let green_failed: HashSet<&str> = baseline
+        .failed_test_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
     let green_ids: HashSet<&str> = baseline.tests.iter().map(|t| t.id.as_str()).collect();
     let mut green_pass = 0usize;
     let mut instr_pass = 0usize;
@@ -621,41 +695,39 @@ fn invert_tests(
             let ws_root = ws_root.clone();
             let cov_target = paths.baseline_cov.clone();
             let baseline = paths.baseline.clone();
-            scope.spawn(move || {
-                loop {
-                    let i = next.fetch_add(1, Ordering::SeqCst);
-                    if i >= n {
-                        break;
-                    }
-                    let (idx, test) = &jobs[i];
-                    match index_one_test(
-                        test,
-                        *idx,
-                        &cov_target,
-                        &baseline,
-                        &prof_root,
-                        &llvm_profdata,
-                        &llvm_cov,
-                        &registry_re,
-                        &ws_root,
-                        &sources,
-                        INDEX_TEST_TIMEOUT,
-                    ) {
-                        Ok(hits) => {
-                            let mut inv = inverted.lock().unwrap();
-                            for (file, lines) in hits {
-                                let e = inv.entry(file).or_default();
-                                for line in lines {
-                                    let v = e.entry(line).or_default();
-                                    if !v.contains(idx) {
-                                        v.push(*idx);
-                                    }
+            scope.spawn(move || loop {
+                let i = next.fetch_add(1, Ordering::SeqCst);
+                if i >= n {
+                    break;
+                }
+                let (idx, test) = &jobs[i];
+                match index_one_test(
+                    test,
+                    *idx,
+                    &cov_target,
+                    &baseline,
+                    &prof_root,
+                    &llvm_profdata,
+                    &llvm_cov,
+                    &registry_re,
+                    &ws_root,
+                    &sources,
+                    INDEX_TEST_TIMEOUT,
+                ) {
+                    Ok(hits) => {
+                        let mut inv = inverted.lock().unwrap();
+                        for (file, lines) in hits {
+                            let e = inv.entry(file).or_default();
+                            for line in lines {
+                                let v = e.entry(line).or_default();
+                                if !v.contains(idx) {
+                                    v.push(*idx);
                                 }
                             }
                         }
-                        Err(err) => {
-                            errors.lock().unwrap().push(format!("{}: {err:#}", test.id));
-                        }
+                    }
+                    Err(err) => {
+                        errors.lock().unwrap().push(format!("{}: {err:#}", test.id));
                     }
                 }
             });
@@ -794,7 +866,9 @@ pub fn parse_lcov(text: &str, ws_root: &Path) -> HashMap<String, Vec<u32>> {
             let mut parts = rest.split(',');
             let Some(ln) = parts.next() else { continue };
             let hits = parts.next().unwrap_or("0");
-            let Ok(line_no) = ln.parse::<u32>() else { continue };
+            let Ok(line_no) = ln.parse::<u32>() else {
+                continue;
+            };
             if hits == "0" {
                 continue;
             }
@@ -887,7 +961,10 @@ pub fn parse_nextest_list(
                 if kind == "bench" {
                     continue;
                 }
-                let ignored = spec.get("ignored").and_then(|x| x.as_bool()).unwrap_or(false);
+                let ignored = spec
+                    .get("ignored")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
                 if ignored {
                     continue;
                 }
@@ -1040,10 +1117,33 @@ end_of_record
         let mut index = CoverageIndex::default();
         index.lines.insert("a.rs".into(), HashMap::new());
         index.stage_b_mutant_ids = ["m1".into(), "m2".into(), "m3".into()].into();
+        index.stage_b_ids_hash = hash_mutant_ids(&index.stage_b_mutant_ids);
         let subset: BTreeSet<String> = ["m1".into(), "m3".into()].into();
         assert!(stage_b_is_cached(&index, &subset));
         let extra: BTreeSet<String> = ["m1".into(), "m4".into()].into();
         assert!(!stage_b_is_cached(&index, &extra));
+        assert_eq!(missing_stage_b_ids(&index, &extra), ["m4".into()].into());
+    }
+
+    #[test]
+    fn merge_line_maps_unions_test_indices() {
+        let mut dest: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
+        dest.entry("a.rs".into()).or_default().insert(3, vec![0, 2]);
+        let mut src: HashMap<String, HashMap<u32, Vec<u32>>> = HashMap::new();
+        src.entry("a.rs".into()).or_default().insert(3, vec![2, 5]);
+        src.entry("b.rs".into()).or_default().insert(1, vec![7]);
+        merge_line_maps(&mut dest, src);
+        assert_eq!(dest["a.rs"][&3], vec![0, 2, 5]);
+        assert_eq!(dest["b.rs"][&1], vec![7]);
+    }
+
+    #[test]
+    fn hash_mutant_ids_is_order_independent_and_stable() {
+        let a: BTreeSet<String> = ["m2".into(), "m1".into()].into();
+        let b: BTreeSet<String> = ["m1".into(), "m2".into()].into();
+        assert_eq!(hash_mutant_ids(&a), hash_mutant_ids(&b));
+        let c: BTreeSet<String> = ["m1".into()].into();
+        assert_ne!(hash_mutant_ids(&a), hash_mutant_ids(&c));
     }
 
     #[test]

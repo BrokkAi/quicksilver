@@ -1,6 +1,6 @@
 use crate::config::{CloneBackendKind, Config};
 use crate::types::Paths;
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
 use std::fs;
 use std::io::{self, Write};
@@ -101,7 +101,9 @@ impl CloneBackend for ZfsCloneBackend {
         if reflink_copy::reflink(src, dst).is_ok() {
             return Ok(());
         }
-        fs::copy(src, dst).map(|_| ()).context("zfs-clone file copy")
+        fs::copy(src, dst)
+            .map(|_| ())
+            .context("zfs-clone file copy")
     }
     fn clone_tree(&self, src: &Path, dst: &Path) -> Result<()> {
         zfs_clone_tree(self, src, dst)
@@ -153,7 +155,10 @@ pub fn probe(
         f.sync_all()?;
     }
 
-    let try_reflink = matches!(requested, CloneBackendKind::Auto | CloneBackendKind::Reflink);
+    let try_reflink = matches!(
+        requested,
+        CloneBackendKind::Auto | CloneBackendKind::Reflink
+    );
     if try_reflink {
         let before = crate::util::statvfs_avail(scratch_root).unwrap_or(0);
         let start = Instant::now();
@@ -217,7 +222,7 @@ pub fn probe(
                 }
             }
         }
-            let _ = fs::remove_file(&dst);
+        let _ = fs::remove_file(&dst);
     }
 
     // zfs-clone is opt-in only. Auto must not pick it: `zfs snapshot -f` is
@@ -479,8 +484,7 @@ fn copy_file_range_path(src: &Path, dst: &Path) -> io::Result<()> {
 
 fn clone_tree_with(backend: &dyn CloneBackend, src: &Path, dst: &Path) -> Result<()> {
     if dst.exists() {
-        fs::remove_dir_all(dst)
-            .with_context(|| format!("remove existing {}", dst.display()))?;
+        fs::remove_dir_all(dst).with_context(|| format!("remove existing {}", dst.display()))?;
     }
     fs::create_dir_all(dst)?;
     let mut dirs = Vec::new();
@@ -745,7 +749,13 @@ fn zfs_clone_tree(backend: &ZfsCloneBackend, src: &Path, dst: &Path) -> Result<(
         );
     }
     let mut clone = zfs_cmd(remote);
-    clone.args(["clone", "-o", &format!("mountpoint={}", dst.display()), &snap_name, &clone_name]);
+    clone.args([
+        "clone",
+        "-o",
+        &format!("mountpoint={}", dst.display()),
+        &snap_name,
+        &clone_name,
+    ]);
     let out = clone.output().context("zfs clone")?;
     if !out.status.success() {
         bail!(
@@ -789,11 +799,7 @@ pub fn worker_dir(paths: &Paths, slot: usize) -> PathBuf {
     paths.workers.join(format!("w{slot:02}"))
 }
 
-pub fn ensure_worker(
-    backend: &dyn CloneBackend,
-    paths: &Paths,
-    slot: usize,
-) -> Result<PathBuf> {
+pub fn ensure_worker(backend: &dyn CloneBackend, paths: &Paths, slot: usize) -> Result<PathBuf> {
     let dest = worker_dir(paths, slot);
     if dest.exists() {
         if backend.name() == "zfs-clone" {
@@ -820,16 +826,11 @@ pub fn check_free_space(path: &Path, min: Option<u64>) -> Result<()> {
     let avail = crate::util::statvfs_avail(path)?;
     if let Some(min) = min {
         if avail < min {
-            bail!(
-                "scratch filesystem has {avail} bytes free; --max-scratch wants at least {min}"
-            );
+            bail!("scratch filesystem has {avail} bytes free; --max-scratch wants at least {min}");
         }
     }
     if avail < 5 * (1 << 30) {
-        warn!(
-            "scratch filesystem has only {} bytes free",
-            avail
-        );
+        warn!("scratch filesystem has only {} bytes free", avail);
     }
     Ok(())
 }
