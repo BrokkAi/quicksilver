@@ -162,12 +162,15 @@ pub fn probe(
                 let clone_secs = start.elapsed().as_secs_f64();
                 let after = crate::util::statvfs_avail(scratch_root).unwrap_or(before);
                 let space_delta = before as i64 - after as i64;
-                verify_independent(&src, &dst)?;
+                // Classify sharing before verify_independent. Writing the source
+                // unshares its first CoW extent, so filefrag/FIEMAP after that
+                // look like a full copy on a working XFS reflink.
                 let sharing = classify_sharing(
                     space_delta,
                     PROBE_BYTES as u64,
                     filefrag_shared(&src, &dst).or_else(|| fiemap_shared(&src, &dst)),
                 );
+                verify_independent(&src, &dst)?;
                 match sharing {
                     Sharing::SharedBlocks => {
                         let _ = fs::remove_dir_all(&dir);

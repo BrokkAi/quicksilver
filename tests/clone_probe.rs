@@ -50,7 +50,7 @@ fn successful_reflink_probe_verifies_shared_blocks_when_fs_supports_it() {
             assert!(report.message.contains("shared blocks"));
         }
         Err(err) => {
-            eprintln!("skip: reflink probe failed on /mnt/containers: {err:#}");
+            panic!("expected reflink CoW on /mnt/containers: {err:#}");
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
