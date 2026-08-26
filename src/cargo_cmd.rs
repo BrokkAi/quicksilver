@@ -246,8 +246,14 @@ pub fn build_tests(
     cmd.args(cargo_profile_args());
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
     // package pays startup + lock + fingerprint 2–4× on the compile-bound path.
-    for p in packages {
-        cmd.arg("-p").arg(p);
+    // Empty means the whole workspace — cargo-mutants pays for everything, and
+    // default-members can be just a facade crate.
+    if packages.is_empty() {
+        cmd.arg("--workspace");
+    } else {
+        for p in packages {
+            cmd.arg("-p").arg(p);
+        }
     }
     if json {
         cmd.arg("--message-format=json");

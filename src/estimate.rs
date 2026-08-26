@@ -105,7 +105,7 @@ pub fn compute(
         },
         assumptions: vec![
             format!("N = {n} is exact from discovery inside scope `{sampled_scope}` (out-of-scope mutants are excluded, not filed as NotCovered)."),
-            format!("t_suite = {:.3}s is exact from the baseline nextest run.", t_suite),
+            format!("t_suite = {:.3}s is the workspace nextest wall clock (cargo-mutants runs the whole suite, not only -p scope).", t_suite),
             format!(
                 "f_nc = {:.3} is an exact census of the {scoped_n} in-scope mutants from Stage A union coverage (one suite run, not per-test). Restricting --sources is sound; a test we did not run is not treated as uncovered.",
                 f_nc
@@ -273,6 +273,7 @@ mod tests {
                 rebuild_secs: 4.0,
             }],
             preflight_recompiled: None,
+            failed_test_ids: Vec::new(),
         };
         let n = crate::plan::scoped_len(&plan);
         let report = compute(n, &plan, &plan, &baseline, &[] as &[Outcome], 2, 4, 16, "a+b".into(), 0);
@@ -300,6 +301,7 @@ mod tests {
                 rebuild_secs: 10.0,
             }],
             preflight_recompiled: None,
+            failed_test_ids: Vec::new(),
         };
         let a = compute(100, &plan, &plan, &baseline, &[], 5, 5, 5, "a".into(), 0);
         let b = compute(100, &plan, &plan, &baseline, &[], 5, 5, 50, "a".into(), 0);

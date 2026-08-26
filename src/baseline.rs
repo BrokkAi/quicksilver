@@ -30,7 +30,7 @@ pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &[], false, false)
 }
 
-pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>)> {
+pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>, Vec<String>)> {
     if !nextest_available() {
         bail!("cargo nextest is required. Install it with: cargo install cargo-nextest");
     }
@@ -38,6 +38,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
     let target = paths.baseline.join("target");
     let meta = load_metadata(&paths.baseline)?;
     let mut last_tests = Vec::new();
+    let mut last_failed_ids = Vec::new();
     let mut last_secs = 0.0;
     for run in 0..cfg.baseline_runs.max(1) {
         info!("baseline cargo nextest run ({}/{})", run + 1, cfg.baseline_runs.max(1));
@@ -48,9 +49,11 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
+        // Workspace suite: cargo-mutants runs everything. Timings for reverse-dep
+        // covering tests are a subset of this JUnit.
         crate::cargo_cmd::apply_package_select(
             &mut cmd,
-            &crate::cargo_cmd::package_select(cfg, &meta),
+            &crate::cargo_cmd::PackageSelect::Workspace,
         );
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
@@ -75,7 +78,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
             let failed = junit_failures(&xml);
             let seed_fails: Vec<_> = failed
                 .iter()
-                .filter(|(pkg, _)| seeds.is_empty() || seeds.iter().any(|s| s == pkg))
+                .filter(|f| seeds.is_empty() || seeds.iter().any(|s| s == &f.package))
                 .cloned()
                 .collect();
             if !seed_fails.is_empty() {
@@ -86,26 +89,27 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
                     seed_fails
                         .iter()
                         .take(5)
-                        .map(|(_, n)| n.as_str())
+                        .map(|f| f.name.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             }
             if !failed.is_empty() {
                 tracing::warn!(
-                    "{} reverse-dep tests failed (not in {:?}); keeping timings. first: {}",
+                    "{} workspace tests failed (not in {:?}); keeping timings. first: {}",
                     failed.len(),
                     seeds,
-                    failed[0].1
+                    failed[0].name
                 );
             }
+            last_failed_ids = failed.into_iter().map(|f| f.id).collect();
         } else if !status.success() {
             bail!("red baseline: cargo nextest run failed and produced no junit.xml");
         }
     }
     let json = serde_json::to_vec_pretty(&last_tests)?;
     crate::util::write_atomic(&paths.index.join("tests.json"), json)?;
-    Ok((last_secs, last_tests))
+    Ok((last_secs, last_tests, last_failed_ids))
 }
 
 pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<TestInfo>> {
@@ -134,15 +138,22 @@ pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<Tes
     Ok(tests)
 }
 
-/// (package, test name) for testcases that contain a failure or error.
-pub fn junit_failures(xml: &str) -> Vec<(String, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JunitFailure {
+    pub id: String,
+    pub package: String,
+    pub name: String,
+}
+
+/// Testcases that contain a failure or error.
+pub fn junit_failures(xml: &str) -> Vec<JunitFailure> {
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(idx) = rest.find("<testcase") {
         rest = &rest[idx..];
         let tag_end = rest.find('>').unwrap_or(rest.len());
         let tag = &rest[..tag_end];
-        let self_close = tag.trim_end().ends_with('/') || rest.as_bytes().get(tag_end.saturating_sub(1)) == Some(&b'/');
+        let self_close = tag.trim_end().ends_with('/');
         let name = attr(tag, "name").unwrap_or_default();
         let classname = attr(tag, "classname").unwrap_or_default();
         let package = classname
@@ -150,18 +161,35 @@ pub fn junit_failures(xml: &str) -> Vec<(String, String)> {
             .next()
             .unwrap_or(classname.as_str())
             .to_string();
-        let body = if self_close || rest[tag_end..].starts_with("/>") {
+        let body = if self_close {
             ""
         } else {
             let close = rest.find("</testcase>").unwrap_or(rest.len());
             &rest[..close]
         };
         if !name.is_empty() && (body.contains("<failure") || body.contains("<error")) {
-            out.push((package, name));
+            out.push(JunitFailure {
+                id: format!("{classname}::{name}"),
+                package,
+                name,
+            });
         }
         rest = &rest[tag_end.min(rest.len()) + 1..];
     }
     out
+}
+
+pub fn junit_passed_ids(xml: &str) -> std::collections::HashSet<String> {
+    let failed: std::collections::HashSet<String> =
+        junit_failures(xml).into_iter().map(|f| f.id).collect();
+    let mut pass = std::collections::HashSet::new();
+    for (name, classname, _) in junit_cases(xml) {
+        let id = format!("{classname}::{name}");
+        if !failed.contains(&id) {
+            pass.insert(id);
+        }
+    }
+    pass
 }
 
 fn junit_cases(xml: &str) -> Vec<(String, String, f64)> {
@@ -287,16 +315,18 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
             tests: Vec::new(),
             package_costs: Vec::new(),
             preflight_recompiled: None,
+            failed_test_ids: Vec::new(),
         });
     }
     build_baseline(cfg, paths)?;
-    let (suite_secs, tests) = run_green_suite(cfg, paths)?;
+    let (suite_secs, tests, failed_test_ids) = run_green_suite(cfg, paths)?;
     let package_costs = measure_package_costs(cfg, paths)?;
     let report = BaselineReport {
         suite_secs,
         tests,
         package_costs,
         preflight_recompiled: None,
+        failed_test_ids,
     };
     write_baseline_report(paths, &report)?;
     Ok(report)
@@ -341,8 +371,12 @@ mod tests {
 "#;
         let failed = junit_failures(xml);
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].0, "brokk-bifrost");
-        assert!(failed[0].1.contains("large_rust_file"));
+        assert_eq!(failed[0].package, "brokk-bifrost");
+        assert!(failed[0].name.contains("large_rust_file"));
+        assert!(failed[0].id.contains("suite_issues"));
+        let passed = junit_passed_ids(xml);
+        assert!(passed.iter().any(|id| id.ends_with("::ok")));
+        assert!(!passed.iter().any(|id| id.contains("large_rust_file")));
     }
 
     fn emptyish_metadata() -> cargo_metadata::Metadata {

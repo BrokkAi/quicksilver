@@ -122,7 +122,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         );
     }
 
-    let mut index = index::build_or_load(&cfg, &paths)?;
+    let mut index = index::build_or_load(&cfg, &paths, &baseline)?;
     let timing = index::attach_timings(&mut index, &baseline.tests);
     if !baseline.tests.is_empty() && !index.tests.is_empty() {
         if timing.matched == 0 {

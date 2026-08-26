@@ -198,4 +198,7 @@ pub struct BaselineReport {
     pub tests: Vec<TestInfo>,
     pub package_costs: Vec<PackageCost>,
     pub preflight_recompiled: Option<u64>,
+    /// Test ids that failed in the uninstrumented suite (non-seed SLO flakes, etc.).
+    #[serde(default)]
+    pub failed_test_ids: Vec<String>,
 }

@@ -4,7 +4,7 @@ use crate::cargo_cmd::{
 };
 use crate::config::Config;
 use crate::exec::process::{WaitResult, run_command_timeout};
-use crate::types::{Mutant, Paths, TestInfo};
+use crate::types::{BaselineReport, Mutant, Paths, TestInfo};
 use crate::util::{find_llvm_tool, rustc_verbose_version, sanitize_filename, sha256_file};
 use anyhow::{Context, Result, bail};
 use ignore::WalkBuilder;
@@ -24,7 +24,7 @@ const INDEX_TEST_TIMEOUT: Duration = Duration::from_secs(120);
 /// Index errors used to be warnings, so a 90% coverage miss still produced a number.
 const INDEX_ERROR_MAX_FRAC: f64 = 0.10;
 
-const INDEX_VERSION: u32 = 2;
+const INDEX_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageIndex {
@@ -41,6 +41,10 @@ pub struct CoverageIndex {
     /// for f_nc / NotCovered. Restricting --sources is sound; restricting tests is not.
     #[serde(default)]
     pub union: HashMap<String, BTreeSet<u32>>,
+    /// Mutant ids Stage B was computed for. Resume/re-run skips attribution
+    /// when the requested set is a subset of this.
+    #[serde(default)]
+    pub stage_b_mutant_ids: BTreeSet<String>,
 }
 
 impl Default for CoverageIndex {
@@ -52,6 +56,7 @@ impl Default for CoverageIndex {
             tests: Vec::new(),
             lines: HashMap::new(),
             union: HashMap::new(),
+            stage_b_mutant_ids: BTreeSet::new(),
         }
     }
 }
@@ -129,7 +134,11 @@ pub fn source_cache_key(root: &Path) -> Result<String> {
     Ok(crate::util::hex(&h.finalize()))
 }
 
-pub fn build_or_load(cfg: &Config, paths: &Paths) -> Result<CoverageIndex> {
+pub fn build_or_load(
+    cfg: &Config,
+    paths: &Paths,
+    baseline: &BaselineReport,
+) -> Result<CoverageIndex> {
     let key = source_cache_key(&paths.baseline)?;
     if !cfg.reindex {
         if let Some(existing) = CoverageIndex::load(paths)? {
@@ -142,26 +151,32 @@ pub fn build_or_load(cfg: &Config, paths: &Paths) -> Result<CoverageIndex> {
             }
         }
     }
-    build_index(cfg, paths, key)
+    build_index(cfg, paths, key, baseline)
 }
 
-fn build_index(cfg: &Config, paths: &Paths, cache_key: String) -> Result<CoverageIndex> {
+fn build_index(
+    cfg: &Config,
+    paths: &Paths,
+    cache_key: String,
+    baseline: &BaselineReport,
+) -> Result<CoverageIndex> {
+    let meta = load_metadata(&paths.baseline)?;
     info!("instrumented build into {}", paths.baseline_cov.display());
     fs::create_dir_all(&paths.baseline_cov)?;
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
     cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
     apply_build_env(&mut cmd, cfg, true);
-    cmd.arg("build").arg("--tests").arg("--workspace");
+    cmd.arg("build").arg("--tests");
     cmd.args(cargo_profile_args());
+    apply_package_select(&mut cmd, &package_select(cfg, &meta));
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     let status = cmd.status().context("instrumented cargo build")?;
     if !status.success() {
-        bail!("instrumented cargo build --tests --workspace failed");
+        bail!("instrumented cargo build --tests failed");
     }
 
-    let meta = load_metadata(&paths.baseline)?;
     let tests = list_tests(cfg, paths)?;
     let seeds = covering_seeds(cfg);
     let tests = filter_reverse_dep_tests(tests, &meta, &seeds);
@@ -176,7 +191,7 @@ fn build_index(cfg: &Config, paths: &Paths, cache_key: String) -> Result<Coverag
         .canonicalize()
         .unwrap_or_else(|_| paths.baseline.clone());
     let sources = source_files_for_seeds(&meta, &seeds, &ws_root);
-    let union = run_union_coverage(cfg, paths, &tests, &sources)?;
+    let union = run_union_coverage(cfg, paths, &tests, &sources, baseline)?;
     info!(
         "stage A union: {} files, {} covered lines",
         union.len(),
@@ -190,6 +205,7 @@ fn build_index(cfg: &Config, paths: &Paths, cache_key: String) -> Result<Coverag
         tests,
         lines: HashMap::new(),
         union,
+        stage_b_mutant_ids: BTreeSet::new(),
     };
     index.save(paths)?;
     Ok(index)
@@ -204,6 +220,14 @@ pub fn stage_b_for_mutants(
     mutants: &[Mutant],
 ) -> Result<()> {
     if mutants.is_empty() || index.tests.is_empty() {
+        return Ok(());
+    }
+    let ids: BTreeSet<String> = mutants.iter().map(|m| m.id.clone()).collect();
+    if stage_b_is_cached(index, &ids) {
+        info!(
+            "reusing Stage B attribution ({} cached mutant ids)",
+            index.stage_b_mutant_ids.len()
+        );
         return Ok(());
     }
     let meta = load_metadata(&paths.baseline)?;
@@ -241,8 +265,15 @@ pub fn stage_b_for_mutants(
         sources.len()
     );
     index.lines = invert_tests(cfg, paths, &jobs, &sources)?;
+    index.stage_b_mutant_ids = ids;
     index.save(paths)?;
     Ok(())
+}
+
+fn stage_b_is_cached(index: &CoverageIndex, ids: &BTreeSet<String>) -> bool {
+    !index.lines.is_empty()
+        && !index.stage_b_mutant_ids.is_empty()
+        && ids.is_subset(&index.stage_b_mutant_ids)
 }
 
 fn filter_reverse_dep_tests(
@@ -302,6 +333,7 @@ fn run_union_coverage(
     paths: &Paths,
     tests: &[TestInfo],
     sources: &[PathBuf],
+    baseline: &BaselineReport,
 ) -> Result<HashMap<String, BTreeSet<u32>>> {
     if tests.is_empty() {
         return Ok(HashMap::new());
@@ -325,12 +357,12 @@ fn run_union_coverage(
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
     let status = cmd.status().context("stage A cargo nextest run")?;
-    if !status.success() {
-        tracing::warn!(
-            "stage A nextest run exited {}; merging whatever profraw was produced",
-            status
-        );
-    }
+    let junit = paths
+        .baseline_cov
+        .join("nextest")
+        .join("quicksilver")
+        .join("junit.xml");
+    check_stage_a_pass_count(tests, baseline, &junit, status.success())?;
 
     let mut raws = Vec::new();
     if let Ok(rd) = fs::read_dir(&prof_root) {
@@ -370,6 +402,64 @@ fn run_union_coverage(
         union.entry(file).or_default().extend(lines);
     }
     Ok(union)
+}
+
+fn check_stage_a_pass_count(
+    catalog: &[TestInfo],
+    baseline: &BaselineReport,
+    junit_path: &Path,
+    nextest_ok: bool,
+) -> Result<()> {
+    if catalog.is_empty() {
+        if !nextest_ok {
+            bail!("stage A nextest run failed with an empty catalog");
+        }
+        return Ok(());
+    }
+    if !junit_path.is_file() {
+        if !nextest_ok {
+            bail!(
+                "stage A nextest run failed with no junit at {}",
+                junit_path.display()
+            );
+        }
+        tracing::warn!("stage A produced no junit; skipping pass-count guard");
+        return Ok(());
+    }
+    let xml = fs::read_to_string(junit_path)?;
+    let instr_passed = crate::baseline::junit_passed_ids(&xml);
+    let green_failed: HashSet<&str> = baseline.failed_test_ids.iter().map(String::as_str).collect();
+    let green_ids: HashSet<&str> = baseline.tests.iter().map(|t| t.id.as_str()).collect();
+    let mut green_pass = 0usize;
+    let mut instr_pass = 0usize;
+    for t in catalog {
+        if green_ids.contains(t.id.as_str()) && !green_failed.contains(t.id.as_str()) {
+            green_pass += 1;
+        }
+        if instr_passed.contains(&t.id) {
+            instr_pass += 1;
+        }
+    }
+    if green_pass == 0 {
+        if !nextest_ok {
+            bail!("stage A nextest run failed and no catalog tests appear in the green baseline");
+        }
+        return Ok(());
+    }
+    let min = ((green_pass as f64) * (1.0 - INDEX_ERROR_MAX_FRAC)).ceil() as usize;
+    if instr_pass < min {
+        bail!(
+            "stage A passed {instr_pass} of {green_pass} catalog tests that were green uninstrumented (threshold {min}, {:.0}% drop allowed). f_nc is not an exact census if instrumentation dropped that many tests.",
+            INDEX_ERROR_MAX_FRAC * 100.0
+        );
+    }
+    if !nextest_ok {
+        tracing::warn!(
+            "stage A nextest exited non-zero but pass count {instr_pass}/{green_pass} is within {:.0}% of the green suite",
+            INDEX_ERROR_MAX_FRAC * 100.0
+        );
+    }
+    Ok(())
 }
 
 fn unique_binaries(tests: &[TestInfo], target_dir: &Path) -> Vec<PathBuf> {
@@ -670,7 +760,7 @@ pub fn list_tests(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
     apply_build_env(&mut cmd, cfg, true);
     cmd.args(["nextest", "list", "--message-format", "json"]);
     cmd.args(["--cargo-profile", crate::cargo_cmd::PROFILE]);
-    cmd.arg("--workspace");
+    apply_package_select(&mut cmd, &package_select(cfg, &meta));
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
         bail!(
@@ -875,6 +965,17 @@ end_of_record
         attach_timings(&mut index, &baseline);
         assert_eq!(index.tests[0].duration_secs, 0.2);
         assert_eq!(index.tests[1].duration_secs, 0.8);
+    }
+
+    #[test]
+    fn stage_b_cache_hits_on_subset_of_mutant_ids() {
+        let mut index = CoverageIndex::default();
+        index.lines.insert("a.rs".into(), HashMap::new());
+        index.stage_b_mutant_ids = ["m1".into(), "m2".into(), "m3".into()].into();
+        let subset: BTreeSet<String> = ["m1".into(), "m3".into()].into();
+        assert!(stage_b_is_cached(&index, &subset));
+        let extra: BTreeSet<String> = ["m1".into(), "m4".into()].into();
+        assert!(!stage_b_is_cached(&index, &extra));
     }
 
     #[test]
