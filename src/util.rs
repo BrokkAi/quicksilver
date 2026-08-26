@@ -1,0 +1,239 @@
+use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+
+pub fn nproc() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+pub fn default_build_jobs(max_build_memory_frac: f64) -> usize {
+    let by_cpu = (nproc() / 8).clamp(1, 16);
+    let by_ram = ram_budget_jobs(max_build_memory_frac).max(1);
+    by_cpu.min(by_ram).max(1)
+}
+
+pub fn ram_budget_jobs(frac: f64) -> usize {
+    let total = mem_total_bytes().unwrap_or(16 * (1 << 30));
+    let budget = (total as f64 * frac) as u64;
+    // Rough per-rustc working set. Too many concurrent rustcs evict the page cache.
+    const PER_JOB: u64 = 2 * (1 << 30);
+    (budget / PER_JOB).max(1) as usize
+}
+
+pub fn mem_total_bytes() -> Option<u64> {
+    let text = fs::read_to_string("/proc/meminfo").ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
+}
+
+pub fn repo_hash(root: &Path) -> String {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut h = Sha256::new();
+    h.update(canon.to_string_lossy().as_bytes());
+    hex(&h.finalize())[..16].to_string()
+}
+
+pub fn hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
+pub fn sha256_bytes(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    hex(&h.finalize())
+}
+
+pub fn sha256_file(path: &Path) -> Result<String> {
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(sha256_bytes(&data))
+}
+
+pub fn rel_slash(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+pub fn which(name: &str) -> Option<PathBuf> {
+    let Ok(path) = std::env::var("PATH") else {
+        return None;
+    };
+    for dir in path.split(':') {
+        let candidate = Path::new(dir).join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub fn fast_linker() -> Option<&'static str> {
+    if which("mold").is_some() {
+        Some("mold")
+    } else if which("ld.lld").is_some() || which("lld").is_some() {
+        Some("lld")
+    } else {
+        None
+    }
+}
+
+pub fn rustc_sysroot() -> Result<PathBuf> {
+    let out = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .context("rustc --print sysroot")?;
+    if !out.status.success() {
+        bail!("rustc --print sysroot failed");
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    ))
+}
+
+pub fn host_triple() -> Result<String> {
+    let out = Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .context("rustc -vV")?;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if let Some(rest) = line.strip_prefix("host: ") {
+            return Ok(rest.trim().to_string());
+        }
+    }
+    bail!("no host: line in rustc -vV")
+}
+
+pub fn rustc_verbose_version() -> Result<String> {
+    let out = Command::new("rustc")
+        .args(["-vV"])
+        .output()
+        .context("rustc -vV")?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+pub fn find_llvm_tool(name: &str) -> Result<PathBuf> {
+    let sysroot = rustc_sysroot()?;
+    let triple = host_triple()?;
+    let in_sysroot = sysroot
+        .join("lib/rustlib")
+        .join(&triple)
+        .join("bin")
+        .join(name);
+    if in_sysroot.is_file() {
+        return Ok(in_sysroot);
+    }
+    if let Some(p) = which(name) {
+        return Ok(p);
+    }
+    let distro = PathBuf::from(format!("/usr/lib/llvm-21/bin/{name}"));
+    if distro.is_file() {
+        return Ok(distro);
+    }
+    bail!("could not find {name}; install the rustup llvm-tools component")
+}
+
+pub fn format_duration(secs: f64) -> String {
+    if !secs.is_finite() || secs < 0.0 {
+        return "n/a".into();
+    }
+    if secs < 1.0 {
+        return format!("{:.0} ms", secs * 1000.0);
+    }
+    if secs < 60.0 {
+        return format!("{secs:.1} s");
+    }
+    if secs < 3600.0 {
+        return format!("{:.1} min", secs / 60.0);
+    }
+    if secs < 86400.0 {
+        return format!("{:.1} h", secs / 3600.0);
+    }
+    format!("{:.1} d", secs / 86400.0)
+}
+
+pub fn duration_from_secs(secs: f64) -> Duration {
+    Duration::from_secs_f64(secs.max(0.0))
+}
+
+pub fn write_atomic(path: &Path, data: impl AsRef<[u8]>) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(data.as_ref())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+pub fn statvfs_avail(path: &Path) -> Result<u64> {
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes())
+        .context("path contains interior NUL")?;
+    unsafe {
+        let mut s: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut s) != 0 {
+            return Err(std::io::Error::last_os_error()).context("statvfs");
+        }
+        Ok(s.f_bavail as u64 * s.f_frsize as u64)
+    }
+}
+
+pub fn fill_incompressible(len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    let mut x: u64 = 0xC0FFEE_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for chunk in buf.chunks_mut(8) {
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let bytes = x.to_le_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    buf
+}
+
+pub fn line_col_to_offset(src: &str, line: usize, column: usize) -> usize {
+    let mut off = 0usize;
+    let mut current_line = 1usize;
+    for part in src.split_inclusive('\n') {
+        if current_line == line {
+            return off + column.min(part.len());
+        }
+        off += part.len();
+        current_line += 1;
+    }
+    src.len().min(off + column)
+}
+
+pub fn sanitize_filename(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+pub fn parse_memory_spec(s: &str) -> Result<f64> {
+    let t = s.trim();
+    if let Some(p) = t.strip_suffix('%') {
+        let v: f64 = p.trim().parse().context("memory percent")?;
+        return Ok((v / 100.0).clamp(0.05, 0.95));
+    }
+    Ok(0.70)
+}

@@ -1,0 +1,47 @@
+[package]
+name = "cargo-quicksilver"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "Apache-2.0"
+description = "Impact-selected mutation testing for Cargo workspaces"
+readme = "README.md"
+repository = "https://github.com/BrokkAi/quicksilver"
+keywords = ["mutation-testing", "cargo", "testing"]
+categories = ["development-tools::testing", "command-line-utilities"]
+
+[lib]
+name = "cargo_quicksilver"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cargo-quicksilver"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+brokk-bifrost-analysis = "=0.10.6"
+cargo_metadata = "0.23"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+ctrlc = "3"
+globset = "0.4"
+humantime = "2"
+ignore = "0.4"
+indicatif = "0.17"
+libc = "0.2"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+quote = "1"
+rand = "0.8"
+reflink-copy = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+syn = { version = "2", features = ["full", "parsing", "extra-traits"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+wait-timeout = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,230 @@
+use crate::baseline::{prepare_baseline, preflight_recompile_count};
+use crate::config::{Config, ConfigExtras, FileConfig, merge_config};
+use crate::discover::{DiscoverFilter, discover};
+use crate::estimate::{self, EstimateReport};
+use crate::exec::execute;
+use crate::index::{self, CoverageIndex};
+use crate::plan::{self, Plan};
+use crate::scratch::{self, CloneBackend};
+use crate::types::{BaselineReport, Mutant, Outcome, Paths};
+use anyhow::Result;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+pub fn repo_root_from_cli(manifest: &Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = manifest {
+        if p.ends_with("Cargo.toml") {
+            return Ok(p.parent().unwrap_or(p).canonicalize()?);
+        }
+        return Ok(p.canonicalize()?);
+    }
+    Ok(std::env::current_dir()?)
+}
+
+pub fn config_from_cli(
+    common: &crate::cli::CommonOpts,
+    extras: ConfigExtras,
+) -> Result<(Config, FileConfig)> {
+    let repo = repo_root_from_cli(&common.manifest_path)?;
+    let file = Config::load_file(&repo)?;
+    let mut extras = extras;
+    extras.packages = common.packages.clone();
+    extras.files = common.files.clone();
+    extras.in_diff = common.in_diff.clone();
+    extras.index_scope = common.index_scope.clone();
+    extras.reindex = common.reindex;
+    extras.json = common.json.clone();
+    extras.resume = common.resume;
+    extras.shard = common
+        .shard
+        .as_deref()
+        .map(crate::config::parse_shard)
+        .transpose()?;
+    extras.baseline_runs = common.baseline_runs;
+    extras.timeout_floor_ms = common.timeout_floor_ms;
+    extras.strict_source_isolation = common.strict_source_isolation;
+    let cfg = merge_config(repo, file.clone(), common, extras)?;
+    Ok((cfg, file))
+}
+
+pub fn install_ctrlc() -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let f = Arc::clone(&flag);
+    let _ = ctrlc::set_handler(move || {
+        f.store(true, Ordering::SeqCst);
+    });
+    flag
+}
+
+pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
+    DiscoverFilter {
+        packages: cfg.packages.clone(),
+        files: cfg.files.clone(),
+        in_diff: cfg.in_diff.clone(),
+    }
+}
+
+pub fn default_index_scope(cfg: &Config, mutants: &[Mutant]) -> Option<String> {
+    if let Some(s) = &cfg.index_scope {
+        return Some(s.clone());
+    }
+    if mutants.iter().any(|m| m.package == "brokk-bifrost-core") {
+        return Some("brokk-bifrost-core".into());
+    }
+    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for m in mutants {
+        *counts.entry(&m.package).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(p, _)| p.to_string())
+}
+
+pub struct Prepared {
+    pub cfg: Config,
+    pub paths: Paths,
+    pub backend: Arc<dyn CloneBackend>,
+    pub probe: scratch::ProbeReport,
+    pub baseline: BaselineReport,
+    pub mutants: Vec<Mutant>,
+    pub index: CoverageIndex,
+    pub plan: Plan,
+}
+
+pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
+    let paths = cfg.paths();
+    paths.ensure()?;
+    let (backend, probe) = scratch::probe_and_select(&cfg)?;
+    eprintln!("{}", scratch::format_probe(&probe));
+    scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
+
+    let baseline = prepare_baseline(&cfg, &paths, skip_baseline)?;
+
+    let mutants = discover(&paths.baseline, &discover_filter(&cfg))?;
+    eprintln!("discovered {} mutants", mutants.len());
+
+    if for_estimate && cfg.index_scope.is_none() {
+        cfg.index_scope = default_index_scope(&cfg, &mutants);
+        if let Some(s) = &cfg.index_scope {
+            eprintln!("index-scope defaulted to {s}");
+        }
+    }
+
+    let mut index = index::build_or_load(&cfg, &paths)?;
+    index::attach_timings(&mut index, &baseline.tests);
+    let plan = plan::plan(
+        &mutants,
+        &index,
+        &baseline,
+        cfg.shard,
+        cfg.build_jobs,
+    );
+    eprintln!(
+        "plan: {} to build, {} not covered",
+        plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>(),
+        plan.not_covered.len()
+    );
+
+    Ok(Prepared {
+        cfg,
+        paths,
+        backend,
+        probe,
+        baseline,
+        mutants,
+        index,
+        plan,
+    })
+}
+
+pub fn run_prepared(
+    prepared: &Prepared,
+    limit: usize,
+    sample: Option<&[Mutant]>,
+) -> Result<(Vec<Outcome>, u64)> {
+    let cancel = install_ctrlc();
+    let plan = if let Some(sample) = sample {
+        plan::plan(
+            sample,
+            &prepared.index,
+            &prepared.baseline,
+            prepared.cfg.shard,
+            prepared.cfg.build_jobs,
+        )
+    } else {
+        prepared.plan.clone()
+    };
+    let exec = execute(
+        &prepared.cfg,
+        &prepared.paths,
+        Arc::clone(&prepared.backend),
+        plan,
+        cancel,
+        limit,
+    )?;
+    Ok((exec.outcomes, exec.builds))
+}
+
+pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
+    let Some(m) = prepared
+        .plan
+        .batches
+        .iter()
+        .flat_map(|b| b.mutants.iter())
+        .map(|p| &p.mutant)
+        .next()
+    else {
+        return Ok(None);
+    };
+    match preflight_recompile_count(&prepared.cfg, &prepared.paths, m) {
+        Ok(n) => {
+            eprintln!("preflight recompile count after one mutant: {n} units");
+            if n > 8 {
+                eprintln!(
+                    "warning: {n} crates rebuilt for one function-body edit. A source-hashing build script is likely at work. Pin identities with [build-env] in quicksilver.toml (bifrost: BIFROST_BUILD_IDENTITY_OVERRIDE)."
+                );
+            }
+            Ok(Some(n))
+        }
+        Err(err) => {
+            tracing::warn!("preflight failed: {err:#}");
+            Ok(None)
+        }
+    }
+}
+
+pub fn estimate_from(
+    prepared: &Prepared,
+    sample: &[Mutant],
+    outcomes: &[Outcome],
+) -> EstimateReport {
+    let scope = prepared
+        .cfg
+        .index_scope
+        .clone()
+        .unwrap_or_else(|| "workspace".into());
+    estimate::compute(
+        prepared.mutants.len(),
+        &prepared.plan,
+        &prepared.baseline,
+        outcomes,
+        prepared.cfg.build_jobs,
+        prepared.cfg.test_jobs,
+        scope,
+        sample.len(),
+    )
+}
+
+pub fn write_outputs(
+    cfg: &Config,
+    outcomes: &[Outcome],
+    estimate: Option<&EstimateReport>,
+) -> Result<()> {
+    crate::report::print_outcomes(outcomes);
+    if let Some(path) = &cfg.json {
+        crate::report::write_json(path, outcomes, estimate)?;
+    }
+    Ok(())
+}
