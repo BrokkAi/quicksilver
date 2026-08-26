@@ -40,7 +40,8 @@ pub struct SampleCounts {
 #[allow(clippy::too_many_arguments)]
 pub fn compute(
     n: usize,
-    plan: &Plan,
+    census: &Plan,
+    t_sel_plan: &Plan,
     baseline: &BaselineReport,
     sample_outcomes: &[crate::types::Outcome],
     j_build: usize,
@@ -49,20 +50,19 @@ pub fn compute(
     sampled_scope: String,
     sample_size: usize,
 ) -> EstimateReport {
-    let scoped_n = scoped_len(plan);
+    let scoped_n = scoped_len(census);
     let f_nc = if scoped_n == 0 {
         0.0
     } else {
-        plan.not_covered.len() as f64 / scoped_n as f64
+        census.not_covered.len() as f64 / scoped_n as f64
     };
-    let (low, high) = wilson_interval(plan.not_covered.len(), scoped_n.max(1));
     let t_build = if baseline.package_costs.is_empty() {
         2.0
     } else {
         baseline.package_costs.iter().map(|p| p.rebuild_secs).sum::<f64>()
             / baseline.package_costs.len() as f64
     };
-    let t_sel = mean_t_sel(plan);
+    let t_sel = mean_t_sel(t_sel_plan);
     let t_suite = baseline.suite_secs;
     let j_cm = j_cm.max(1);
     let covered_frac = 1.0 - f_nc;
@@ -72,7 +72,7 @@ pub fn compute(
     let t_qs = compile_side.max(test_side);
     // Schemata batches per crate, not per function. unique_packages already
     // counts only crates with covered mutants — do not multiply by covered_frac.
-    let projected_batches = unique_packages(plan);
+    let projected_batches = unique_packages(census);
     let t_v2 = (projected_batches as f64 * t_build) / j_build.max(1) as f64
         + n as f64 * covered_frac * t_sel / j_test.max(1) as f64;
 
@@ -82,8 +82,8 @@ pub fn compute(
         sample_size,
         n_exact: n,
         f_nc,
-        f_nc_low: low,
-        f_nc_high: high,
+        f_nc_low: f_nc,
+        f_nc_high: f_nc,
         t_suite_secs: t_suite,
         t_build_mean_secs: t_build,
         t_sel_mean_secs: t_sel,
@@ -107,11 +107,11 @@ pub fn compute(
             format!("N = {n} is exact from discovery inside scope `{sampled_scope}` (out-of-scope mutants are excluded, not filed as NotCovered)."),
             format!("t_suite = {:.3}s is exact from the baseline nextest run.", t_suite),
             format!(
-                "f_nc = {:.3} (95% Wilson interval {:.3}–{:.3}) is the coverage-index census of the {scoped_n} in-scope mutants, not a workspace-wide census against a partial index. A crate with unusual coverage skews f_nc hard, and f_nc is the largest lever in the model.",
-                f_nc, low, high
+                "f_nc = {:.3} is an exact census of the {scoped_n} in-scope mutants from Stage A union coverage (one suite run, not per-test). Restricting --sources is sound; a test we did not run is not treated as uncovered.",
+                f_nc
             ),
             format!(
-                "t_sel mean = {:.4}s is the sum of baseline durations of covering tests, over in-scope covered mutants (sample execution n={}).",
+                "t_sel mean = {:.4}s is sampled: per-test attribution (Stage B) over the executed sample (n={}).",
                 t_sel, sample_size
             ),
             format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package (matches the single multi -p invocation in build_one).", t_build),
@@ -127,22 +127,6 @@ pub fn compute(
     }
 }
 
-fn wilson_interval(successes: usize, n: usize) -> (f64, f64) {
-    if n == 0 {
-        return (0.0, 1.0);
-    }
-    let z = 1.96_f64;
-    let n = n as f64;
-    let p = successes as f64 / n;
-    let z2 = z * z;
-    let denom = 1.0 + z2 / n;
-    let center = p + z2 / (2.0 * n);
-    let margin = z * ((p * (1.0 - p) + z2 / (4.0 * n)) / n).sqrt();
-    let low = ((center - margin) / denom).clamp(0.0, 1.0);
-    let high = ((center + margin) / denom).clamp(0.0, 1.0);
-    (low, high)
-}
-
 pub fn render(report: &EstimateReport) -> String {
     let mut s = String::new();
     s.push_str("=== cargo-quicksilver estimate ===\n\n");
@@ -154,8 +138,8 @@ pub fn render(report: &EstimateReport) -> String {
     ));
     s.push_str("Measured inputs:\n");
     s.push_str(&format!(
-        "  f_nc (not covered): {:.3}  [range {:.3}–{:.3}; sampled from {}]\n",
-        report.f_nc, report.f_nc_low, report.f_nc_high, report.sampled_scope
+        "  f_nc (not covered): {:.3}  [census of {}]\n",
+        report.f_nc, report.sampled_scope
     ));
     s.push_str(&format!(
         "  t_suite: {}  [exact]\n",
@@ -291,7 +275,7 @@ mod tests {
             preflight_recompiled: None,
         };
         let n = crate::plan::scoped_len(&plan);
-        let report = compute(n, &plan, &baseline, &[] as &[Outcome], 2, 4, 16, "a+b".into(), 0);
+        let report = compute(n, &plan, &plan, &baseline, &[] as &[Outcome], 2, 4, 16, "a+b".into(), 0);
         assert_eq!(n, 36);
         // 1 not covered / 36 in-scope — not 0 because we did not file other crates as NC.
         assert!((report.f_nc - 1.0 / 36.0).abs() < 1e-9);
@@ -317,8 +301,8 @@ mod tests {
             }],
             preflight_recompiled: None,
         };
-        let a = compute(100, &plan, &baseline, &[], 5, 5, 5, "a".into(), 0);
-        let b = compute(100, &plan, &baseline, &[], 5, 5, 50, "a".into(), 0);
+        let a = compute(100, &plan, &plan, &baseline, &[], 5, 5, 5, "a".into(), 0);
+        let b = compute(100, &plan, &plan, &baseline, &[], 5, 5, 50, "a".into(), 0);
         assert!(b.t_mutants_secs < a.t_mutants_secs);
         assert!((a.t_mutants_secs / b.t_mutants_secs - 10.0).abs() < 1e-9);
     }

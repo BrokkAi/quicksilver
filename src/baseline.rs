@@ -36,6 +36,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
     }
     let config_path = write_nextest_config(&paths.index)?;
     let target = paths.baseline.join("target");
+    let meta = load_metadata(&paths.baseline)?;
     let mut last_tests = Vec::new();
     let mut last_secs = 0.0;
     for run in 0..cfg.baseline_runs.max(1) {
@@ -47,7 +48,10 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
-        crate::cargo_cmd::apply_package_select(&mut cmd, &crate::cargo_cmd::package_select(cfg));
+        crate::cargo_cmd::apply_package_select(
+            &mut cmd,
+            &crate::cargo_cmd::package_select(cfg, &meta),
+        );
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         let start = Instant::now();
@@ -68,7 +72,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
             paths.index.join("junit.xml")
         };
         if junit.is_file() {
-            last_tests = parse_junit(&fs::read_to_string(&junit)?, &load_metadata(&paths.baseline)?)?;
+            last_tests = parse_junit(&fs::read_to_string(&junit)?, &meta)?;
         }
     }
     let json = serde_json::to_vec_pretty(&last_tests)?;

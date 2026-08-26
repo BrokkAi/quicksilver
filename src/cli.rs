@@ -52,7 +52,8 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub in_diff: Option<String>,
 
-    /// Build the coverage index for one crate at a time.
+    /// Limit union coverage reporting to this crate's sources (sound).
+    /// Tests from reverse-dependent crates are still run.
     #[arg(long, global = true)]
     pub index_scope: Option<String>,
 

@@ -190,6 +190,42 @@ fn scoped_index_does_not_file_other_crates_as_not_covered() {
             .map(|m| m.package.as_str())
             .collect::<Vec<_>>()
     );
+    // always_ok and maybe_hang live in tiny_a but are reached only from tiny_c's
+    // tests. Scoping the index must not turn cross-crate coverage into NotCovered.
+    let covered_fqns: Vec<String> = prepared
+        .plan
+        .batches
+        .iter()
+        .flat_map(|b| b.mutants.iter())
+        .map(|m| m.mutant.fqn.clone())
+        .collect();
+    assert!(
+        covered_fqns.iter().any(|f| f.contains("always_ok")),
+        "tiny_c covers tiny_a::always_ok; covered={covered_fqns:?}"
+    );
+    assert!(
+        covered_fqns.iter().any(|f| f.contains("maybe_hang")),
+        "tiny_c covers tiny_a::maybe_hang; covered={covered_fqns:?}"
+    );
+    assert_eq!(
+        prepared.plan.not_covered.len(),
+        2,
+        "only uncovered() is NotCovered, f_nc=2/9; not_covered={:?}",
+        prepared
+            .plan
+            .not_covered
+            .iter()
+            .map(|m| m.fqn.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        prepared
+            .plan
+            .not_covered
+            .iter()
+            .all(|m| m.fqn.contains("uncovered")),
+        "NotCovered should be uncovered() only"
+    );
     let all = discover(repo.path(), &filter()).unwrap();
     assert!(
         all.iter().any(|m| m.package != "tiny_a"),

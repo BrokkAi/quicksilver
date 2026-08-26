@@ -2,8 +2,8 @@ use crate::config::Config;
 use crate::types::Paths;
 use crate::util::fast_linker;
 use anyhow::{Context, Result, bail};
-use cargo_metadata::{Metadata, MetadataCommand};
-use std::collections::BTreeMap;
+use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
@@ -44,22 +44,79 @@ pub enum PackageSelect {
     Packages(Vec<String>),
 }
 
-pub fn package_select(cfg: &Config) -> PackageSelect {
-    package_select_from(&cfg.packages, cfg.index_scope.as_deref())
+pub fn covering_seeds(cfg: &Config) -> Vec<String> {
+    covering_seeds_from(&cfg.packages, cfg.index_scope.as_deref())
 }
 
-pub fn package_select_from(packages: &[String], index_scope: Option<&str>) -> PackageSelect {
+pub fn covering_seeds_from(packages: &[String], index_scope: Option<&str>) -> Vec<String> {
     let mut pkgs = packages.to_vec();
     if let Some(scope) = index_scope {
         if !pkgs.iter().any(|p| p == scope) {
             pkgs.push(scope.to_string());
         }
     }
-    if pkgs.is_empty() {
+    pkgs
+}
+
+pub fn package_select(cfg: &Config, meta: &Metadata) -> PackageSelect {
+    package_select_from(&cfg.packages, cfg.index_scope.as_deref(), meta)
+}
+
+pub fn package_select_from(
+    packages: &[String],
+    index_scope: Option<&str>,
+    meta: &Metadata,
+) -> PackageSelect {
+    let seeds = covering_seeds_from(packages, index_scope);
+    if seeds.is_empty() {
         PackageSelect::Workspace
     } else {
-        PackageSelect::Packages(pkgs)
+        PackageSelect::Packages(reverse_dependents(meta, &seeds).into_iter().collect())
     }
+}
+
+/// Packages whose test binaries can cover `seeds`: each seed and every
+/// workspace package that transitively depends on one (normal or dev).
+pub fn reverse_dependents(meta: &Metadata, seeds: &[String]) -> BTreeSet<String> {
+    let ws_names: HashSet<String> = meta
+        .workspace_packages()
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    let mut reverse: HashMap<String, Vec<String>> = HashMap::new();
+    for pkg in meta.workspace_packages() {
+        for dep in &pkg.dependencies {
+            if dep.kind == DependencyKind::Build {
+                continue;
+            }
+            if !ws_names.contains(dep.name.as_str()) {
+                continue;
+            }
+            reverse
+                .entry(dep.name.to_string())
+                .or_default()
+                .push(pkg.name.to_string());
+        }
+    }
+    let mut out = BTreeSet::new();
+    let mut stack: Vec<String> = seeds
+        .iter()
+        .filter(|s| ws_names.contains(s.as_str()))
+        .cloned()
+        .collect();
+    while let Some(p) = stack.pop() {
+        if !out.insert(p.clone()) {
+            continue;
+        }
+        if let Some(dependents) = reverse.get(&p) {
+            for d in dependents {
+                if !out.contains(d) {
+                    stack.push(d.clone());
+                }
+            }
+        }
+    }
+    out
 }
 
 pub fn apply_package_select(cmd: &mut Command, select: &PackageSelect) {
@@ -304,20 +361,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn package_select_scoped_uses_minus_p() {
+    fn package_select_unscoped_is_workspace() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let meta = load_metadata(&root).expect("tiny metadata");
         assert_eq!(
-            package_select_from(&["tiny_a".into()], None),
-            PackageSelect::Packages(vec!["tiny_a".into()])
-        );
-        assert_eq!(
-            package_select_from(&[], Some("tiny_a")),
-            PackageSelect::Packages(vec!["tiny_a".into()])
+            package_select_from(&[], None, &meta),
+            PackageSelect::Workspace
         );
     }
 
     #[test]
-    fn package_select_unscoped_is_workspace() {
-        assert_eq!(package_select_from(&[], None), PackageSelect::Workspace);
+    fn reverse_dependents_include_downstream_crates() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let meta = load_metadata(&root).expect("tiny metadata");
+        let d = reverse_dependents(&meta, &["tiny_a".into()]);
+        assert!(d.contains("tiny_a"));
+        assert!(d.contains("tiny_b"), "tiny_b links tiny_a: {d:?}");
+        assert!(d.contains("tiny_c"), "tiny_c links tiny_a: {d:?}");
+        let php_like = reverse_dependents(&meta, &["tiny_b".into()]);
+        assert!(php_like.contains("tiny_b"));
+        assert!(!php_like.contains("tiny_a"), "tiny_a does not depend on tiny_b: {php_like:?}");
+        assert!(!php_like.contains("tiny_c"));
     }
 
     #[test]

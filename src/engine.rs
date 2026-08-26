@@ -140,6 +140,16 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
             );
         }
     }
+    // Estimate pays Stage B only for the sample (cmd_estimate). Run/index
+    // attribute every in-scope mutant now.
+    if !for_estimate {
+        let covered: Vec<_> = mutants
+            .iter()
+            .filter(|m| index.union_covers(&m.path, m.start_line, m.end_line))
+            .cloned()
+            .collect();
+        index::stage_b_for_mutants(&cfg, &paths, &mut index, &covered)?;
+    }
     let plan = plan::plan(
         &mutants,
         &index,
@@ -231,9 +241,17 @@ pub fn estimate_from(
         .index_scope
         .clone()
         .unwrap_or_else(|| "workspace".into());
+    let sample_plan = plan::plan(
+        sample,
+        &prepared.index,
+        &prepared.baseline,
+        prepared.cfg.shard,
+        prepared.cfg.build_jobs,
+    );
     estimate::compute(
         prepared.mutants.len(),
         &prepared.plan,
+        &sample_plan,
         &prepared.baseline,
         outcomes,
         prepared.cfg.build_jobs,

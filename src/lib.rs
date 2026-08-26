@@ -66,10 +66,12 @@ fn cmd_list(common: &cli::CommonOpts) -> Result<i32> {
 
 fn cmd_index(common: &cli::CommonOpts) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
-    let prepared = engine::prepare(cfg, true, false)?;
+    // Stage A only; per-test attribution is the sample/run path.
+    let prepared = engine::prepare(cfg, true, true)?;
     println!(
-        "coverage index: {} tests, {} files",
+        "coverage index: {} tests catalogued, {} files in union, {} files attributed",
         prepared.index.tests.len(),
+        prepared.index.union.len(),
         prepared.index.lines.len()
     );
     Ok(0)
@@ -92,9 +94,24 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
-    let prepared = engine::prepare(cfg, args.skip_baseline, true)?;
+    let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
     let _ = engine::maybe_preflight(&prepared)?;
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
+    let covered_sample: Vec<_> = sample
+        .iter()
+        .filter(|m| {
+            prepared
+                .index
+                .union_covers(&m.path, m.start_line, m.end_line)
+        })
+        .cloned()
+        .collect();
+    crate::index::stage_b_for_mutants(
+        &prepared.cfg,
+        &prepared.paths,
+        &mut prepared.index,
+        &covered_sample,
+    )?;
     eprintln!("running sample of {} mutants through the pipeline", sample.len());
     let (outcomes, builds) = engine::run_prepared(&prepared, 0, Some(&sample))?;
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);

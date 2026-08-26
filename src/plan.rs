@@ -24,6 +24,10 @@ pub fn plan(
     let mut not_covered = Vec::new();
     let mut covered = Vec::new();
     for m in mutants {
+        if !index.union_covers(&m.path, m.start_line, m.end_line) {
+            not_covered.push(m.clone());
+            continue;
+        }
         let mut tests = index.tests_covering(&m.path, m.start_line, m.end_line);
         tests.sort_by(|a, b| {
             a.duration_secs
@@ -31,10 +35,6 @@ pub fn plan(
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then(a.name.cmp(&b.name))
         });
-        if tests.is_empty() {
-            not_covered.push(m.clone());
-            continue;
-        }
         let t_build = cost_by_pkg.get(m.package.as_str()).copied().unwrap_or(1.0);
         let t_sel: f64 = tests.iter().map(|t| t.duration_secs).sum();
         covered.push(PlannedMutant {
@@ -104,6 +104,9 @@ pub fn mean_t_sel(plan: &Plan) -> f64 {
     let mut n = 0.0;
     for b in &plan.batches {
         for m in &b.mutants {
+            if m.tests.is_empty() {
+                continue;
+            }
             sum += m.tests.iter().map(|t| t.duration_secs).sum::<f64>();
             n += 1.0;
         }
