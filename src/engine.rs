@@ -102,7 +102,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
 
     let baseline = prepare_baseline(&cfg, &paths, skip_baseline)?;
 
-    let mutants = discover(&paths.baseline, &discover_filter(&cfg))?;
+    let mut mutants = discover(&paths.baseline, &discover_filter(&cfg))?;
     eprintln!("discovered {} mutants", mutants.len());
 
     if for_estimate && cfg.index_scope.is_none() {
@@ -112,8 +112,37 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         }
     }
 
+    // Coverage is only valid for the indexed crate. Planning the rest of the
+    // workspace against that index files every out-of-scope mutant as
+    // NotCovered and inflates f_nc (and therefore the headline speedup).
+    if let Some(scope) = cfg.index_scope.clone() {
+        let before = mutants.len();
+        mutants.retain(|m| m.package == scope);
+        eprintln!(
+            "planning {} mutants in index-scope {scope} ({} excluded, not NotCovered)",
+            mutants.len(),
+            before.saturating_sub(mutants.len())
+        );
+    }
+
     let mut index = index::build_or_load(&cfg, &paths)?;
-    index::attach_timings(&mut index, &baseline.tests);
+    let timing = index::attach_timings(&mut index, &baseline.tests);
+    if !baseline.tests.is_empty() && !index.tests.is_empty() {
+        if timing.matched == 0 {
+            anyhow::bail!(
+                "failed to attach baseline timings to any of {} indexed tests ({} junit cases). t_sel would collapse to ~0. Match on (binary-id, name), not bare test name.",
+                timing.total,
+                baseline.tests.len()
+            );
+        }
+        if timing.matched * 5 < timing.total {
+            tracing::warn!(
+                "attached timings to only {}/{} indexed tests; t_sel may be biased low",
+                timing.matched,
+                timing.total
+            );
+        }
+    }
     let plan = plan::plan(
         &mutants,
         &index,
@@ -212,6 +241,7 @@ pub fn estimate_from(
         outcomes,
         prepared.cfg.build_jobs,
         prepared.cfg.test_jobs,
+        prepared.cfg.cm_jobs,
         scope,
         sample.len(),
     )

@@ -517,4 +517,14 @@ mod tests {
         .unwrap();
         assert!(m.iter().any(|x| x.replacement.contains("Ok(Default::default())")));
     }
+
+    #[test]
+    fn body_span_keeps_closing_brace_after_multibyte() {
+        let snippet = "fn f() -> bool { let x = \"café\"; x.is_empty() }";
+        let m = mutants_from_snippet("p", "a.rs", "p::f", snippet, 0, 1).unwrap();
+        assert!(!m.is_empty());
+        let body = &snippet[m[0].body_start_byte..m[0].body_end_byte];
+        assert!(body.starts_with('{'), "body={body:?}");
+        assert!(body.ends_with('}'), "body={body:?}");
+    }
 }

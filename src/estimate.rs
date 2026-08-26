@@ -1,5 +1,5 @@
 use crate::outcome::OutcomeCounts;
-use crate::plan::{Plan, mean_t_sel, unique_functions};
+use crate::plan::{Plan, mean_t_sel, scoped_len, unique_packages};
 use crate::types::{BaselineReport, Mutant};
 use crate::util::format_duration;
 use serde::Serialize;
@@ -36,6 +36,7 @@ pub struct SampleCounts {
     pub builds: usize,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn compute(
     n: usize,
     plan: &Plan,
@@ -43,10 +44,11 @@ pub fn compute(
     sample_outcomes: &[crate::types::Outcome],
     j_build: usize,
     j_test: usize,
+    j_cm: usize,
     sampled_scope: String,
     sample_size: usize,
 ) -> EstimateReport {
-    let scoped_n = plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>() + plan.not_covered.len();
+    let scoped_n = scoped_len(plan);
     let f_nc = if scoped_n == 0 {
         0.0
     } else {
@@ -61,19 +63,15 @@ pub fn compute(
     };
     let t_sel = mean_t_sel(plan);
     let t_suite = baseline.suite_secs;
-    let j_cm = j_build.max(1);
+    let j_cm = j_cm.max(1);
     let covered_frac = 1.0 - f_nc;
     let t_mutants = n as f64 * (t_build + t_suite) / j_cm as f64;
     let compile_side = n as f64 * covered_frac * t_build / j_build.max(1) as f64;
     let test_side = n as f64 * covered_frac * t_sel / j_test.max(1) as f64;
     let t_qs = compile_side.max(test_side);
-    // Scale unique functions from the sampled plan up to N.
-    let functions_per_mutant = if scoped_n == 0 {
-        1.0
-    } else {
-        unique_functions(plan) as f64 / scoped_n.max(1) as f64
-    };
-    let projected_batches = ((n as f64 * covered_frac * functions_per_mutant).max(1.0)) as usize;
+    // Schemata batches per crate, not per function. unique_packages already
+    // counts only crates with covered mutants — do not multiply by covered_frac.
+    let projected_batches = unique_packages(plan);
     let t_v2 = (projected_batches as f64 * t_build) / j_build.max(1) as f64
         + n as f64 * covered_frac * t_sel / j_test.max(1) as f64;
 
@@ -104,21 +102,24 @@ pub fn compute(
             builds: counts.builds,
         },
         assumptions: vec![
-            format!("N = {n} is exact from discovery."),
+            format!("N = {n} is exact from discovery inside scope `{sampled_scope}` (out-of-scope mutants are excluded, not filed as NotCovered)."),
             format!("t_suite = {:.3}s is exact from the baseline nextest run.", t_suite),
             format!(
-                "f_nc = {:.3} (95% Wilson interval {:.3}–{:.3}) is sampled from scope `{sampled_scope}` and may not generalize. A crate with unusual coverage skews f_nc hard, and f_nc is the largest lever in the model.",
+                "f_nc = {:.3} (95% Wilson interval {:.3}–{:.3}) is the coverage-index census of the {scoped_n} in-scope mutants, not a workspace-wide census against a partial index. A crate with unusual coverage skews f_nc hard, and f_nc is the largest lever in the model.",
                 f_nc, low, high
             ),
             format!(
-                "t_sel mean = {:.4}s is the sum of baseline durations of covering tests, sampled from the same scope (n={}).",
+                "t_sel mean = {:.4}s is the sum of baseline durations of covering tests, over in-scope covered mutants (sample execution n={}).",
                 t_sel, sample_size
             ),
-            format!("t_build mean = {:.3}s from per-package touch-and-rebuild.", t_build),
+            format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package (matches the single multi -p invocation in build_one).", t_build),
             "T_qs is a max of compile-side and test-side (decoupled pools), not a sum.".into(),
-            "T_mutants uses a coupled worker model: N · (t_build + t_suite) / J_cm with J_cm = build-jobs.".into(),
             format!(
-                "T_v2 treats one schema compile per unique covered function (projected {projected_batches} batches); that is a ceiling-ish proxy, not a measured schemata run."
+                "T_mutants uses a coupled worker model: N · (t_build + t_suite) / J_cm with J_cm = --cm-jobs ({j_cm}), independent of J_build={}.",
+                j_build.max(1)
+            ),
+            format!(
+                "T_v2 treats one schema compile per crate that has covered mutants ({projected_batches} batches), not one per function. That is a proxy, not a measured schemata run."
             ),
             "Coverage index can under-report tests that spawn other processes. LLVM_PROFILE_FILE uses %p.".into(),
         ],
@@ -217,4 +218,106 @@ pub fn sample_mutants(mutants: &[Mutant], n: usize, seed: u64) -> Vec<Mutant> {
     v.truncate(n);
     let _ = rng.gen::<u64>();
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::Plan;
+    use crate::types::{
+        BaselineReport, LocalityBatch, Mutant, Outcome, PackageCost, PlannedMutant, TestInfo,
+    };
+
+    fn mutant(pkg: &str, fqn: &str) -> Mutant {
+        Mutant {
+            id: format!("{pkg}::{fqn}"),
+            package: pkg.into(),
+            path: format!("{pkg}/src/lib.rs"),
+            fqn: fqn.into(),
+            start_byte: 0,
+            end_byte: 10,
+            start_line: 1,
+            end_line: 3,
+            body_start_byte: 0,
+            body_end_byte: 10,
+            replacement: "{ 0 }".into(),
+            return_kind: "number".into(),
+        }
+    }
+
+    fn covered(pkg: &str, fqn: &str) -> PlannedMutant {
+        PlannedMutant {
+            mutant: mutant(pkg, fqn),
+            tests: vec![TestInfo {
+                id: "pkg::t".into(),
+                name: "t".into(),
+                package: pkg.into(),
+                binary_id: pkg.into(),
+                binary_name: pkg.into(),
+                binary_rel: "deps/t".into(),
+                cwd_rel: pkg.into(),
+                duration_secs: 0.5,
+            }],
+            estimated_cost_secs: 1.5,
+        }
+    }
+
+    #[test]
+    fn t_v2_batches_per_crate_not_per_function() {
+        let plan = Plan {
+            batches: vec![
+                LocalityBatch {
+                    package: "a".into(),
+                    file: "a/src/lib.rs".into(),
+                    mutants: (0..20).map(|i| covered("a", &format!("f{i}"))).collect(),
+                },
+                LocalityBatch {
+                    package: "b".into(),
+                    file: "b/src/lib.rs".into(),
+                    mutants: (0..15).map(|i| covered("b", &format!("g{i}"))).collect(),
+                },
+            ],
+            not_covered: vec![mutant("a", "uncovered")],
+        };
+        let baseline = BaselineReport {
+            suite_secs: 10.0,
+            tests: Vec::new(),
+            package_costs: vec![PackageCost {
+                package: "a".into(),
+                rebuild_secs: 4.0,
+            }],
+            preflight_recompiled: None,
+        };
+        let n = crate::plan::scoped_len(&plan);
+        let report = compute(n, &plan, &baseline, &[] as &[Outcome], 2, 4, 16, "a+b".into(), 0);
+        assert_eq!(n, 36);
+        // 1 not covered / 36 in-scope — not 0 because we did not file other crates as NC.
+        assert!((report.f_nc - 1.0 / 36.0).abs() < 1e-9);
+        assert_eq!(report.schema_batches, 2, "one schema compile per crate");
+        assert_eq!(report.j_cm, 16);
+        assert_ne!(report.j_cm, report.j_build);
+        // Compile side of v2 is 2 * t_build / J_build, not 35 function-builds.
+        let expected_v2_compile = 2.0 * 4.0 / 2.0;
+        let covered_frac = 1.0 - report.f_nc;
+        let expected_v2_test = n as f64 * covered_frac * 0.5 / 4.0;
+        assert!((report.t_v2_secs - (expected_v2_compile + expected_v2_test)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn j_cm_independent_of_j_build() {
+        let plan = Plan::default();
+        let baseline = BaselineReport {
+            suite_secs: 100.0,
+            tests: Vec::new(),
+            package_costs: vec![PackageCost {
+                package: "a".into(),
+                rebuild_secs: 10.0,
+            }],
+            preflight_recompiled: None,
+        };
+        let a = compute(100, &plan, &baseline, &[], 5, 5, 5, "a".into(), 0);
+        let b = compute(100, &plan, &baseline, &[], 5, 5, 50, "a".into(), 0);
+        assert!(b.t_mutants_secs < a.t_mutants_secs);
+        assert!((a.t_mutants_secs / b.t_mutants_secs - 10.0).abs() < 1e-9);
+    }
 }

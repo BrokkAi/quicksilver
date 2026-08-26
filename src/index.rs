@@ -2,6 +2,7 @@ use crate::cargo_cmd::{
     apply_build_env, cargo_profile_args, load_metadata, package_dir_rel, relative_to_target,
 };
 use crate::config::Config;
+use crate::exec::process::{WaitResult, run_command_timeout};
 use crate::types::{Paths, TestInfo};
 use crate::util::{find_llvm_tool, rustc_verbose_version, sanitize_filename, sha256_file};
 use anyhow::{Context, Result, bail};
@@ -13,8 +14,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tracing::info;
+
+/// Hang-prone suites (bifrost) need a bound; nextest's own slow-timeout is 120s.
+const INDEX_TEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Index errors used to be warnings, so a 90% coverage miss still produced a number.
+const INDEX_ERROR_MAX_FRAC: f64 = 0.10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoverageIndex {
@@ -176,6 +183,7 @@ fn build_index(cfg: &Config, paths: &Paths, cache_key: String) -> Result<Coverag
                         &llvm_cov,
                         &registry_re,
                         &ws_root,
+                        INDEX_TEST_TIMEOUT,
                     ) {
                         Ok(hits) => {
                             let mut inv = inverted.lock().unwrap();
@@ -200,9 +208,18 @@ fn build_index(cfg: &Config, paths: &Paths, cache_key: String) -> Result<Coverag
 
     let errs = errors.lock().unwrap();
     if !errs.is_empty() {
-        tracing::warn!("{} tests failed to produce coverage", errs.len());
+        let frac = errs.len() as f64 / n.max(1) as f64;
+        tracing::warn!("{} of {n} tests failed to produce coverage", errs.len());
         for e in errs.iter().take(8) {
             tracing::warn!("  {e}");
+        }
+        if frac > INDEX_ERROR_MAX_FRAC || errs.len() == n {
+            bail!(
+                "{} of {n} tests failed to produce coverage ({:.0}%); f_nc would be garbage. First error: {}",
+                errs.len(),
+                frac * 100.0,
+                errs[0]
+            );
         }
     }
     drop(errs);
@@ -237,7 +254,7 @@ fn regex_escape(s: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 fn index_one_test(
     test: &TestInfo,
-    _idx: u32,
+    idx: u32,
     target_dir: &Path,
     baseline: &Path,
     prof_root: &Path,
@@ -245,10 +262,16 @@ fn index_one_test(
     llvm_cov: &Path,
     registry_re: &str,
     ws_root: &Path,
+    timeout: Duration,
 ) -> Result<HashMap<String, Vec<u32>>> {
+    // One directory per test. Prefix-matching `{slug}*.profraw` in a shared
+    // directory cross-attributes (and deletes) files when one test id is a
+    // prefix of another — bifrost has dozens of those pairs.
     let slug = sanitize_filename(&test.id);
-    let raw_pattern = prof_root.join(format!("{slug}.%p.profraw"));
-    let merged = prof_root.join(format!("{slug}.profdata"));
+    let dir = prof_root.join(format!("{idx:08}_{slug}"));
+    fs::create_dir_all(&dir)?;
+    let raw_pattern = dir.join("%p.profraw");
+    let merged = dir.join("merged.profdata");
     let binary = target_dir.join(&test.binary_rel);
     if !binary.is_file() {
         bail!("missing test binary {}", binary.display());
@@ -264,26 +287,42 @@ fn index_one_test(
     cmd.arg("--exact").arg(&test.name);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
-    let _ = cmd.status();
+    match run_command_timeout(cmd, timeout).context("index test spawn")? {
+        WaitResult::Timeout => {
+            let _ = fs::remove_dir_all(&dir);
+            bail!("timed out after {timeout:?}");
+        }
+        WaitResult::Exited(status) => {
+            if !status.success() {
+                tracing::debug!(
+                    "index test {} exited {:?} (still collecting profraw if any)",
+                    test.id,
+                    status.code()
+                );
+            }
+        }
+    }
 
     let mut raws = Vec::new();
-    if let Ok(rd) = fs::read_dir(prof_root) {
+    if let Ok(rd) = fs::read_dir(&dir) {
         for e in rd.flatten() {
             let n = e.file_name();
             let n = n.to_string_lossy();
-            if n.starts_with(&slug) && n.ends_with(".profraw") {
+            if n.ends_with(".profraw") {
                 raws.push(e.path());
             }
         }
     }
     if raws.is_empty() {
-        return Ok(HashMap::new());
+        let _ = fs::remove_dir_all(&dir);
+        bail!("no profraw produced");
     }
     let mut merge = Command::new(llvm_profdata);
     merge.arg("merge").arg("--sparse").arg("-o").arg(&merged);
     merge.args(&raws);
     let st = merge.status().context("llvm-profdata merge")?;
     if !st.success() {
+        let _ = fs::remove_dir_all(&dir);
         bail!("llvm-profdata merge failed");
     }
 
@@ -299,29 +338,12 @@ fn index_one_test(
     export.arg(&merged);
     export.arg(&binary);
     let out = export.output().context("llvm-cov export")?;
+    let _ = fs::remove_dir_all(&dir);
     if !out.status.success() {
-        // Some llvm-cov builds want `--format=text`.
-        let mut export = Command::new(llvm_cov);
-        export.args([
-            "export",
-            "--format=text",
-            "--ignore-filename-regex",
-            registry_re,
-            "--instr-profile",
-        ]);
-        export.arg(&merged);
-        export.arg(&binary);
-        let out = export.output().context("llvm-cov export text")?;
-        if !out.status.success() {
-            bail!(
-                "llvm-cov export failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        return Ok(parse_lcov(&String::from_utf8_lossy(&out.stdout), ws_root));
-    }
-    for r in raws {
-        let _ = fs::remove_file(r);
+        bail!(
+            "llvm-cov export --format=lcov failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     Ok(parse_lcov(&String::from_utf8_lossy(&out.stdout), ws_root))
 }
@@ -454,16 +476,35 @@ pub fn parse_nextest_list(
     Ok(tests)
 }
 
-/// Overlay baseline timings onto indexed tests by test name.
-pub fn attach_timings(index: &mut CoverageIndex, baseline_tests: &[TestInfo]) {
-    let mut by_name: HashMap<&str, f64> = HashMap::new();
+#[derive(Debug, Clone, Copy)]
+pub struct TimingMatch {
+    pub matched: usize,
+    pub total: usize,
+}
+
+/// Overlay baseline timings onto indexed tests by (binary_id, name).
+/// Bare test name is ambiguous across binaries and must not be the key.
+pub fn attach_timings(index: &mut CoverageIndex, baseline_tests: &[TestInfo]) -> TimingMatch {
+    let mut by_bin_name: HashMap<(String, String), f64> = HashMap::new();
+    let mut by_id: HashMap<String, f64> = HashMap::new();
     for t in baseline_tests {
-        by_name.insert(t.name.as_str(), t.duration_secs);
+        by_bin_name.insert((t.binary_id.clone(), t.name.clone()), t.duration_secs);
+        by_id.insert(t.id.clone(), t.duration_secs);
     }
+    let mut matched = 0;
     for t in &mut index.tests {
-        if let Some(d) = by_name.get(t.name.as_str()) {
-            t.duration_secs = *d;
+        if let Some(d) = by_bin_name
+            .get(&(t.binary_id.clone(), t.name.clone()))
+            .copied()
+            .or_else(|| by_id.get(&t.id).copied())
+        {
+            t.duration_secs = d;
+            matched += 1;
         }
+    }
+    TimingMatch {
+        matched,
+        total: index.tests.len(),
     }
 }
 
@@ -489,5 +530,79 @@ end_of_record
         // Direct unit of DA parsing: if SF can't be normalized, map is empty.
         // That's OK — the engine always has a real workspace root.
         let _ = map;
+    }
+
+    fn testinfo(id: &str, binary_id: &str, name: &str, dur: f64) -> TestInfo {
+        TestInfo {
+            id: id.into(),
+            name: name.into(),
+            package: "pkg".into(),
+            binary_id: binary_id.into(),
+            binary_name: "pkg".into(),
+            binary_rel: "deps/pkg".into(),
+            cwd_rel: "pkg".into(),
+            duration_secs: dur,
+        }
+    }
+
+    #[test]
+    fn attach_timings_matches_binary_id_and_name_not_bare_name() {
+        let mut index = CoverageIndex {
+            cache_key: "k".into(),
+            scope: None,
+            tests: vec![
+                testinfo("pkg::bin_a::same", "pkg::bin_a", "same", 0.001),
+                testinfo("pkg::bin_b::same", "pkg::bin_b", "same", 0.001),
+            ],
+            lines: HashMap::new(),
+        };
+        let baseline = vec![
+            testinfo("pkg::bin_a::same", "pkg::bin_a", "same", 1.25),
+            testinfo("pkg::bin_b::same", "pkg::bin_b", "same", 4.5),
+        ];
+        let m = attach_timings(&mut index, &baseline);
+        assert_eq!(m.matched, 2);
+        assert_eq!(index.tests[0].duration_secs, 1.25);
+        assert_eq!(index.tests[1].duration_secs, 4.5);
+    }
+
+    #[test]
+    fn attach_timings_does_not_steal_by_prefix_name() {
+        let mut index = CoverageIndex {
+            cache_key: "k".into(),
+            scope: None,
+            tests: vec![
+                testinfo(
+                    "pkg::row_identities_are_deterministic",
+                    "pkg",
+                    "row_identities_are_deterministic",
+                    0.001,
+                ),
+                testinfo(
+                    "pkg::row_identities_are_deterministic_and_distinct",
+                    "pkg",
+                    "row_identities_are_deterministic_and_distinct",
+                    0.001,
+                ),
+            ],
+            lines: HashMap::new(),
+        };
+        let baseline = vec![
+            testinfo(
+                "pkg::row_identities_are_deterministic",
+                "pkg",
+                "row_identities_are_deterministic",
+                0.2,
+            ),
+            testinfo(
+                "pkg::row_identities_are_deterministic_and_distinct",
+                "pkg",
+                "row_identities_are_deterministic_and_distinct",
+                0.8,
+            ),
+        ];
+        attach_timings(&mut index, &baseline);
+        assert_eq!(index.tests[0].duration_secs, 0.2);
+        assert_eq!(index.tests[1].duration_secs, 0.8);
     }
 }

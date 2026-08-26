@@ -48,6 +48,8 @@ pub fn apply_build_env(cmd: &mut Command, cfg: &Config, coverage: bool) {
     cmd.env_remove("RUSTC_WRAPPER");
     cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env_remove("SCCACHE");
+    // Honour the target repo's rust-toolchain.toml, not the caller's pin.
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
     cmd.env("CARGO_INCREMENTAL", "1");
     cmd.env("RUSTFLAGS", rustflags(coverage));
     for (k, v) in &cfg.build_env {
@@ -77,8 +79,14 @@ pub fn package_for_path(meta: &Metadata, rel: &str) -> Option<String> {
     let mut best: Option<(usize, String)> = None;
     for pkg in meta.workspace_packages() {
         let manifest = Path::new(pkg.manifest_path.as_std_path());
-        let pkg_dir = manifest.parent()?;
-        let rel_pkg = pkg_dir.strip_prefix(&ws).ok()?;
+        let Some(pkg_dir) = manifest.parent() else {
+            continue;
+        };
+        // A package whose directory is not under workspace_root is skippable,
+        // not a reason to abort the whole lookup.
+        let Ok(rel_pkg) = pkg_dir.strip_prefix(&ws) else {
+            continue;
+        };
         let prefix = crate::util::rel_slash(rel_pkg);
         let matches = if prefix.is_empty() {
             true
@@ -127,7 +135,7 @@ pub fn build_tests(
     root: &Path,
     target_dir: &Path,
     cfg: &Config,
-    package: Option<&str>,
+    packages: &[String],
     coverage: bool,
     json: bool,
 ) -> Result<BuildResult> {
@@ -137,7 +145,9 @@ pub fn build_tests(
     apply_build_env(&mut cmd, cfg, coverage);
     cmd.arg("build").arg("--tests");
     cmd.args(cargo_profile_args());
-    if let Some(p) = package {
+    // One cargo invocation with repeated -p. Separate `cargo build -p X` per
+    // package pays startup + lock + fingerprint 2–4× on the compile-bound path.
+    for p in packages {
         cmd.arg("-p").arg(p);
     }
     if json {
@@ -245,4 +255,24 @@ pub fn dump_metadata_json(paths: &Paths, meta: &Metadata) -> Result<()> {
 
 pub fn env_for_tests() -> BTreeMap<String, String> {
     BTreeMap::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn package_for_path_matches_workspace_members() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let meta = load_metadata(&root).expect("tiny metadata");
+        assert_eq!(
+            package_for_path(&meta, "crate_a/src/lib.rs").as_deref(),
+            Some("tiny_a")
+        );
+        assert_eq!(
+            package_for_path(&meta, "crate_b/src/lib.rs").as_deref(),
+            Some("tiny_b")
+        );
+        assert_eq!(package_for_path(&meta, "no/such.rs"), None);
+    }
 }

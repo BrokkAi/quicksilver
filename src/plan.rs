@@ -120,3 +120,18 @@ pub fn unique_functions(plan: &Plan) -> usize {
     }
     set.len()
 }
+
+/// Schemata batches per crate that has at least one covered mutant.
+pub fn unique_packages(plan: &Plan) -> usize {
+    let mut set = std::collections::BTreeSet::new();
+    for b in &plan.batches {
+        if !b.mutants.is_empty() {
+            set.insert(b.package.as_str());
+        }
+    }
+    set.len()
+}
+
+pub fn scoped_len(plan: &Plan) -> usize {
+    plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>() + plan.not_covered.len()
+}

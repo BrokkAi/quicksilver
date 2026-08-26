@@ -27,7 +27,7 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
 pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     let target = paths.baseline.join("target");
     info!("baseline cargo build --tests (profile quicksilver)");
-    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, None, false, false)
+    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &[], false, false)
 }
 
 pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>)> {
@@ -78,13 +78,20 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
 pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<TestInfo>> {
     let mut tests = Vec::new();
     for (name, classname, time) in junit_cases(xml) {
-        let package = classname.clone();
+        // nextest's JUnit classname is the binary id, not the package name.
+        // Integration tests look like `pkg::bin`; lib tests are often just `pkg`.
+        let binary_id = classname;
+        let package = binary_id
+            .split("::")
+            .next()
+            .unwrap_or(binary_id.as_str())
+            .to_string();
         let cwd = crate::cargo_cmd::package_dir_rel(meta, &package);
         tests.push(TestInfo {
-            id: format!("{package}::{name}"),
+            id: format!("{binary_id}::{name}"),
             name,
             package,
-            binary_id: classname,
+            binary_id,
             binary_name: String::new(),
             binary_rel: String::new(),
             cwd_rel: cwd,
@@ -137,7 +144,14 @@ pub fn measure_package_costs(cfg: &Config, paths: &Paths) -> Result<Vec<PackageC
         touch(&src)?;
         info!("timing incremental rebuild of {name}");
         let start = Instant::now();
-        match crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, Some(&name), false, false) {
+        match crate::cargo_cmd::build_tests(
+            &paths.baseline,
+            &target,
+            cfg,
+            std::slice::from_ref(&name),
+            false,
+            false,
+        ) {
             Ok(_) => {
                 costs.push(PackageCost {
                     package: name,
@@ -170,7 +184,10 @@ pub fn preflight_recompile_count(
     cmd.current_dir(&paths.baseline);
     cmd.env("CARGO_TARGET_DIR", &target);
     apply_build_env(&mut cmd, cfg, false);
-    cmd.args(["build", "--tests", "-p", &mutant.package, "-v"]);
+    // Workspace `cargo build --tests`, not `-p mutant.package`. A source-hashing
+    // build script (BIFROST_BUILD_IDENTITY) relinks a *different* crate; scoping
+    // to the mutant package misses the cascade this preflight exists to catch.
+    cmd.args(["build", "--tests", "-v"]);
     cmd.args(cargo_profile_args());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -220,4 +237,49 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     };
     write_baseline_report(paths, &report)?;
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn junit_classname_is_binary_id_not_package() {
+        let xml = r#"
+<testsuite>
+  <testcase name="row_identities_are_deterministic" classname="brokk-bifrost-core" time="0.20"/>
+  <testcase name="row_identities_are_deterministic_and_distinct" classname="brokk-bifrost-core" time="0.80"/>
+  <testcase name="it_works" classname="tiny_a::integration" time="1.5"/>
+</testsuite>
+"#;
+        let meta = emptyish_metadata();
+        let tests = parse_junit(xml, &meta).unwrap();
+        assert_eq!(tests[0].binary_id, "brokk-bifrost-core");
+        assert_eq!(tests[0].package, "brokk-bifrost-core");
+        assert_eq!(
+            tests[0].id,
+            "brokk-bifrost-core::row_identities_are_deterministic"
+        );
+        assert_eq!(tests[2].binary_id, "tiny_a::integration");
+        assert_eq!(tests[2].package, "tiny_a");
+        assert_eq!(tests[2].id, "tiny_a::integration::it_works");
+        assert_eq!(tests[2].duration_secs, 1.5);
+    }
+
+    fn emptyish_metadata() -> cargo_metadata::Metadata {
+        // parse_junit only uses metadata for package_dir_rel; missing packages
+        // yield empty cwd_rel, which is fine for this unit test.
+        let raw = r#"{
+            "packages": [],
+            "workspace_members": [],
+            "workspace_default_members": [],
+            "resolve": null,
+            "target_directory": "/tmp/target",
+            "build_directory": "/tmp/target",
+            "version": 1,
+            "workspace_root": "/tmp",
+            "metadata": null
+        }"#;
+        serde_json::from_str(raw).expect("metadata stub")
+    }
 }

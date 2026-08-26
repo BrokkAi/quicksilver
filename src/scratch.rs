@@ -163,10 +163,14 @@ pub fn probe(
                 let after = crate::util::statvfs_avail(scratch_root).unwrap_or(before);
                 let space_delta = before as i64 - after as i64;
                 verify_independent(&src, &dst)?;
-                let sharing = classify_sharing(space_delta, PROBE_BYTES as u64, fiemap_shared(&src, &dst));
-                let _ = fs::remove_dir_all(&dir);
+                let sharing = classify_sharing(
+                    space_delta,
+                    PROBE_BYTES as u64,
+                    filefrag_shared(&src, &dst).or_else(|| fiemap_shared(&src, &dst)),
+                );
                 match sharing {
                     Sharing::SharedBlocks => {
+                        let _ = fs::remove_dir_all(&dir);
                         return Ok(ProbeReport {
                             backend: CloneBackendKind::Reflink,
                             sharing,
@@ -179,14 +183,17 @@ pub fn probe(
                     }
                     other => {
                         if requested == CloneBackendKind::Reflink && !allow_copy {
+                            let _ = fs::remove_dir_all(&dir);
                             bail!(reflink_not_shared_error(other, space_delta));
                         }
                         if requested == CloneBackendKind::Auto && !allow_copy {
-                            // Fall through to zfs / abort rather than silently copy.
+                            // Keep the probe files; fall through to abort rather than silently copy.
+                            // Auto does not select zfs-clone (no destroy path).
                             warn!(
                                 "FICLONE returned success but blocks are not shared ({other:?}, delta {space_delta})"
                             );
                         } else if allow_copy {
+                            let _ = fs::remove_dir_all(&dir);
                             return Ok(ProbeReport {
                                 backend: CloneBackendKind::Copy,
                                 sharing: other,
@@ -207,10 +214,13 @@ pub fn probe(
                 }
             }
         }
-        let _ = fs::remove_file(&dst);
+            let _ = fs::remove_file(&dst);
     }
 
-    if matches!(requested, CloneBackendKind::Auto | CloneBackendKind::ZfsClone)
+    // zfs-clone is opt-in only. Auto must not pick it: `zfs snapshot -f` is
+    // invalid, snapshots may cover a whole shared volume, clones are never
+    // destroyed, and ensure_worker's remove_dir_all would wipe a mounted clone.
+    if requested == CloneBackendKind::ZfsClone
         && zfs_available(None)
         && lookup_dataset(None, scratch_root).is_ok()
     {
@@ -218,7 +228,7 @@ pub fn probe(
         return Ok(ProbeReport {
             backend: CloneBackendKind::ZfsClone,
             sharing: Sharing::SharedBlocks,
-            message: "zfs command is available and the scratch path is a ZFS dataset; will snapshot baseline and clone per worker. An NFS client cannot issue zfs snapshot itself — set --zfs-remote if this is a re-export."
+            message: "zfs-clone selected explicitly. Snapshots/clones are not destroyed; use a dedicated dataset, not a shared volume. An NFS client cannot issue zfs snapshot itself — set --zfs-remote if this is a re-export."
                 .into(),
             clone_secs: 0.0,
             space_delta: 0,
@@ -269,25 +279,25 @@ pub fn probe(
     })
 }
 
-fn classify_sharing(space_delta: i64, file_size: u64, fiemap: Option<bool>) -> Sharing {
-    if fiemap == Some(true) {
+pub(crate) fn classify_sharing(space_delta: i64, file_size: u64, hint: Option<bool>) -> Sharing {
+    if hint == Some(true) {
         return Sharing::SharedBlocks;
     }
-    if fiemap == Some(false) {
-        return if space_delta > (file_size as i64) / 4 {
-            Sharing::ServerSideCopy
-        } else {
-            Sharing::FullCopy
-        };
+    if hint == Some(false) {
+        // Definitive: extents do not share. A noisy 0-byte statvfs delta on a
+        // multi-terabyte pool must not override this.
+        if space_delta > (file_size as i64) / 2 {
+            return Sharing::ServerSideCopy;
+        }
+        return Sharing::FullCopy;
     }
-    // Free-space heuristic. CoW should not consume ~file_size.
-    if space_delta < (file_size as i64) / 8 {
-        Sharing::SharedBlocks
-    } else if space_delta > (file_size as i64) / 4 {
-        Sharing::ServerSideCopy
-    } else {
-        Sharing::Unknown
+    // No FIEMAP/filefrag (typical over NFS). Async free-space accounting on a
+    // large pool reads ~0 whether or not blocks were shared — do not treat a
+    // small delta as confirmation.
+    if space_delta > (file_size as i64) / 2 {
+        return Sharing::ServerSideCopy;
     }
+    Sharing::Unknown
 }
 
 fn verify_independent(src: &Path, dst: &Path) -> Result<()> {
@@ -334,7 +344,51 @@ fn copy_refused_error(sharing: Sharing, root: &Path) -> String {
 fn fiemap_shared(a: &Path, b: &Path) -> Option<bool> {
     let ea = fiemap_first_physical(a)?;
     let eb = fiemap_first_physical(b)?;
+    if ea == 0 || eb == 0 {
+        return None;
+    }
     Some(ea == eb)
+}
+
+/// XFS `filefrag -v` prints `shared` on extents that share physical blocks.
+fn filefrag_shared(a: &Path, b: &Path) -> Option<bool> {
+    fn extents(path: &Path) -> Option<(bool, String)> {
+        let cmd = if std::path::Path::new("/usr/sbin/filefrag").is_file() {
+            "/usr/sbin/filefrag"
+        } else {
+            "filefrag"
+        };
+        let out = std::process::Command::new(cmd)
+            .arg("-v")
+            .arg(path)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut phys = String::new();
+        let mut shared = false;
+        for line in text.lines() {
+            if line.contains("shared") {
+                shared = true;
+            }
+            // "0:        0..    8191:   79906503..  79914694:"
+            if let Some(rest) = line.split_once(':') {
+                if rest.0.trim().chars().all(|c| c.is_ascii_digit()) {
+                    phys.push_str(line.trim());
+                    phys.push('\n');
+                }
+            }
+        }
+        Some((shared, phys))
+    }
+    let (sa, pa) = extents(a)?;
+    let (sb, pb) = extents(b)?;
+    if pa.is_empty() || pb.is_empty() {
+        return None;
+    }
+    Some(sa && sb && pa == pb)
 }
 
 fn fiemap_first_physical(path: &Path) -> Option<u64> {
@@ -669,16 +723,23 @@ fn zfs_clone_tree(backend: &ZfsCloneBackend, src: &Path, dst: &Path) -> Result<(
     let snap_name = format!("{dataset}@{snap}");
     let clone_name = format!("{dataset}-{}", crate::util::sanitize_filename(&snap));
     let mut snap_cmd = zfs_cmd(remote);
-    snap_cmd.args(["snapshot", "-f", &snap_name]);
+    // `zfs snapshot` has no `-f`. Force-destroy is `zfs destroy -f`.
+    snap_cmd.args(["snapshot", &snap_name]);
     let status = snap_cmd.status()?;
     if !status.success() {
-        // snapshot may already exist
+        // snapshot may already exist from a previous leaked clone
         let mut s2 = zfs_cmd(remote);
         s2.args(["snapshot", &snap_name]);
         let _ = s2.status()?;
     }
     if dst.exists() {
-        fs::remove_dir_all(dst)?;
+        // Do not remove_dir_all a mounted ZFS clone — that deletes dataset
+        // contents rather than the mount. Fail instead; this backend has no
+        // destroy path yet (which is why Auto will not select it).
+        bail!(
+            "zfs-clone destination {} already exists; refusing to delete a possible mounted dataset. Destroy the clone dataset explicitly.",
+            dst.display()
+        );
     }
     let mut clone = zfs_cmd(remote);
     clone.args(["clone", "-o", &format!("mountpoint={}", dst.display()), &snap_name, &clone_name]);
@@ -732,10 +793,23 @@ pub fn ensure_worker(
 ) -> Result<PathBuf> {
     let dest = worker_dir(paths, slot);
     if dest.exists() {
+        if backend.name() == "zfs-clone" {
+            bail!(
+                "zfs-clone worker {} already exists; refusing to delete a possible mounted dataset",
+                dest.display()
+            );
+        }
         fs::remove_dir_all(&dest)?;
     }
     info!("cloning baseline -> {}", dest.display());
+    let start = Instant::now();
     backend.clone_tree(&paths.baseline, &dest)?;
+    info!(
+        "cloned baseline -> {} in {:.1}s via {}",
+        dest.display(),
+        start.elapsed().as_secs_f64(),
+        backend.name()
+    );
     Ok(dest)
 }
 
@@ -765,4 +839,42 @@ pub fn format_probe(report: &ProbeReport) -> String {
         report.sharing,
         report.clone_secs
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_true_is_shared_even_if_delta_is_large() {
+        assert_eq!(
+            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, Some(true)),
+            Sharing::SharedBlocks
+        );
+    }
+
+    #[test]
+    fn hint_false_is_not_overridden_by_small_delta() {
+        assert_eq!(
+            classify_sharing(0, 32 * 1024 * 1024, Some(false)),
+            Sharing::FullCopy
+        );
+    }
+
+    #[test]
+    fn no_hint_small_delta_is_unknown_not_shared() {
+        // NFS/ZFS async accounting: 32 MB is noise on a 6.8 T pool.
+        assert_eq!(
+            classify_sharing(0, 32 * 1024 * 1024, None),
+            Sharing::Unknown
+        );
+    }
+
+    #[test]
+    fn no_hint_large_delta_is_a_copy() {
+        assert_eq!(
+            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, None),
+            Sharing::ServerSideCopy
+        );
+    }
 }

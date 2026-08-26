@@ -207,17 +207,24 @@ pub fn fill_incompressible(len: usize) -> Vec<u8> {
     buf
 }
 
+/// Convert a proc-macro2 `LineColumn` to a byte offset.
+///
+/// `column` is a 0-based *character* index, not a byte index. Treating it as
+/// bytes truncates the span on any multibyte character in the line (café, CJK).
 pub fn line_col_to_offset(src: &str, line: usize, column: usize) -> usize {
     let mut off = 0usize;
-    let mut current_line = 1usize;
-    for part in src.split_inclusive('\n') {
+    for (current_line, part) in (1usize..).zip(src.split_inclusive('\n')) {
         if current_line == line {
-            return off + column.min(part.len());
+            return off
+                + part
+                    .chars()
+                    .take(column)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
         }
         off += part.len();
-        current_line += 1;
     }
-    src.len().min(off + column)
+    src.len()
 }
 
 pub fn sanitize_filename(s: &str) -> String {
@@ -236,4 +243,31 @@ pub fn parse_memory_spec(s: &str) -> Result<f64> {
         return Ok((v / 100.0).clamp(0.05, 0.95));
     }
     Ok(0.70)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn line_col_treats_column_as_chars() {
+        let src = "fn f() -> bool { let x = \"café\"; x.is_empty() }";
+        // The closing brace is the last character.
+        let close = src.rfind('}').unwrap();
+        let col = src[..close + 1].chars().count(); // 0-based end column on line 1
+        assert_eq!(line_col_to_offset(src, 1, col), close + 1);
+        // Byte-as-column would undershoot by the extra byte in é.
+        let naive = col.min(src.len());
+        assert!(naive < src.len() || src.is_ascii());
+        assert_eq!(src.as_bytes()[close], b'}');
+    }
+
+    #[test]
+    fn line_col_cjk_does_not_truncate() {
+        let src = "fn f() -> i32 { let x = \"日本語\"; 1 }";
+        let close = src.rfind('}').unwrap();
+        let col = src[..close + 1].chars().count();
+        assert_eq!(line_col_to_offset(src, 1, col), close + 1);
+        assert!(src[line_col_to_offset(src, 1, 0)..line_col_to_offset(src, 1, col)].ends_with('}'));
+    }
 }

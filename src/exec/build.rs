@@ -25,7 +25,7 @@ pub fn build_one(
     planned: &PlannedMutant,
     build_counter: &AtomicU64,
 ) -> Result<Result<BuiltMutant, Outcome>> {
-    crate::scratch::check_free_space(runs_root, cfg.max_scratch).ok();
+    crate::scratch::check_free_space(runs_root, cfg.max_scratch)?;
     let original = apply_mutant(worker_root, &planned.mutant)?;
     build_counter.fetch_add(1, Ordering::SeqCst);
     let mut packages: Vec<String> = Vec::new();
@@ -35,29 +35,20 @@ pub fn build_one(
             packages.push(t.package.clone());
         }
     }
-    let mut stdout = Vec::new();
-    let mut executables = Vec::new();
-    let mut build_err = None;
-    for pkg in &packages {
-        match build_tests(worker_root, target_dir, cfg, Some(pkg), false, true) {
-            Ok(result) => {
-                stdout.extend(result.stdout);
-                executables.extend(result.executables);
-            }
-            Err(err) => {
-                build_err = Some(err);
-                break;
-            }
-        }
-    }
+    let built = build_tests(worker_root, target_dir, cfg, &packages, false, true);
     let restore = restore_file(worker_root, &planned.mutant, &original);
-    if let Some(err) = build_err {
-        let _ = restore_file(worker_root, &planned.mutant, &original);
-        return Ok(Err(Outcome::unviable(
-            planned.mutant.clone(),
-            err.to_string(),
-        )));
-    }
+    let result = match built {
+        Ok(result) => result,
+        Err(err) => {
+            let _ = restore_file(worker_root, &planned.mutant, &original);
+            return Ok(Err(Outcome::unviable(
+                planned.mutant.clone(),
+                err.to_string(),
+            )));
+        }
+    };
+    let stdout = result.stdout;
+    let executables = result.executables;
     if let Err(err) = restore {
         anyhow::bail!("restore failed after build: {err:#}");
     }

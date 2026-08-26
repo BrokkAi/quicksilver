@@ -90,6 +90,7 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         build_jobs: 2,
         test_jobs: 4,
         index_jobs: 4,
+        cm_jobs: 8,
         allow_copy: true,
         max_build_memory_frac: 0.7,
         max_scratch: None,

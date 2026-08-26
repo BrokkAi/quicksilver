@@ -34,6 +34,12 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub index_jobs: Option<usize>,
 
+    /// Parallelism assumed for the cargo-mutants comparison baseline (J_cm).
+    /// Independent of the quicksilver build pool; cargo-mutants runs whole
+    /// scenarios and typically uses all cores.
+    #[arg(long, global = true)]
+    pub cm_jobs: Option<usize>,
+
     /// Restrict mutants to these packages.
     #[arg(long = "package", short = 'p', global = true)]
     pub packages: Vec<String>,

@@ -160,4 +160,45 @@ fn coverage_caught_missed_notcovered_timeout() {
     );
 }
 
+#[test]
+fn scoped_index_does_not_file_other_crates_as_not_covered() {
+    if !tools_ok() {
+        eprintln!("skip: nextest or llvm-cov not available");
+        return;
+    }
+    let repo = support::setup_tiny();
+    let scratch = tempfile::tempdir().unwrap();
+    let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+    cfg.index_scope = Some("tiny_a".into());
+    let prepared = prepare(cfg, false, false).expect("prepare");
+    assert!(
+        prepared.mutants.iter().all(|m| m.package == "tiny_a"),
+        "in-scope planning must drop other crates, not keep them as mutants: {:?}",
+        prepared
+            .mutants
+            .iter()
+            .map(|m| m.package.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        prepared.plan.not_covered.iter().all(|m| m.package == "tiny_a"),
+        "NotCovered must be in-scope only: {:?}",
+        prepared
+            .plan
+            .not_covered
+            .iter()
+            .map(|m| m.package.as_str())
+            .collect::<Vec<_>>()
+    );
+    let all = discover(repo.path(), &filter()).unwrap();
+    assert!(
+        all.iter().any(|m| m.package != "tiny_a"),
+        "fixture must have out-of-scope mutants for this assertion to mean anything"
+    );
+    assert!(
+        prepared.mutants.len() < all.len(),
+        "scoped prepare should drop out-of-crate mutants"
+    );
+}
+
 

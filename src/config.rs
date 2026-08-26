@@ -40,6 +40,8 @@ pub struct FileConfig {
     pub test_jobs: Option<usize>,
     #[serde(rename = "index-jobs")]
     pub index_jobs: Option<usize>,
+    #[serde(rename = "cm-jobs")]
+    pub cm_jobs: Option<usize>,
     #[serde(rename = "allow-copy")]
     pub allow_copy: Option<bool>,
     #[serde(rename = "zfs-remote")]
@@ -58,6 +60,8 @@ pub struct Config {
     pub build_jobs: usize,
     pub test_jobs: usize,
     pub index_jobs: usize,
+    /// Comparison baseline width for cargo-mutants (J_cm). Not the QS build pool.
+    pub cm_jobs: usize,
     pub allow_copy: bool,
     pub max_build_memory_frac: f64,
     pub max_scratch: Option<u64>,
@@ -149,6 +153,7 @@ pub fn merge_config(
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
     let index_jobs = cli.index_jobs.or(file.index_jobs).unwrap_or_else(nproc);
+    let cm_jobs = cli.cm_jobs.or(file.cm_jobs).unwrap_or_else(nproc);
 
     let mut build_env = file.build_env;
     if let Ok(v) = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE") {
@@ -164,6 +169,7 @@ pub fn merge_config(
         build_jobs: build_jobs.max(1),
         test_jobs: test_jobs.max(1),
         index_jobs: index_jobs.max(1),
+        cm_jobs: cm_jobs.max(1),
         allow_copy: cli.allow_copy || file.allow_copy.unwrap_or(false),
         max_build_memory_frac,
         max_scratch: cli.max_scratch,
