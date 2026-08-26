@@ -47,6 +47,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
+        crate::cargo_cmd::apply_package_select(&mut cmd, &crate::cargo_cmd::package_select(cfg));
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         let start = Instant::now();

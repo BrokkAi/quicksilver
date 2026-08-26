@@ -33,6 +33,48 @@ pub fn nextest_profile_args() -> Vec<String> {
     ]
 }
 
+/// Which crates' tests the green suite / unscoped cargo should run.
+///
+/// Bare `cargo nextest run` follows `default-members`. On bifrost that is the
+/// facade crate, so a core-scoped estimate got 8525 facade JUnit cases and
+/// zero timings for the 317 indexed core tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackageSelect {
+    Workspace,
+    Packages(Vec<String>),
+}
+
+pub fn package_select(cfg: &Config) -> PackageSelect {
+    package_select_from(&cfg.packages, cfg.index_scope.as_deref())
+}
+
+pub fn package_select_from(packages: &[String], index_scope: Option<&str>) -> PackageSelect {
+    let mut pkgs = packages.to_vec();
+    if let Some(scope) = index_scope {
+        if !pkgs.iter().any(|p| p == scope) {
+            pkgs.push(scope.to_string());
+        }
+    }
+    if pkgs.is_empty() {
+        PackageSelect::Workspace
+    } else {
+        PackageSelect::Packages(pkgs)
+    }
+}
+
+pub fn apply_package_select(cmd: &mut Command, select: &PackageSelect) {
+    match select {
+        PackageSelect::Workspace => {
+            cmd.arg("--workspace");
+        }
+        PackageSelect::Packages(pkgs) => {
+            for p in pkgs {
+                cmd.arg("-p").arg(p);
+            }
+        }
+    }
+}
+
 pub fn rustflags(coverage: bool) -> String {
     let mut parts = Vec::new();
     if coverage {
@@ -260,6 +302,23 @@ pub fn env_for_tests() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_select_scoped_uses_minus_p() {
+        assert_eq!(
+            package_select_from(&["tiny_a".into()], None),
+            PackageSelect::Packages(vec!["tiny_a".into()])
+        );
+        assert_eq!(
+            package_select_from(&[], Some("tiny_a")),
+            PackageSelect::Packages(vec!["tiny_a".into()])
+        );
+    }
+
+    #[test]
+    fn package_select_unscoped_is_workspace() {
+        assert_eq!(package_select_from(&[], None), PackageSelect::Workspace);
+    }
 
     #[test]
     fn package_for_path_matches_workspace_members() {
