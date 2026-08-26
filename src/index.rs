@@ -343,7 +343,6 @@ fn run_union_coverage(
     fs::create_dir_all(&prof_root)?;
     let pattern = prof_root.join("%p_%m.profraw");
     let junit = paths.index.join("stage-a-junit.xml");
-    let _ = fs::remove_file(&junit);
     let config_path = crate::cargo_cmd::write_nextest_config_junit(&paths.index, Some(&junit))?;
     let meta = load_metadata(&paths.baseline)?;
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
@@ -351,47 +350,43 @@ fn run_union_coverage(
     let merged = paths.index.join("union.profdata");
     let _ = fs::remove_file(&merged);
 
-    // Drain profraw into a running merge so 12k instrumented tests cannot
-    // fill the scratch filesystem (last run: 189G then ENOSPC).
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let drain = {
-        let stop = Arc::clone(&stop);
-        let prof_root = prof_root.clone();
-        let merged = merged.clone();
-        let llvm_profdata = llvm_profdata.clone();
-        std::thread::spawn(move || {
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let _ = drain_profraw(&prof_root, &merged, &llvm_profdata, Duration::from_secs(3));
-                std::thread::sleep(Duration::from_millis(1500));
-            }
-            let _ = drain_profraw(&prof_root, &merged, &llvm_profdata, Duration::ZERO);
-        })
-    };
+    // One nextest of 12k instrumented tests wrote ~190G of profraw and filled
+    // the disk. Concurrent drain merged half-written files. Shard instead:
+    // run, merge only completed files, delete, then the next shard.
+    const SHARD: usize = 300;
+    let n_shards = tests.len().div_ceil(SHARD).max(1);
+    let mut instr_passed: HashSet<String> = HashSet::new();
+    let mut any_ok = false;
+    info!("stage A nextest in {n_shards} shards of up to {SHARD} tests");
+    for shard in 1..=n_shards {
+        let _ = fs::remove_file(&junit);
+        let mut cmd = crate::cargo_cmd::cargo_command();
+        cmd.current_dir(&paths.baseline);
+        cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
+        apply_build_env(&mut cmd, cfg, true);
+        cmd.env("LLVM_PROFILE_FILE", &pattern);
+        cmd.args(["nextest", "run"]);
+        cmd.args(crate::cargo_cmd::nextest_profile_args());
+        cmd.arg("--config-file").arg(&config_path);
+        apply_package_select(&mut cmd, &package_select(cfg, &meta));
+        cmd.arg("--partition").arg(format!("count:{shard}/{n_shards}"));
+        cmd.stdout(Stdio::inherit());
+        cmd.stderr(Stdio::inherit());
+        let status = cmd.status().context("stage A cargo nextest run")?;
+        if status.success() {
+            any_ok = true;
+        } else {
+            tracing::warn!("stage A shard {shard}/{n_shards} exited {status}");
+        }
+        if junit.is_file() {
+            let xml = fs::read_to_string(&junit)?;
+            instr_passed.extend(crate::baseline::junit_passed_ids(&xml));
+        }
+        merge_all_profraw(&prof_root, &merged, &llvm_profdata)?;
+        crate::scratch::check_free_space(&cfg.scratch_root, Some(8 * (1 << 30)))?;
+    }
 
-    let mut cmd = crate::cargo_cmd::cargo_command();
-    cmd.current_dir(&paths.baseline);
-    cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
-    apply_build_env(&mut cmd, cfg, true);
-    cmd.env("LLVM_PROFILE_FILE", &pattern);
-    cmd.args(["nextest", "run"]);
-    cmd.args(crate::cargo_cmd::nextest_profile_args());
-    cmd.arg("--config-file").arg(&config_path);
-    apply_package_select(&mut cmd, &package_select(cfg, &meta));
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-    let status = cmd.status().context("stage A cargo nextest run")?;
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = drain.join();
-    let junit = if junit.is_file() {
-        junit
-    } else {
-        paths
-            .baseline_cov
-            .join("nextest")
-            .join("quicksilver")
-            .join("junit.xml")
-    };
-    check_stage_a_pass_count(tests, baseline, &junit, status.success())?;
+    check_stage_a_pass_ids(tests, baseline, &instr_passed, any_ok)?;
 
     if !merged.is_file() {
         let _ = fs::remove_dir_all(&prof_root);
@@ -414,10 +409,10 @@ fn run_union_coverage(
     Ok(union)
 }
 
-fn check_stage_a_pass_count(
+fn check_stage_a_pass_ids(
     catalog: &[TestInfo],
     baseline: &BaselineReport,
-    junit_path: &Path,
+    instr_passed: &HashSet<String>,
     nextest_ok: bool,
 ) -> Result<()> {
     if catalog.is_empty() {
@@ -426,18 +421,13 @@ fn check_stage_a_pass_count(
         }
         return Ok(());
     }
-    if !junit_path.is_file() {
+    if instr_passed.is_empty() {
         if !nextest_ok {
-            bail!(
-                "stage A nextest run failed with no junit at {}",
-                junit_path.display()
-            );
+            bail!("stage A nextest run failed with no passing tests in JUnit");
         }
-        tracing::warn!("stage A produced no junit; skipping pass-count guard");
+        tracing::warn!("stage A produced no JUnit passes; skipping pass-count guard");
         return Ok(());
     }
-    let xml = fs::read_to_string(junit_path)?;
-    let instr_passed = crate::baseline::junit_passed_ids(&xml);
     let green_failed: HashSet<&str> = baseline.failed_test_ids.iter().map(String::as_str).collect();
     let green_ids: HashSet<&str> = baseline.tests.iter().map(|t| t.id.as_str()).collect();
     let mut green_pass = 0usize;
@@ -470,6 +460,18 @@ fn check_stage_a_pass_count(
         );
     }
     Ok(())
+}
+
+fn merge_all_profraw(prof_root: &Path, acc: &Path, llvm_profdata: &Path) -> Result<usize> {
+    let mut total = 0usize;
+    loop {
+        let n = drain_profraw(prof_root, acc, llvm_profdata, Duration::ZERO)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
 }
 
 fn drain_profraw(
