@@ -153,7 +153,12 @@ pub fn merge_config(
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
     let index_jobs = cli.index_jobs.or(file.index_jobs).unwrap_or_else(nproc);
-    let cm_jobs = cli.cm_jobs.or(file.cm_jobs).unwrap_or_else(nproc);
+    // cargo-mutants workers are RAM-bound the same way the QS build pool is.
+    // Defaulting to nproc (120 here) would overstate the competitor.
+    let cm_jobs = cli
+        .cm_jobs
+        .or(file.cm_jobs)
+        .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
 
     let mut build_env = file.build_env;
     if let Ok(v) = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE") {

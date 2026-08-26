@@ -45,8 +45,9 @@ pub fn run_mutant_tests(
                 return Ok(Outcome::caught(planned.mutant.clone(), t.name.clone()));
             }
             RunStatus::Error { code } => {
-                return Ok(Outcome::unviable(
+                return Ok(Outcome::errored(
                     planned.mutant.clone(),
+                    t.name.clone(),
                     format!(
                         "test {} exited {:?} (libtest failures are 101; this is not Caught)",
                         t.name, code

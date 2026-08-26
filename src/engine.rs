@@ -65,12 +65,9 @@ pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
     }
 }
 
-pub fn default_index_scope(cfg: &Config, mutants: &[Mutant]) -> Option<String> {
-    if let Some(s) = &cfg.index_scope {
-        return Some(s.clone());
-    }
-    if mutants.iter().any(|m| m.package == "brokk-bifrost-core") {
-        return Some("brokk-bifrost-core".into());
+pub fn default_index_scope(explicit: Option<&str>, mutants: &[Mutant]) -> Option<String> {
+    if let Some(s) = explicit {
+        return Some(s.to_string());
     }
     let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for m in mutants {
@@ -106,7 +103,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
     eprintln!("discovered {} mutants", mutants.len());
 
     if for_estimate && cfg.index_scope.is_none() {
-        cfg.index_scope = default_index_scope(&cfg, &mutants);
+        cfg.index_scope = default_index_scope(cfg.index_scope.as_deref(), &mutants);
         if let Some(s) = &cfg.index_scope {
             eprintln!("index-scope defaulted to {s}");
         }
@@ -257,4 +254,50 @@ pub fn write_outputs(
         crate::report::write_json(path, outcomes, estimate)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Mutant;
+
+    fn mutant(package: &str) -> Mutant {
+        Mutant {
+            id: format!("{package}::f"),
+            package: package.into(),
+            path: format!("{package}/src/lib.rs"),
+            fqn: "f".into(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+            body_start_byte: 0,
+            body_end_byte: 1,
+            replacement: "{ 0 }".into(),
+            return_kind: "number".into(),
+        }
+    }
+
+    #[test]
+    fn index_scope_picks_the_most_populous_package() {
+        let mutants = vec![
+            mutant("brokk-bifrost-core"),
+            mutant("tiny_a"),
+            mutant("tiny_a"),
+            mutant("tiny_a"),
+        ];
+        assert_eq!(
+            default_index_scope(None, &mutants).as_deref(),
+            Some("tiny_a")
+        );
+    }
+
+    #[test]
+    fn index_scope_explicit_wins() {
+        let mutants = vec![mutant("tiny_a"), mutant("tiny_a"), mutant("tiny_b")];
+        assert_eq!(
+            default_index_scope(Some("tiny_b"), &mutants).as_deref(),
+            Some("tiny_b")
+        );
+    }
 }

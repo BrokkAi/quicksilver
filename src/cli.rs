@@ -35,8 +35,8 @@ pub struct CommonOpts {
     pub index_jobs: Option<usize>,
 
     /// Parallelism assumed for the cargo-mutants comparison baseline (J_cm).
-    /// Independent of the quicksilver build pool; cargo-mutants runs whole
-    /// scenarios and typically uses all cores.
+    /// Defaults to the same RAM/CPU formula as --build-jobs: cargo-mutants
+    /// workers each run a full rustc and will not actually use all cores.
     #[arg(long, global = true)]
     pub cm_jobs: Option<usize>,
 

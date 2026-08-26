@@ -65,6 +65,9 @@ pub enum VerdictKind {
     Missed,
     NotCovered,
     Unviable,
+    /// Test binary ran but did not fail as libtest (exit 101). Dynamic-link
+    /// failures, abort, etc. Not a compile failure and not Caught.
+    Errored,
     Timeout,
 }
 
@@ -126,6 +129,16 @@ impl Outcome {
             kind: VerdictKind::Timeout,
             test: Some(test),
             message: None,
+            build: true,
+        }
+    }
+
+    pub fn errored(mutant: Mutant, test: String, message: String) -> Self {
+        Self {
+            mutant,
+            kind: VerdictKind::Errored,
+            test: Some(test),
+            message: Some(message),
             build: true,
         }
     }

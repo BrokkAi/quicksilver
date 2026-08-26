@@ -32,6 +32,7 @@ pub struct SampleCounts {
     pub missed: usize,
     pub not_covered: usize,
     pub unviable: usize,
+    pub errored: usize,
     pub timeout: usize,
     pub builds: usize,
 }
@@ -98,6 +99,7 @@ pub fn compute(
             missed: counts.missed,
             not_covered: counts.not_covered,
             unviable: counts.unviable,
+            errored: counts.errored,
             timeout: counts.timeout,
             builds: counts.builds,
         },
@@ -115,8 +117,7 @@ pub fn compute(
             format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package (matches the single multi -p invocation in build_one).", t_build),
             "T_qs is a max of compile-side and test-side (decoupled pools), not a sum.".into(),
             format!(
-                "T_mutants uses a coupled worker model: N · (t_build + t_suite) / J_cm with J_cm = --cm-jobs ({j_cm}), independent of J_build={}.",
-                j_build.max(1)
+                "T_mutants uses a coupled worker model: N · (t_build + t_suite) / J_cm. J_cm defaults to the same RAM/CPU formula as J_build (here {j_cm}); override with --cm-jobs. cargo-mutants workers each run a full rustc and will not actually use all cores."
             ),
             format!(
                 "T_v2 treats one schema compile per crate that has covered mutants ({projected_batches} batches), not one per function. That is a proxy, not a measured schemata run."
@@ -197,6 +198,7 @@ pub fn render(report: &EstimateReport) -> String {
         report.sample_counts.not_covered
     ));
     s.push_str(&format!("  Unviable:   {}\n", report.sample_counts.unviable));
+    s.push_str(&format!("  Errored:    {}\n", report.sample_counts.errored));
     s.push_str(&format!("  Timeout:    {}\n", report.sample_counts.timeout));
     s.push_str(&format!("  Builds:     {}\n\n", report.sample_counts.builds));
     s.push_str("Assumptions:\n");

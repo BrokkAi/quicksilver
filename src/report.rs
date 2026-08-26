@@ -20,6 +20,7 @@ pub struct CountReport {
     pub missed: usize,
     pub not_covered: usize,
     pub unviable: usize,
+    pub errored: usize,
     pub timeout: usize,
     pub builds: usize,
     pub total: usize,
@@ -32,6 +33,7 @@ impl From<&OutcomeCounts> for CountReport {
             missed: c.missed,
             not_covered: c.not_covered,
             unviable: c.unviable,
+            errored: c.errored,
             timeout: c.timeout,
             builds: c.builds,
             total: c.total(),
@@ -42,12 +44,13 @@ impl From<&OutcomeCounts> for CountReport {
 pub fn print_outcomes(outcomes: &[Outcome]) {
     let c = OutcomeCounts::from_outcomes(outcomes);
     eprintln!(
-        "outcomes: {} total — {} caught, {} missed, {} not covered, {} unviable, {} timeout ({} builds)",
+        "outcomes: {} total — {} caught, {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} builds)",
         c.total(),
         c.caught,
         c.missed,
         c.not_covered,
         c.unviable,
+        c.errored,
         c.timeout,
         c.builds
     );
@@ -65,6 +68,15 @@ pub fn print_outcomes(outcomes: &[Outcome]) {
                     o.mutant.id,
                     o.mutant.fqn,
                     o.test.as_deref().unwrap_or("?")
+                );
+            }
+            VerdictKind::Errored => {
+                eprintln!(
+                    "  ERRORED {}  {}  ({})  {}",
+                    o.mutant.id,
+                    o.mutant.fqn,
+                    o.test.as_deref().unwrap_or("?"),
+                    o.message.as_deref().unwrap_or("")
                 );
             }
             _ => {}
