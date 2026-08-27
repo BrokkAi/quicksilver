@@ -417,17 +417,40 @@ fn run_union_coverage(
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
     let merged = paths.index.join("union.profdata");
-    let _ = fs::remove_file(&merged);
+    let progress_path = paths.index.join("stage-a-progress.json");
 
     // One nextest of 12k instrumented tests wrote ~190G of profraw and filled
     // the disk. Concurrent drain merged half-written files. Shard instead:
     // run, merge only completed files, delete, then the next shard.
     const SHARD: usize = 300;
     let n_shards = tests.len().div_ceil(SHARD).max(1);
-    let mut instr_passed: HashSet<String> = HashSet::new();
-    let mut any_ok = false;
+    let resume = if cfg.reindex {
+        None
+    } else {
+        load_stage_a_progress(&progress_path, tests.len(), n_shards, &merged)
+    };
+    let start_shard = resume.as_ref().map(|p| p.completed + 1).unwrap_or(1);
+    let mut instr_passed: HashSet<String> = resume
+        .as_ref()
+        .map(|p| p.passed.iter().cloned().collect())
+        .unwrap_or_default();
+    let mut any_ok = resume.is_some();
+    if start_shard == 1 {
+        let _ = fs::remove_file(&merged);
+        let _ = fs::remove_file(&progress_path);
+        let _ = fs::remove_dir_all(&prof_root);
+        fs::create_dir_all(&prof_root)?;
+    } else {
+        info!(
+            "resuming Stage A at shard {start_shard}/{n_shards} (union.profdata kept, {} passed ids cached)",
+            instr_passed.len()
+        );
+        let _ = fs::remove_dir_all(&prof_root);
+        fs::create_dir_all(&prof_root)?;
+    }
+
     info!("stage A nextest in {n_shards} shards of up to {SHARD} tests");
-    for shard in 1..=n_shards {
+    for shard in start_shard..=n_shards as u32 {
         let _ = fs::remove_file(&junit);
         let mut cmd = crate::cargo_cmd::cargo_command();
         cmd.current_dir(&paths.baseline);
@@ -453,10 +476,18 @@ fn run_union_coverage(
             instr_passed.extend(crate::baseline::junit_passed_ids(&xml));
         }
         merge_all_profraw(&prof_root, &merged, &llvm_profdata)?;
+        save_stage_a_progress(&progress_path, tests.len(), n_shards, shard, &instr_passed)?;
         crate::scratch::check_free_space(&cfg.scratch_root, Some(8 * (1 << 30)))?;
     }
 
-    check_stage_a_pass_ids(tests, baseline, &instr_passed, any_ok)?;
+    if resume.is_some() && instr_passed.len() < tests.len() / 2 {
+        tracing::warn!(
+            "Stage A resumed without a full JUnit pass list ({} ids); skipping the pass-count guard. Union coverage is still accumulated in union.profdata.",
+            instr_passed.len()
+        );
+    } else {
+        check_stage_a_pass_ids(tests, baseline, &instr_passed, any_ok)?;
+    }
 
     if !merged.is_file() {
         let _ = fs::remove_dir_all(&prof_root);
@@ -471,6 +502,7 @@ fn run_union_coverage(
     let hits = llvm_cov_export(&llvm_cov, &merged, &binaries, sources, &ws_root)?;
     let _ = fs::remove_dir_all(&prof_root);
     let _ = fs::remove_file(&merged);
+    let _ = fs::remove_file(&progress_path);
 
     let mut union: HashMap<String, BTreeSet<u32>> = HashMap::new();
     for (file, lines) in hits {
@@ -536,6 +568,56 @@ fn check_stage_a_pass_ids(
     Ok(())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StageAProgress {
+    n_tests: usize,
+    n_shards: usize,
+    completed: u32,
+    #[serde(default)]
+    passed: Vec<String>,
+}
+
+fn load_stage_a_progress(
+    path: &Path,
+    n_tests: usize,
+    n_shards: usize,
+    merged: &Path,
+) -> Option<StageAProgress> {
+    if !path.is_file() || !merged.is_file() {
+        return None;
+    }
+    let p: StageAProgress = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
+    if p.n_tests == n_tests
+        && p.n_shards == n_shards
+        && p.completed >= 1
+        && p.completed < n_shards as u32
+    {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn save_stage_a_progress(
+    path: &Path,
+    n_tests: usize,
+    n_shards: usize,
+    completed: u32,
+    passed: &HashSet<String>,
+) -> Result<()> {
+    let p = StageAProgress {
+        n_tests,
+        n_shards,
+        completed,
+        passed: {
+            let mut v: Vec<String> = passed.iter().cloned().collect();
+            v.sort();
+            v
+        },
+    };
+    crate::util::write_atomic(path, serde_json::to_vec_pretty(&p)?)
+}
+
 fn merge_all_profraw(prof_root: &Path, acc: &Path, llvm_profdata: &Path) -> Result<usize> {
     let mut total = 0usize;
     loop {
@@ -586,22 +668,51 @@ fn drain_profraw(
         return Ok(0);
     }
     let tmp = acc.with_extension("tmp");
+    if try_llvm_merge(llvm_profdata, acc, &raws, &tmp)? {
+        for r in &raws {
+            let _ = fs::remove_file(r);
+        }
+        return Ok(raws.len());
+    }
+    // A timed-out or killed test leaves a truncated header. llvm-profdata
+    // then fails the whole batch, including a good union.profdata input.
+    // Merge survivors one file at a time and drop the corrupt ones.
+    tracing::warn!(
+        "batch profraw merge failed ({} files); merging one-by-one and skipping corrupt profiles",
+        raws.len()
+    );
+    let mut kept = 0usize;
+    for r in &raws {
+        match try_llvm_merge(llvm_profdata, acc, std::slice::from_ref(r), &tmp)? {
+            true => kept += 1,
+            false => tracing::warn!("skipping corrupt profraw {}", r.display()),
+        }
+        let _ = fs::remove_file(r);
+    }
+    Ok(kept)
+}
+
+fn try_llvm_merge(
+    llvm_profdata: &Path,
+    acc: &Path,
+    inputs: &[PathBuf],
+    tmp: &Path,
+) -> Result<bool> {
     let mut merge = Command::new(llvm_profdata);
-    merge.arg("merge").arg("--sparse").arg("-o").arg(&tmp);
+    merge.arg("merge").arg("--sparse").arg("-o").arg(tmp);
     if acc.is_file() {
         merge.arg(acc);
     }
-    merge.args(&raws);
-    let st = merge.status().context("incremental llvm-profdata merge")?;
-    if !st.success() {
-        let _ = fs::remove_file(&tmp);
-        bail!("incremental llvm-profdata merge failed");
+    merge.args(inputs);
+    merge.stdout(Stdio::null());
+    merge.stderr(Stdio::piped());
+    let out = merge.output().context("incremental llvm-profdata merge")?;
+    if !out.status.success() {
+        let _ = fs::remove_file(tmp);
+        return Ok(false);
     }
-    fs::rename(&tmp, acc)?;
-    for r in &raws {
-        let _ = fs::remove_file(r);
-    }
-    Ok(raws.len())
+    fs::rename(tmp, acc)?;
+    Ok(true)
 }
 
 fn unique_binaries(tests: &[TestInfo], target_dir: &Path) -> Vec<PathBuf> {
@@ -1110,6 +1221,20 @@ end_of_record
         attach_timings(&mut index, &baseline);
         assert_eq!(index.tests[0].duration_secs, 0.2);
         assert_eq!(index.tests[1].duration_secs, 0.8);
+    }
+
+    #[test]
+    fn stage_a_progress_resumes_only_on_matching_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("union.profdata");
+        fs::write(&merged, b"ok").unwrap();
+        let p = dir.path().join("stage-a-progress.json");
+        save_stage_a_progress(&p, 12685, 43, 23, &HashSet::new()).unwrap();
+        let got = load_stage_a_progress(&p, 12685, 43, &merged).expect("resume");
+        assert_eq!(got.completed, 23);
+        assert!(load_stage_a_progress(&p, 1, 43, &merged).is_none());
+        assert!(load_stage_a_progress(&p, 12685, 40, &merged).is_none());
+        assert!(load_stage_a_progress(&p, 12685, 43, &dir.path().join("missing")).is_none());
     }
 
     #[test]
