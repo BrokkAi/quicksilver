@@ -796,7 +796,8 @@ fn lookup_dataset(remote: Option<&str>, mount: &Path) -> Result<String> {
 }
 
 pub fn worker_dir(paths: &Paths, slot: usize) -> PathBuf {
-    paths.workers.join(format!("w{slot:02}"))
+    let prefix = std::env::var("QS_WORKER_PREFIX").unwrap_or_default();
+    paths.workers.join(format!("{prefix}w{slot:02}"))
 }
 
 pub fn ensure_worker(backend: &dyn CloneBackend, paths: &Paths, slot: usize) -> Result<PathBuf> {

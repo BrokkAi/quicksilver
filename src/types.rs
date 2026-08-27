@@ -177,8 +177,9 @@ impl Paths {
             baseline_cov: session.join("baseline-cov"),
             index: session.join("index"),
             workers: session.join("workers"),
-            runs: session.join("runs"),
-            state: session.join("state"),
+            runs: session.join(std::env::var("QS_RUNS_SUBDIR").unwrap_or_else(|_| "runs".into())),
+            state: session
+                .join(std::env::var("QS_STATE_SUBDIR").unwrap_or_else(|_| "state".into())),
             session,
         }
     }

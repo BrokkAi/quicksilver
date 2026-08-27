@@ -11,6 +11,7 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -233,6 +234,10 @@ pub fn stage_b_for_mutants(
     if mutants.is_empty() || index.tests.is_empty() {
         return Ok(());
     }
+    let _lock = lock_coverage(paths)?;
+    if let Some(fresh) = CoverageIndex::load(paths)? {
+        *index = fresh;
+    }
     let ids: BTreeSet<String> = mutants.iter().map(|m| m.id.clone()).collect();
     if stage_b_is_cached(index, &ids) {
         info!(
@@ -304,6 +309,32 @@ pub fn stage_b_for_mutants(
     index.stage_b_ids_hash = hash_mutant_ids(&index.stage_b_mutant_ids);
     index.save(paths)?;
     Ok(())
+}
+
+struct CoverageLock {
+    _file: fs::File,
+}
+
+fn lock_coverage(paths: &Paths) -> Result<CoverageLock> {
+    let path = paths.index.join("coverage.lock");
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        bail!(
+            "flock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(CoverageLock { _file: file })
 }
 
 fn stage_b_is_cached(index: &CoverageIndex, ids: &BTreeSet<String>) -> bool {
