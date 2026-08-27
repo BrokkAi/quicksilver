@@ -8,6 +8,7 @@ use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::info;
@@ -108,21 +109,28 @@ pub fn execute(
             let cancel = Arc::clone(&cancel);
             let cargo_invocations = Arc::clone(&cargo_invocations);
             scope.spawn(move || {
-                let worker = match ensure_worker(backend.as_ref(), &paths, slot) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        tracing::error!("worker {slot} clone failed: {err:#}");
-                        return;
-                    }
-                };
+                let mut worker: Option<PathBuf> = None;
                 while let Ok(batch) = batch_rx.recv() {
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
+                    let w = match &worker {
+                        Some(w) => w.clone(),
+                        None => match ensure_worker(backend.as_ref(), &paths, slot) {
+                            Ok(w) => {
+                                worker = Some(w.clone());
+                                w
+                            }
+                            Err(err) => {
+                                tracing::error!("worker {slot} clone failed: {err:#}");
+                                return;
+                            }
+                        },
+                    };
                     let _ = walk_batch(
                         &cfg,
                         backend.as_ref(),
-                        &worker,
+                        &w,
                         &paths.runs,
                         &batch,
                         &cargo_invocations,

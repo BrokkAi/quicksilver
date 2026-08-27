@@ -107,23 +107,30 @@ pub fn execute(
             let cancel = Arc::clone(&cancel);
             let cargo_invocations = Arc::clone(&cargo_invocations);
             scope.spawn(move || {
-                let worker = match ensure_worker(backend.as_ref(), &paths, slot) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        tracing::error!("schema worker {slot} clone failed: {err:#}");
-                        return;
-                    }
-                };
+                let mut worker: Option<PathBuf> = None;
                 while let Ok((package, planned)) = job_rx.recv() {
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
+                    let w = match &worker {
+                        Some(w) => w.clone(),
+                        None => match ensure_worker(backend.as_ref(), &paths, slot) {
+                            Ok(w) => {
+                                worker = Some(w.clone());
+                                w
+                            }
+                            Err(err) => {
+                                tracing::error!("schema worker {slot} clone failed: {err:#}");
+                                return;
+                            }
+                        },
+                    };
                     let planned_for_err = planned.clone();
                     match run_crate(
                         &cfg,
                         &paths,
                         backend.as_ref(),
-                        &worker,
+                        &w,
                         &package,
                         planned,
                         &cargo_invocations,
@@ -601,6 +608,18 @@ fn bisect_offenders(
     Ok(offenders)
 }
 
+fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
+    let mut tests: Vec<TestInfo> = Vec::new();
+    for p in planned {
+        for t in &p.tests {
+            if !tests.iter().any(|x| x.id == t.id) {
+                tests.push(t.clone());
+            }
+        }
+    }
+    tests
+}
+
 fn null_schema_gate(
     cfg: &Config,
     run_dir: &Path,
@@ -625,7 +644,7 @@ fn null_schema_gate(
                 replacement: String::new(),
                 return_kind: String::new(),
             }),
-        tests: Vec::new(),
+        tests: union_selected_tests(planned),
         estimated_cost_secs: 0.0,
     };
     let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, cfg.timeout_floor, &[])?;
@@ -854,4 +873,67 @@ fn progress_bar(n: u64, quiet: bool) -> ProgressBar {
         .unwrap_or_else(|_| ProgressStyle::default_bar()),
     );
     pb
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Mutant;
+
+    fn mutant(id: &str) -> Mutant {
+        Mutant {
+            id: id.into(),
+            package: "p".into(),
+            path: "p/src/lib.rs".into(),
+            fqn: "p::f".into(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+            body_start_byte: 0,
+            body_end_byte: 1,
+            replacement: "{ 0 }".into(),
+            return_kind: "number".into(),
+        }
+    }
+
+    fn testinfo(id: &str, dur: f64) -> TestInfo {
+        TestInfo {
+            id: id.into(),
+            name: id.into(),
+            package: "p".into(),
+            binary_id: "p".into(),
+            binary_name: "p".into(),
+            binary_rel: "deps/p".into(),
+            cwd_rel: "p".into(),
+            duration_secs: dur,
+        }
+    }
+
+    #[test]
+    fn null_gate_timeout_scales_with_selected_tests() {
+        let planned = vec![
+            PlannedMutant {
+                mutant: mutant("a"),
+                tests: vec![testinfo("t1", 20.0), testinfo("t2", 10.0)],
+                estimated_cost_secs: 0.0,
+            },
+            PlannedMutant {
+                mutant: mutant("b"),
+                tests: vec![testinfo("t2", 10.0), testinfo("t3", 5.0)],
+                estimated_cost_secs: 0.0,
+            },
+        ];
+        let tests = union_selected_tests(&planned);
+        assert_eq!(tests.len(), 3);
+        let sum: f64 = tests.iter().map(|t| t.duration_secs).sum();
+        assert!((sum - 35.0).abs() < 1e-9, "union durations {sum}");
+        let timeout_floor: f64 = 5.0;
+        let timeout = timeout_floor.max(3.0 * sum);
+        assert!(
+            timeout > timeout_floor,
+            "null-gate timeout must not collapse to the 5s floor"
+        );
+        assert!((timeout - 105.0).abs() < 1e-9);
+    }
 }
