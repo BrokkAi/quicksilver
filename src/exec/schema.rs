@@ -1,12 +1,8 @@
 //! Schema pool + test pool. Test binaries do not change between mutants.
 
-use crate::cargo_cmd::{
-    apply_build_env, apply_package_select, build_tests_captured, cargo_command, crate_root_source,
-    load_metadata, nextest_profile_args, write_nextest_config, PackageSelect,
-};
+use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
 use crate::config::Config;
 use crate::exec::build::resolve_binary;
-use crate::exec::process::RunStatus;
 use crate::exec::test::{run_mutant_tests_with_env, BinariesManifest, ManifestTest};
 use crate::exec::{append_outcome, load_resume, ExecResult};
 use crate::plan::Plan;
@@ -16,14 +12,13 @@ use crate::schema::{
     restore_files, snapshot_sources, Site,
 };
 use crate::scratch::{ensure_worker, CloneBackend};
-use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo};
+use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo, VerdictKind};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -77,7 +72,7 @@ pub fn execute(
         by_pkg.entry(p.mutant.package.clone()).or_default().push(p);
     }
 
-    let build_counter = Arc::new(AtomicU64::new(0));
+    let cargo_invocations = Arc::new(AtomicU64::new(0));
     let jobs: Vec<(String, Vec<PlannedMutant>)> = by_pkg.into_iter().collect();
     let n_mutants: usize = jobs.iter().map(|(_, v)| v.len()).sum();
     info!(
@@ -110,8 +105,15 @@ pub fn execute(
             let cfg = Arc::clone(&cfg);
             let paths = Arc::clone(&paths);
             let cancel = Arc::clone(&cancel);
-            let build_counter = Arc::clone(&build_counter);
+            let cargo_invocations = Arc::clone(&cargo_invocations);
             scope.spawn(move || {
+                let worker = match ensure_worker(backend.as_ref(), &paths, slot) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::error!("schema worker {slot} clone failed: {err:#}");
+                        return;
+                    }
+                };
                 while let Ok((package, planned)) = job_rx.recv() {
                     if cancel.load(Ordering::Relaxed) {
                         break;
@@ -121,10 +123,10 @@ pub fn execute(
                         &cfg,
                         &paths,
                         backend.as_ref(),
-                        slot,
+                        &worker,
                         &package,
                         planned,
-                        &build_counter,
+                        &cargo_invocations,
                         &cancel,
                     ) {
                         Ok(CrateDone {
@@ -208,7 +210,7 @@ pub fn execute(
     let _ = fs::remove_dir_all(paths.runs.join("schema"));
 
     Ok(ExecResult {
-        builds: build_counter.load(Ordering::SeqCst),
+        cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
         outcomes,
     })
 }
@@ -224,10 +226,10 @@ fn run_crate(
     cfg: &Config,
     paths: &Paths,
     backend: &dyn CloneBackend,
-    slot: usize,
+    worker: &Path,
     package: &str,
     planned: Vec<PlannedMutant>,
-    build_counter: &AtomicU64,
+    cargo_invocations: &AtomicU64,
     cancel: &AtomicBool,
 ) -> Result<CrateDone> {
     let mutants: Vec<Mutant> = planned.iter().map(|p| p.mutant.clone()).collect();
@@ -262,15 +264,14 @@ fn run_crate(
         });
     }
 
-    let worker = ensure_worker(backend, paths, slot)?;
     let target = worker.join("target");
-    let meta = load_metadata(&worker)?;
+    let meta = load_metadata(worker)?;
     let crate_root_abs =
         crate_root_source(&meta, package).with_context(|| format!("crate root for {package}"))?;
-    let crate_root = rebase_to_worker(&crate_root_abs, &paths.baseline, &worker);
+    let crate_root = rebase_to_worker(&crate_root_abs, &paths.baseline, worker);
     let crate_root_rel = crate::util::rel_slash(
         crate_root
-            .strip_prefix(&worker)
+            .strip_prefix(worker)
             .unwrap_or(crate_root.as_path()),
     );
 
@@ -291,16 +292,17 @@ fn run_crate(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let snap = snapshot_sources(&worker, &batch, &crate_root_rel)?;
+        let snap = snapshot_sources(worker, &batch, &crate_root_rel)?;
         let isolated = isolate(
             cfg,
-            &worker,
+            worker,
             &target,
+            package,
             &packages,
             &snap,
             &crate_root,
             batch,
-            build_counter,
+            cargo_invocations,
         )?;
         for (id, msg) in isolated.unviable {
             if let Some(p) = by_id.get(&id) {
@@ -308,10 +310,9 @@ fn run_crate(
             }
         }
         if isolated.sites.is_empty() {
-            restore_files(&worker, &snap)?;
+            restore_files(worker, &snap)?;
             continue;
         }
-        null_schema_gate(cfg, &worker, &target, &packages)?;
         let run_dir = paths.runs.join("schema").join(format!("{package}-{bi}"));
         stage_binaries(
             cfg,
@@ -322,6 +323,7 @@ fn run_crate(
             &isolated.sites,
             &isolated.executables,
         )?;
+        null_schema_gate(cfg, &run_dir, &paths.baseline, &planned)?;
         identity_gate(cfg, &run_dir, &paths.baseline, &isolated.sites, &by_id)?;
         for p in &planned {
             if let Some((site, variant)) = lookup_variant(&isolated.sites, &p.mutant.id) {
@@ -333,7 +335,7 @@ fn run_crate(
             }
         }
         keep.push(run_dir);
-        restore_files(&worker, &snap)?;
+        restore_files(worker, &snap)?;
     }
 
     Ok(CrateDone {
@@ -349,25 +351,65 @@ struct Isolated {
     executables: Vec<PathBuf>,
 }
 
+fn cargo_build(
+    cfg: &Config,
+    worker: &Path,
+    target: &Path,
+    packages: &[String],
+    cargo_invocations: &AtomicU64,
+) -> Result<CapturedBuild> {
+    cargo_invocations.fetch_add(1, Ordering::SeqCst);
+    build_tests_captured(worker, target, cfg, packages, false)
+}
+
+/// Attribution rounds compile only `mutated`. The prologue never changes a
+/// signature, so no dependent crate can newly fail to compile. `-> impl Trait`
+/// is pre-filtered before we get here. The full `test_packages` list is built
+/// once, after the mutated crate is clean, to produce test binaries.
+fn finalize_test_binaries(
+    cfg: &Config,
+    worker: &Path,
+    target: &Path,
+    mutated: &str,
+    test_packages: &[String],
+    crate_only: CapturedBuild,
+    cargo_invocations: &AtomicU64,
+) -> Result<Vec<PathBuf>> {
+    let only_mutated =
+        test_packages.is_empty() || (test_packages.len() == 1 && test_packages[0] == mutated);
+    if only_mutated {
+        return Ok(crate_only.executables);
+    }
+    let full = cargo_build(cfg, worker, target, test_packages, cargo_invocations)?;
+    if !full.success {
+        bail!(
+            "schema test packages failed to compile against a clean mutated crate:\n{}",
+            tail_utf8(&full.stderr)
+        );
+    }
+    Ok(full.executables)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn isolate(
     cfg: &Config,
     worker: &Path,
     target: &Path,
-    packages: &[String],
+    mutated: &str,
+    test_packages: &[String],
     originals: &HashMap<String, Vec<u8>>,
     crate_root: &Path,
     mut sites: Vec<Site>,
-    build_counter: &AtomicU64,
+    cargo_invocations: &AtomicU64,
 ) -> Result<Isolated> {
+    let mutated_pkgs = [mutated.to_string()];
     let mut unviable = Vec::new();
     let max_rounds = cfg.schema_max_rounds.max(1);
     for round in 1..=max_rounds {
         restore_files(worker, originals)?;
         if sites.is_empty() {
             inject_runtime(crate_root)?;
-            build_counter.fetch_add(1, Ordering::SeqCst);
-            let built = build_tests_captured(worker, target, cfg, packages, false)?;
+            let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
             if !built.success {
                 bail!(
                     "schema runtime itself does not compile:\n{}",
@@ -381,13 +423,21 @@ fn isolate(
             });
         }
         let applied = apply_schema_to_tree(worker, &sites, crate_root)?;
-        build_counter.fetch_add(1, Ordering::SeqCst);
-        let built = build_tests_captured(worker, target, cfg, packages, false)?;
+        let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if built.success {
+            let executables = finalize_test_binaries(
+                cfg,
+                worker,
+                target,
+                mutated,
+                test_packages,
+                built,
+                cargo_invocations,
+            )?;
             return Ok(Isolated {
                 sites,
                 unviable,
-                executables: built.executables,
+                executables,
             });
         }
         let spans = parse_compiler_error_spans(&built.stdout);
@@ -400,11 +450,11 @@ fn isolate(
                 cfg,
                 worker,
                 target,
-                packages,
+                mutated,
                 originals,
                 crate_root,
                 &sites,
-                build_counter,
+                cargo_invocations,
             )?;
             let disabled = disable_sites(&mut sites, &offenders);
             if disabled.is_empty() {
@@ -434,19 +484,18 @@ fn isolate(
     restore_files(worker, originals)?;
     if !sites.is_empty() {
         let applied = apply_schema_to_tree(worker, &sites, crate_root)?;
-        build_counter.fetch_add(1, Ordering::SeqCst);
-        let built = build_tests_captured(worker, target, cfg, packages, false)?;
+        let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if !built.success {
             warn!("schema still failing after {max_rounds} diagnostic rounds; bisecting");
             let offenders = bisect_offenders(
                 cfg,
                 worker,
                 target,
-                packages,
+                mutated,
                 originals,
                 crate_root,
                 &sites,
-                build_counter,
+                cargo_invocations,
             )?;
             let disabled = disable_sites(&mut sites, &offenders);
             for (id, why) in disabled {
@@ -455,25 +504,42 @@ fn isolate(
             restore_files(worker, originals)?;
             if !sites.is_empty() {
                 let _ = apply_schema_to_tree(worker, &sites, crate_root)?;
-                build_counter.fetch_add(1, Ordering::SeqCst);
-                let last = build_tests_captured(worker, target, cfg, packages, false)?;
+                let last = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
                 if !last.success {
                     bail!(
                         "schema build still failing after bisection:\n{}",
                         tail_utf8(&last.stderr)
                     );
                 }
+                let executables = finalize_test_binaries(
+                    cfg,
+                    worker,
+                    target,
+                    mutated,
+                    test_packages,
+                    last,
+                    cargo_invocations,
+                )?;
                 return Ok(Isolated {
                     sites,
                     unviable,
-                    executables: last.executables,
+                    executables,
                 });
             }
         } else {
+            let executables = finalize_test_binaries(
+                cfg,
+                worker,
+                target,
+                mutated,
+                test_packages,
+                built,
+                cargo_invocations,
+            )?;
             return Ok(Isolated {
                 sites,
                 unviable,
-                executables: built.executables,
+                executables,
             });
         }
         let _ = applied;
@@ -490,16 +556,16 @@ fn bisect_offenders(
     cfg: &Config,
     worker: &Path,
     target: &Path,
-    packages: &[String],
+    mutated: &str,
     originals: &HashMap<String, Vec<u8>>,
     crate_root: &Path,
     sites: &[Site],
-    build_counter: &AtomicU64,
+    cargo_invocations: &AtomicU64,
 ) -> Result<BTreeSet<u32>> {
+    let mutated_pkgs = [mutated.to_string()];
     restore_files(worker, originals)?;
     inject_runtime(crate_root)?;
-    build_counter.fetch_add(1, Ordering::SeqCst);
-    let rt_only = build_tests_captured(worker, target, cfg, packages, false)?;
+    let rt_only = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
     if !rt_only.success {
         bail!(
             "schema __qs_rt does not compile (bisection aborted):\n{}",
@@ -512,8 +578,7 @@ fn bisect_offenders(
     while !remaining.is_empty() {
         restore_files(worker, originals)?;
         apply_schema_to_tree(worker, &remaining, crate_root)?;
-        build_counter.fetch_add(1, Ordering::SeqCst);
-        let built = build_tests_captured(worker, target, cfg, packages, false)?;
+        let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if built.success {
             break;
         }
@@ -526,8 +591,7 @@ fn bisect_offenders(
         let left = remaining[..mid].to_vec();
         restore_files(worker, originals)?;
         apply_schema_to_tree(worker, &left, crate_root)?;
-        build_counter.fetch_add(1, Ordering::SeqCst);
-        let left_built = build_tests_captured(worker, target, cfg, packages, false)?;
+        let left_built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if !left_built.success {
             remaining = left;
         } else {
@@ -537,24 +601,48 @@ fn bisect_offenders(
     Ok(offenders)
 }
 
-fn null_schema_gate(cfg: &Config, worker: &Path, target: &Path, packages: &[String]) -> Result<()> {
-    let config_path = write_nextest_config(&worker.join("qs-nextest"))?;
-    let mut cmd = cargo_command();
-    cmd.current_dir(worker);
-    cmd.env("CARGO_TARGET_DIR", target);
-    apply_build_env(&mut cmd, cfg, false);
-    cmd.env_remove("QS_MUTANT");
-    cmd.args(["nextest", "run"]);
-    cmd.args(nextest_profile_args());
-    cmd.arg("--config-file").arg(&config_path);
-    apply_package_select(&mut cmd, &PackageSelect::Packages(packages.to_vec()));
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
-    let st = cmd.status().context("null-schema nextest")?;
-    if !st.success() {
-        bail!("null-schema gate failed: suite is not green with QS_MUTANT unset");
+fn null_schema_gate(
+    cfg: &Config,
+    run_dir: &Path,
+    baseline: &Path,
+    planned: &[PlannedMutant],
+) -> Result<()> {
+    let dummy = PlannedMutant {
+        mutant: planned
+            .first()
+            .map(|p| p.mutant.clone())
+            .unwrap_or_else(|| Mutant {
+                id: "null-schema".into(),
+                package: String::new(),
+                path: String::new(),
+                fqn: String::new(),
+                start_byte: 0,
+                end_byte: 0,
+                start_line: 1,
+                end_line: 1,
+                body_start_byte: 0,
+                body_end_byte: 0,
+                replacement: String::new(),
+                return_kind: String::new(),
+            }),
+        tests: Vec::new(),
+        estimated_cost_secs: 0.0,
+    };
+    let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, cfg.timeout_floor, &[])?;
+    match outcome.kind {
+        VerdictKind::Caught | VerdictKind::Timeout | VerdictKind::Errored => {
+            bail!(
+                "null-schema gate failed: staged tests are not green with QS_MUTANT unset ({:?} {})",
+                outcome.kind,
+                outcome
+                    .test
+                    .as_deref()
+                    .or(outcome.message.as_deref())
+                    .unwrap_or("")
+            );
+        }
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn identity_gate(

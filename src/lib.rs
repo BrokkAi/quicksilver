@@ -91,7 +91,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let prepared = engine::prepare(cfg, args.skip_baseline, false)?;
     let _ = engine::maybe_preflight(&prepared)?;
-    let (outcomes, _builds) = if prepared.cfg.schema {
+    let (outcomes, cargo_invocations) = if prepared.cfg.schema {
         engine::run_schema(&prepared, args.limit, None)?
     } else {
         engine::run_prepared(&prepared, args.limit, None)?
@@ -105,13 +105,13 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
                 for d in &diffs {
                     eprintln!("  {}  {}  v1={:?} v2={:?}", d.mutant_id, d.fqn, d.v1, d.v2);
                 }
-                engine::write_outputs(&prepared.cfg, &outcomes, None)?;
+                engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
                 return Ok(2);
             }
             eprintln!("differential gate: {} v1 verdicts matched", outcomes.len());
         }
     }
-    engine::write_outputs(&prepared.cfg, &outcomes, None)?;
+    engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
 }
@@ -210,11 +210,11 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         "running sample of {} mutants through the pipeline",
         sample.len()
     );
-    let (outcomes, builds) = engine::run_prepared(&prepared, 0, Some(&sample))?;
+    let (outcomes, cargo_invocations) = engine::run_prepared(&prepared, 0, Some(&sample))?;
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
-    report.sample_counts.builds = builds as usize;
+    report.sample_counts.cargo_invocations = cargo_invocations as usize;
     print!("{}", estimate::render(&report));
-    engine::write_outputs(&prepared.cfg, &outcomes, Some(&report))?;
+    engine::write_outputs(&prepared.cfg, &outcomes, Some(&report), cargo_invocations)?;
     Ok(0)
 }
 

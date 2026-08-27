@@ -52,6 +52,8 @@ pub struct SampleCounts {
     pub errored: usize,
     pub timeout: usize,
     pub builds: usize,
+    #[serde(default)]
+    pub cargo_invocations: usize,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -124,6 +126,7 @@ pub fn compute(
             errored: counts.errored,
             timeout: counts.timeout,
             builds: counts.builds,
+            cargo_invocations: 0,
         },
         by_return_kind,
         assumptions: vec![
@@ -209,8 +212,12 @@ pub fn render(report: &EstimateReport) -> String {
     s.push_str(&format!("  Errored:    {}\n", report.sample_counts.errored));
     s.push_str(&format!("  Timeout:    {}\n", report.sample_counts.timeout));
     s.push_str(&format!(
-        "  Builds:     {}\n\n",
+        "  Mutant builds: {}\n",
         report.sample_counts.builds
+    ));
+    s.push_str(&format!(
+        "  Cargo invocations: {}\n\n",
+        report.sample_counts.cargo_invocations
     ));
     if !report.by_return_kind.is_empty() {
         s.push_str("Unviable rate by return kind (sample):\n");

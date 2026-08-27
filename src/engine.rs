@@ -194,7 +194,7 @@ pub fn run_prepared(
         cancel,
         limit,
     )?;
-    Ok((exec.outcomes, exec.builds))
+    Ok((exec.outcomes, exec.cargo_invocations))
 }
 
 pub fn run_schema(
@@ -222,7 +222,7 @@ pub fn run_schema(
         cancel,
         limit,
     )?;
-    Ok((exec.outcomes, exec.builds))
+    Ok((exec.outcomes, exec.cargo_invocations))
 }
 
 pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
@@ -288,10 +288,11 @@ pub fn write_outputs(
     cfg: &Config,
     outcomes: &[Outcome],
     estimate: Option<&EstimateReport>,
+    cargo_invocations: u64,
 ) -> Result<()> {
-    crate::report::print_outcomes(outcomes);
+    crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json(path, outcomes, estimate)?;
+        crate::report::write_json(path, outcomes, estimate, cargo_invocations)?;
     }
     Ok(())
 }

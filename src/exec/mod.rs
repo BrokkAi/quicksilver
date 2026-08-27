@@ -19,7 +19,8 @@ pub mod test;
 
 pub struct ExecResult {
     pub outcomes: Vec<Outcome>,
-    pub builds: u64,
+    /// Real `cargo` invocations, not per-mutant Outcome.build flags.
+    pub cargo_invocations: u64,
 }
 
 pub fn execute(
@@ -81,7 +82,7 @@ pub fn execute(
         cfg.test_jobs
     );
 
-    let build_counter = Arc::new(AtomicU64::new(0));
+    let cargo_invocations = Arc::new(AtomicU64::new(0));
     let test_bound = (4 * cfg.test_jobs).max(4);
     let (batch_tx, batch_rx) = bounded::<crate::types::LocalityBatch>(batches.len().max(1));
     let (built_tx, built_rx) = bounded::<BuiltMutant>(test_bound);
@@ -105,7 +106,7 @@ pub fn execute(
             let cfg = Arc::clone(&cfg);
             let paths = Arc::clone(&paths);
             let cancel = Arc::clone(&cancel);
-            let build_counter = Arc::clone(&build_counter);
+            let cargo_invocations = Arc::clone(&cargo_invocations);
             scope.spawn(move || {
                 let worker = match ensure_worker(backend.as_ref(), &paths, slot) {
                     Ok(p) => p,
@@ -124,7 +125,7 @@ pub fn execute(
                         &worker,
                         &paths.runs,
                         &batch,
-                        &build_counter,
+                        &cargo_invocations,
                         |item| match item {
                             Ok(built) => {
                                 if cfg.strict_source_isolation {
@@ -214,7 +215,7 @@ pub fn execute(
     });
 
     Ok(ExecResult {
-        builds: build_counter.load(Ordering::SeqCst),
+        cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
         outcomes,
     })
 }

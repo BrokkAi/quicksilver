@@ -98,10 +98,15 @@ fn schema_gates_and_differential_against_v1() {
     cfg2.schema = true;
     // Reuse the same scratch so the coverage index is cached.
     let prepared2 = prepare(cfg2, false, false).expect("prepare schema");
-    let (v2, builds) = run_schema(&prepared2, 0, None).expect("v2 schema run");
+    let (v2, cargo_invocations) = run_schema(&prepared2, 0, None).expect("v2 schema run");
     assert!(
-        builds >= 1,
-        "schema path must compile the crate at least once"
+        cargo_invocations >= 1,
+        "schema path must cargo-build at least once"
+    );
+    assert!(
+        cargo_invocations < v2.len() as u64,
+        "schema must not cargo-per-mutant: {cargo_invocations} cargo invocations for {} mutants",
+        v2.len()
     );
 
     let by_kind = |os: &[cargo_quicksilver::types::Outcome], k: VerdictKind| {

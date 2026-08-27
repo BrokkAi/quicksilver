@@ -24,6 +24,8 @@ pub struct CountReport {
     pub errored: usize,
     pub timeout: usize,
     pub builds: usize,
+    #[serde(default)]
+    pub cargo_invocations: u64,
     pub total: usize,
 }
 
@@ -37,15 +39,16 @@ impl From<&OutcomeCounts> for CountReport {
             errored: c.errored,
             timeout: c.timeout,
             builds: c.builds,
+            cargo_invocations: 0,
             total: c.total(),
         }
     }
 }
 
-pub fn print_outcomes(outcomes: &[Outcome]) {
+pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
     let c = OutcomeCounts::from_outcomes(outcomes);
     eprintln!(
-        "outcomes: {} total — {} caught, {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} builds)",
+        "outcomes: {} total — {} caught, {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
         c.total(),
         c.caught,
         c.missed,
@@ -53,7 +56,8 @@ pub fn print_outcomes(outcomes: &[Outcome]) {
         c.unviable,
         c.errored,
         c.timeout,
-        c.builds
+        c.builds,
+        cargo_invocations
     );
     for o in outcomes {
         match o.kind {
@@ -89,13 +93,15 @@ pub fn write_json(
     path: &Path,
     outcomes: &[Outcome],
     estimate: Option<&EstimateReport>,
+    cargo_invocations: u64,
 ) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
-    let report = JsonReport {
+    let mut report = JsonReport {
         outcomes: outcomes.to_vec(),
         estimate: estimate.cloned(),
         counts: CountReport::from(&counts),
     };
+    report.counts.cargo_invocations = cargo_invocations;
     crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     Ok(())
 }

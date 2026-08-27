@@ -74,6 +74,9 @@ pub fn run_exact_with_env(
     cmd.arg("--exact").arg(test_name);
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    // Never inherit a mutant from the parent. Null-schema and identity gates
+    // rely on an empty extra_env meaning "no mutant active".
+    cmd.env_remove("QS_MUTANT");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
