@@ -1,7 +1,7 @@
 mod support;
 
 use cargo_quicksilver::discover::{discover, mutant_id, DiscoverFilter};
-use cargo_quicksilver::engine::{prepare, run_prepared};
+use cargo_quicksilver::engine::{prepare, run_schema};
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 
@@ -31,7 +31,9 @@ fn discovery_finds_production_fns_and_skips_test_region() {
         "test-region helper must be excluded: {fqns:?}"
     );
     assert!(
-        mutants.iter().any(|m| m.path.contains("crate_a") && m.fqn.contains("add")),
+        mutants
+            .iter()
+            .any(|m| m.path.contains("crate_a") && m.fqn.contains("add")),
         "production symbols in a file that also has #[cfg(test)] must still be found"
     );
 }
@@ -65,7 +67,11 @@ fn mutant_ids_stable_across_line_shift() {
         .find(|m| m.fqn.contains("add") && m.replacement.contains('0'))
         .expect("add mutant after shift");
     assert_ne!(
-        before.iter().find(|m| m.id == shifted.id).unwrap().start_line,
+        before
+            .iter()
+            .find(|m| m.id == shifted.id)
+            .unwrap()
+            .start_line,
         shifted.start_line,
         "line numbers should have moved"
     );
@@ -90,9 +96,7 @@ fn coverage_caught_missed_notcovered_timeout() {
     cfg.timeout_floor = std::time::Duration::from_millis(800);
     let prepared = prepare(cfg, false, false).expect("prepare");
 
-    let covering = prepared
-        .index
-        .tests_covering("crate_a/src/lib.rs", 1, 3);
+    let covering = prepared.index.tests_covering("crate_a/src/lib.rs", 1, 3);
     assert!(
         covering.iter().any(|t| t.name.contains("add_works")),
         "add should be covered by add_works; covering={:?}",
@@ -108,7 +112,7 @@ fn coverage_caught_missed_notcovered_timeout() {
     assert!(!uncovered.is_empty(), "expected uncovered mutants");
 
     let (nc_outcomes, nc_builds) =
-        run_prepared(&prepared, 0, Some(&uncovered)).expect("run uncovered");
+        run_schema(&prepared, 0, Some(&uncovered)).expect("run uncovered");
     assert_eq!(nc_builds, 0, "NotCovered must not build");
     assert!(
         nc_outcomes
@@ -124,7 +128,7 @@ fn coverage_caught_missed_notcovered_timeout() {
         .find(|m| m.fqn.contains("add") && m.replacement.contains('0'))
         .cloned()
         .expect("add -> 0");
-    let (caught, builds) = run_prepared(&prepared, 0, Some(&[add0])).expect("run add");
+    let (caught, builds) = run_schema(&prepared, 0, Some(&[add0])).expect("run add");
     assert!(builds >= 1);
     assert!(
         caught.iter().any(|o| o.kind == VerdictKind::Caught),
@@ -138,7 +142,7 @@ fn coverage_caught_missed_notcovered_timeout() {
         .find(|m| m.fqn.contains("always_ok") && m.replacement.contains("false"))
         .cloned()
         .expect("always_ok -> false");
-    let (missed, _) = run_prepared(&prepared, 0, Some(&[always_false])).expect("run always_ok");
+    let (missed, _) = run_schema(&prepared, 0, Some(&[always_false])).expect("run always_ok");
     assert!(
         missed.iter().any(|o| o.kind == VerdictKind::Missed),
         "always_ok -> false is a genuine gap: {:?}",
@@ -151,7 +155,7 @@ fn coverage_caught_missed_notcovered_timeout() {
         .find(|m| m.fqn.contains("maybe_hang") && m.replacement.contains("true"))
         .cloned()
         .expect("maybe_hang -> true");
-    let (to, _) = run_prepared(&prepared, 0, Some(&[hang])).expect("run hang");
+    let (to, _) = run_schema(&prepared, 0, Some(&[hang])).expect("run hang");
     assert!(
         to.iter()
             .any(|o| o.kind == VerdictKind::Timeout || o.kind == VerdictKind::Caught),
@@ -181,7 +185,11 @@ fn scoped_index_does_not_file_other_crates_as_not_covered() {
             .collect::<Vec<_>>()
     );
     assert!(
-        prepared.plan.not_covered.iter().all(|m| m.package == "tiny_a"),
+        prepared
+            .plan
+            .not_covered
+            .iter()
+            .all(|m| m.package == "tiny_a"),
         "NotCovered must be in-scope only: {:?}",
         prepared
             .plan
@@ -236,5 +244,3 @@ fn scoped_index_does_not_file_other_crates_as_not_covered() {
         "scoped prepare should drop out-of-crate mutants"
     );
 }
-
-

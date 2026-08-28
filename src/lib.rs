@@ -81,7 +81,6 @@ fn cmd_index(common: &cli::CommonOpts) -> Result<i32> {
 
 fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     let extras = ConfigExtras {
-        schema: args.schema,
         schema_max_rounds: args.schema_max_rounds,
         schema_batch_size: args.schema_batch_size,
         diff_against: args.diff_against.clone(),
@@ -91,25 +90,25 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let prepared = engine::prepare(cfg, args.skip_baseline, false)?;
     let _ = engine::maybe_preflight(&prepared)?;
-    let (outcomes, cargo_invocations) = if prepared.cfg.schema {
-        engine::run_schema(&prepared, args.limit, None)?
-    } else {
-        engine::run_prepared(&prepared, args.limit, None)?
-    };
-    if prepared.cfg.schema {
-        crate::report::print_exhaustive(&outcomes);
-        if let Some(path) = &prepared.cfg.diff_against {
-            let diffs = crate::schema::gate_differential(path, &outcomes)?;
-            if !diffs.is_empty() {
-                eprintln!("differential gate failed: {} disagreements", diffs.len());
-                for d in &diffs {
-                    eprintln!("  {}  {}  v1={:?} v2={:?}", d.mutant_id, d.fqn, d.v1, d.v2);
-                }
-                engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
-                return Ok(2);
+    let (outcomes, cargo_invocations) = engine::run_schema(&prepared, args.limit, None)?;
+    crate::report::print_exhaustive(&outcomes);
+    if let Some(path) = &prepared.cfg.diff_against {
+        let diffs = crate::schema::gate_differential(path, &outcomes)?;
+        if !diffs.is_empty() {
+            eprintln!("differential gate failed: {} disagreements", diffs.len());
+            for d in &diffs {
+                eprintln!(
+                    "  {}  {}  reference={:?} this run={:?}",
+                    d.mutant_id, d.fqn, d.v1, d.v2
+                );
             }
-            eprintln!("differential gate: {} v1 verdicts matched", outcomes.len());
+            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+            return Ok(2);
         }
+        eprintln!(
+            "differential gate: {} reference verdicts matched",
+            outcomes.len()
+        );
     }
     engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
@@ -150,7 +149,7 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         sample.len()
     );
     prepared.cfg.resume = false;
-    let (selected, _) = engine::run_prepared(&prepared, 0, Some(&covered))?;
+    let (selected, _) = engine::run_schema(&prepared, 0, Some(&covered))?;
     let jsonl = prepared.paths.state.join("outcomes.jsonl");
     if jsonl.is_file() {
         let _ = std::fs::rename(&jsonl, prepared.paths.state.join("audit-selected.jsonl"));
@@ -163,7 +162,7 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         prepared.cfg.build_jobs,
     );
     let cancel = engine::install_ctrlc();
-    let full_exec = crate::exec::execute(
+    let full_exec = crate::exec::schema::execute(
         &prepared.cfg,
         &prepared.paths,
         std::sync::Arc::clone(&prepared.backend),
@@ -187,7 +186,6 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
     let extras = ConfigExtras {
         sample: args.sample,
         sample_seed: args.sample_seed,
-        schema: args.schema,
         schema_max_rounds: args.schema_max_rounds,
         schema_batch_size: args.schema_batch_size,
         diff_against: args.diff_against.clone(),
@@ -221,32 +219,27 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
     // back to the 0.001s index default and 5s-timeout every slow test.
     let _ = crate::index::attach_timings(&mut prepared.index, &prepared.baseline.tests);
     eprintln!(
-        "running sample of {} mutants through the pipeline{}",
-        sample.len(),
-        if prepared.cfg.schema {
-            " (schema v2)"
-        } else {
-            ""
-        }
+        "running sample of {} mutants through the pipeline",
+        sample.len()
     );
-    let (outcomes, cargo_invocations) = if prepared.cfg.schema {
-        engine::run_schema(&prepared, 0, Some(&sample))?
-    } else {
-        engine::run_prepared(&prepared, 0, Some(&sample))?
-    };
-    if prepared.cfg.schema {
-        if let Some(path) = &prepared.cfg.diff_against {
-            let diffs = crate::schema::gate_differential(path, &outcomes)?;
-            if !diffs.is_empty() {
-                eprintln!("differential gate failed: {} disagreements", diffs.len());
-                for d in &diffs {
-                    eprintln!("  {}  {}  v1={:?} v2={:?}", d.mutant_id, d.fqn, d.v1, d.v2);
-                }
-                engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
-                return Ok(2);
+    let (outcomes, cargo_invocations) = engine::run_schema(&prepared, 0, Some(&sample))?;
+    if let Some(path) = &prepared.cfg.diff_against {
+        let diffs = crate::schema::gate_differential(path, &outcomes)?;
+        if !diffs.is_empty() {
+            eprintln!("differential gate failed: {} disagreements", diffs.len());
+            for d in &diffs {
+                eprintln!(
+                    "  {}  {}  reference={:?} this run={:?}",
+                    d.mutant_id, d.fqn, d.v1, d.v2
+                );
             }
-            eprintln!("differential gate: {} v1 verdicts matched", outcomes.len());
+            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+            return Ok(2);
         }
+        eprintln!(
+            "differential gate: {} reference verdicts matched",
+            outcomes.len()
+        );
     }
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
     report.sample_counts.cargo_invocations = cargo_invocations as usize;

@@ -82,8 +82,6 @@ pub struct Config {
     pub zfs_remote: Option<String>,
     pub zfs_dataset: Option<String>,
     pub quiet: bool,
-    /// Build a mutant schema per crate instead of one compile per mutant.
-    pub schema: bool,
     pub schema_max_rounds: u32,
     /// 0 means one batch per crate (no split).
     pub schema_batch_size: usize,
@@ -208,7 +206,6 @@ pub fn merge_config(
             .or(file.zfs_dataset)
             .or_else(|| std::env::var("QS_ZFS_DATASET").ok()),
         quiet: extras.quiet,
-        schema: extras.schema,
         schema_max_rounds: if extras.schema_max_rounds == 0 {
             5
         } else {
@@ -236,7 +233,6 @@ pub struct ConfigExtras {
     pub timeout_floor_ms: u64,
     pub strict_source_isolation: bool,
     pub quiet: bool,
-    pub schema: bool,
     pub schema_max_rounds: u32,
     pub schema_batch_size: usize,
     pub diff_against: Option<PathBuf>,

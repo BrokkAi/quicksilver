@@ -105,7 +105,6 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         zfs_remote: None,
         zfs_dataset: None,
         quiet: true,
-        schema: false,
         schema_max_rounds: 5,
         schema_batch_size: 0,
         diff_against: None,

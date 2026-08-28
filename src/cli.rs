@@ -135,8 +135,8 @@ pub struct EstimateArgs {
     /// Skip the green-suite / rebuild-cost measurements (tests only).
     #[arg(long, hide = true)]
     pub skip_baseline: bool,
-    /// Mutant schemata: one compile per crate, then selected tests with QS_MUTANT.
-    #[arg(long)]
+    /// Deprecated: schemata is the only engine; this flag is accepted and ignored.
+    #[arg(long, global = false, hide = true)]
     pub schema: bool,
     /// Isolation rebuilds that map rustc diagnostics back to sites.
     #[arg(long, default_value_t = 5)]
@@ -144,7 +144,7 @@ pub struct EstimateArgs {
     /// Split a crate's sites when this many are exceeded. 0 = one batch per crate.
     #[arg(long, default_value_t = 0)]
     pub schema_batch_size: usize,
-    /// v1 `estimate --json` to compare verdicts against (differential gate).
+    /// Prior run's `--json` report to compare verdicts against (differential gate).
     #[arg(long)]
     pub diff_against: Option<PathBuf>,
     /// Identity-mutant gate: sites to activate with the original-body variant.
@@ -160,8 +160,8 @@ pub struct RunArgs {
     pub limit: usize,
     #[arg(long, hide = true)]
     pub skip_baseline: bool,
-    /// Mutant schemata: one compile per crate, then selected tests with QS_MUTANT.
-    #[arg(long)]
+    /// Deprecated: schemata is the only engine; this flag is accepted and ignored.
+    #[arg(long, global = false, hide = true)]
     pub schema: bool,
     /// Isolation rebuilds that map rustc diagnostics back to sites.
     #[arg(long, default_value_t = 5)]
@@ -169,7 +169,7 @@ pub struct RunArgs {
     /// Split a crate's sites when this many are exceeded. 0 = one batch per crate.
     #[arg(long, default_value_t = 0)]
     pub schema_batch_size: usize,
-    /// v1 `estimate --json` / run JSON to compare verdicts against (differential gate).
+    /// Prior run's `--json` report to compare verdicts against (differential gate).
     #[arg(long)]
     pub diff_against: Option<PathBuf>,
     /// Identity-mutant gate: sites to activate with the original-body variant.

@@ -140,7 +140,7 @@ pub fn compute(
                 "t_sel mean = {:.4}s is sampled: per-test attribution (Stage B) over the executed sample (n={}).",
                 t_sel, sample_size
             ),
-            format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package (matches the single multi -p invocation in build_one).", t_build),
+            format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package.", t_build),
             "T_qs is a max of compile-side and test-side (decoupled pools), not a sum.".into(),
             format!(
                 "T_mutants uses a coupled worker model: N · (t_build + t_suite) / J_cm. J_cm defaults to the same RAM/CPU formula as J_build (here {j_cm}); override with --cm-jobs. cargo-mutants workers each run a full rustc and will not actually use all cores."
@@ -187,7 +187,7 @@ pub fn render(report: &EstimateReport) -> String {
         format_duration(report.t_mutants_secs)
     ));
     s.push_str(&format!(
-        "  quicksilver v1: {}   [max(compile, test)]\n",
+        "  per-mutant builds (removed engine): {}   [max(compile, test)]\n",
         format_duration(report.t_qs_secs)
     ));
     s.push_str(&format!(

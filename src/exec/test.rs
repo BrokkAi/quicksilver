@@ -71,15 +71,6 @@ fn confirm_lock() -> std::sync::MutexGuard<'static, ()> {
 /// buffer holds 64KB; outcomes.jsonl does not need all of it.
 const MESSAGE_TAIL: usize = 2000;
 
-pub fn run_mutant_tests(
-    planned: &PlannedMutant,
-    run_dir: &Path,
-    baseline_root: &Path,
-    timeout_floor: Duration,
-) -> Result<Outcome> {
-    run_mutant_tests_with_env(planned, run_dir, baseline_root, timeout_floor, &[])
-}
-
 pub fn run_mutant_tests_with_env(
     planned: &PlannedMutant,
     run_dir: &Path,
@@ -396,7 +387,8 @@ where
             stderr: tail(&null_err, MESSAGE_TAIL),
         }));
     }
-    let budget = duration_from_secs((null_secs.as_secs_f64() * 3.0).max(policy.floor.as_secs_f64()));
+    let budget =
+        duration_from_secs((null_secs.as_secs_f64() * 3.0).max(policy.floor.as_secs_f64()));
     let (again, again_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
     tracing::info!(
         "confirm {}: re-run with mutant {:?} in {:.2}s (calibrated budget {:.1}s)",
@@ -614,10 +606,7 @@ mod tests {
         let (outcome, seen) = drive(
             true,
             &fake_tests(&["t1"]),
-            &[
-                (RunStatus::Failed, 0.5, ""),
-                (RunStatus::Passed, 0.5, ""),
-            ],
+            &[(RunStatus::Failed, 0.5, ""), (RunStatus::Passed, 0.5, "")],
         );
         assert_eq!(outcome.kind, VerdictKind::Missed);
         assert_eq!(seen.len(), 2, "no null run after a passing retry");
@@ -747,7 +736,11 @@ mod tests {
             &[
                 (RunStatus::Error { code: Some(1) }, 0.5, ""),
                 (RunStatus::Error { code: Some(1) }, 0.5, "boom"),
-                (RunStatus::Error { code: Some(1) }, 0.5, "no mutant, still boom"),
+                (
+                    RunStatus::Error { code: Some(1) },
+                    0.5,
+                    "no mutant, still boom",
+                ),
             ],
         );
         assert_eq!(seen.len(), 3);

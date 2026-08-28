@@ -31,7 +31,9 @@ fn probe_with_allow_copy_succeeds_and_does_not_claim_shared_blocks() {
         "allow-copy path must not pretend blocks are shared: {:?}",
         report.sharing
     );
-    assert!(report.message.to_ascii_lowercase().contains("copy") || report.message.contains("WARNING"));
+    assert!(
+        report.message.to_ascii_lowercase().contains("copy") || report.message.contains("WARNING")
+    );
 }
 
 #[test]

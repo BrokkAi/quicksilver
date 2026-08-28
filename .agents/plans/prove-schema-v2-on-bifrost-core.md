@@ -37,7 +37,7 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
 - [x] (2026-08-28) Drive timeouts and infrastructure errors down: v2 timeouts went 23 → 0 across two runs; the error cluster is gone; the remaining 3 errors are real test-level problems shared with v1 (two `persisted_build_reports_cache_open_failure` signal flakes, one stack-overflow abort in `edge_weight_only_merge_sums_distinct_file_line_sites`).
 - [x] (2026-08-28) Differential allow-list documented (Decision Log). Criterion One of Validation (literal empty diff, exit 0) is NOT met, so per that section the v1 execute path stays in the tree for now.
 - [x] Get a differential pass, or a documented allow-list of expected disagreements, on the same `--sample 150 --sample-seed 1` set. Completed 2026-08-28: 15 disagreements, all allow-listed in the Decision Log (4 `ref`-prefilter, 11 v1 floor-timeouts). The 22 v1-Missed→v2-Caught shift was real — v1's Missed verdicts were vacuous (empty selections) and v1 itself confirms the catches on the healed index.
-- [ ] Only after a trusted v2 sample: delete or hide the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared` used as the default estimate runner). Do not do this yet.
+- [x] (2026-08-28) Delete the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared`) and make schemata the only engine. Authorized by the user on 2026-08-28 after reviewing the v2c differential: the documented allow-list is accepted as the trust bar in place of Validation criterion One. `--schema` remains as a hidden accepted no-op flag.
 
 ## Surprises & Discoveries
 
@@ -119,6 +119,10 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
   Rationale: The cached attribution was provably incomplete (empty selections for 35 sampled covered mutants) because parallel shards wiped each other's `index/profraw` directories. Both engines consume these selections, so the proof needs a sound index more than it needs cache reuse. Union coverage is untouched; NotCovered stays comparable.
   Date/Author: 2026-08-28 / Fable session.
 
+- Decision: Remove the v1 execute path. The user accepted the documented allow-list as the trust bar (in place of Validation criterion One's literal empty diff) and authorized the deletion. `run_prepared`, `exec::execute`, `build_one`/`walk_batch`, and the plain `run_mutant_tests` wrapper are deleted; `estimate` and `run` always use the schema engine; `--schema` stays as a hidden accepted no-op so existing scripts keep working; `resolve_binary` and the confirmation machinery survive as schema infrastructure. The fixture differential test now checks v2 self-consistency instead of v1 agreement.
+  Rationale: v1 existed only as the sanity baseline for this proof. After the index heal it agreed with v2 everywhere except its own floor-timeout noise and the documented prefilter class, and on those v2's verdicts are the evidenced ones.
+  Date/Author: 2026-08-28 / user decision, Fable session.
+
 - Decision: Allow-list for the v2c-vs-v1f differential (`--sample 150 --sample-seed 1`, 15 rows). Class 1, 4 rows, `caught→unviable`: `Language.extensions`, `FqName.segments`, `Role.single_target_roles`, `WorkspaceOverlayContent.*` — return kind `ref` is pre-filtered as structurally unviable under schemata; v1 caught 3 of them, so this is a real, bounded measurement loss (about 2.7% of the sample), not noise. Class 2, 11 rows, `timeout→caught` (5) and `timeout→missed` (6): every v1f timeout is a 0.41–2.04 s-green test cut off at v1's 5-second floor on a loaded box; v2's confirmation pass re-ran each with null calibration and produced a real verdict, so the v2 side is the trustworthy one in all 11. No other classes remain; errored (3) and not-covered (7) agree exactly.
   Rationale: The plan accepts "a documented allow-list of expected disagreements" in place of an empty diff. Both classes are mechanically identifiable from the reports alone and neither indicts a schema verdict.
   Date/Author: 2026-08-28 / Fable session.
@@ -139,7 +143,7 @@ Lessons: gates that iterate every covering test do not scale to reverse-dependen
 
 This repository is `cargo-quicksilver`, a command-line tool that does mutation testing for Rust Cargo workspaces. Mutation testing means: change a function body on purpose, rebuild, run tests that should exercise that body, and see if a test fails. A failing test is Caught. A passing test is Missed. If no test ever executed that source span, the mutant is Not Covered. If the change does not compile, it is Unviable.
 
-v1 (the older execute path) clones a worker tree per build slot, applies one mutant, runs `cargo build --tests`, then runs selected tests against that binary. The entry is `src/exec/mod.rs` `execute`, called from `src/engine.rs` `run_prepared`. Estimate uses this unless `--schema` is set.
+v1 (the older execute path) cloned a worker tree per build slot, applied one mutant, ran `cargo build --tests`, then ran selected tests against that binary. The entry was `src/exec/mod.rs` `execute`, called from `src/engine.rs` `run_prepared`. Removed 2026-08-28 after the proof below; schemata is the only engine, and `--schema` is a hidden accepted no-op.
 
 v2, also called schemata in comments, inserts a short dispatch prologue after each selected function’s opening `{`. The original body stays. A small module `__qs_rt` (source string `QS_RT_SRC` in `src/schema.rs`) reads the environment variable `QS_MUTANT` once. Format is `site_id:variant` as two decimal or hex-capable integers joined by `:`. When unset, `active` returns `None` and every function runs its original body. When set, only that site takes the matching match-arm (a `return …` of the mutant replacement) or the identity arm (empty, fall through). Tests therefore share one compiled binary. The execute entry is `src/exec/schema.rs` `execute`, called from `src/engine.rs` `run_schema`.
 
@@ -230,6 +234,8 @@ Four: `cargo test --offline --test schema` still passes, including `schema_gates
 
 Until (1) holds, keep v1 execute. Do not delete `run_prepared`.
 
+Superseded 2026-08-28: the user reviewed the v2c-vs-v1f differential (15 rows, all allow-listed in the Decision Log) and accepted the documented allow-list as the trust bar in place of criterion One. v1 execute is removed; `schema_gates_and_differential_self_consistent` (v2 self-diff must be empty) replaces `schema_gates_and_differential_against_v1` as the regression gate.
+
 The third run’s actual transcript, for comparison (failure, not acceptance):
 
     differential gate failed: 59 disagreements
@@ -291,3 +297,5 @@ External tools: rustc 1.97.1, cargo, cargo-nextest, llvm-profdata and llvm-cov f
 ## Revision note
 
 2026-08-27: Created this ExecPlan after the bifrost-core v1 sample and three v2 attempts. Written retroactive and status-heavy because the schema engine already landed; the open work is proving verdicts, not scaffolding. Source of truth for numbers is the JSON files named above, not chat memory.
+
+2026-08-28: Proof completed and closed out. Recorded the diagnosis chain (pool budgets, binary resolution, Stage B corruption), the healed-index baselines (v1f/v2c), the 15-row allow-list, and the user-authorized removal of the v1 execute path. Schemata is the only engine as of this date.

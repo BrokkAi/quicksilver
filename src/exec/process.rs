@@ -181,7 +181,11 @@ pub fn run_exact_capture_with_env(
         WaitResult::Exited(st) => classify_exit(st),
         WaitResult::Timeout => RunStatus::Timeout,
     };
-    Ok((status, elapsed, String::from_utf8_lossy(&bytes).into_owned()))
+    Ok((
+        status,
+        elapsed,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
 }
 
 fn kill_tree(child: &std::process::Child) {
@@ -254,14 +258,28 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let (status, _dur, err) = run_exact_capture_with_env(
-            Path::new(script),
-            "ignored",
-            Path::new("/"),
-            Duration::from_secs(30),
-            &[],
-        )
-        .unwrap();
+        // A sibling test's fork can briefly hold this script's write fd open,
+        // so the first exec can hit ETXTBSY. Retry until the fd is gone.
+        let mut result = None;
+        for _ in 0..50 {
+            match run_exact_capture_with_env(
+                Path::new(script),
+                "ignored",
+                Path::new("/"),
+                Duration::from_secs(30),
+                &[],
+            ) {
+                Ok(r) => {
+                    result = Some(r);
+                    break;
+                }
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("spawn failed for a non-ETXTBSY reason: {e:#}"),
+            }
+        }
+        let (status, _dur, err) = result.expect("script stayed ETXTBSY after 50 tries");
         assert_eq!(status, RunStatus::Failed);
         assert!(err.len() <= STDERR_CAP, "cap not applied: {}", err.len());
         assert!(err.trim_end().ends_with("line 20000"), "kept head not tail");

@@ -1,8 +1,8 @@
 mod support;
 
 use cargo_quicksilver::discover::{discover, DiscoverFilter};
-use cargo_quicksilver::engine::{prepare, run_prepared, run_schema};
-use cargo_quicksilver::schema::{assign_unique_u32, build_sites, diff_verdicts};
+use cargo_quicksilver::engine::{prepare, run_schema};
+use cargo_quicksilver::schema::{assign_unique_u32, build_sites, gate_differential};
 use cargo_quicksilver::types::VerdictKind;
 
 fn tools_ok() -> bool {
@@ -18,7 +18,6 @@ fn schema_cfg(
     let mut cfg = support::scratch_cfg(repo, scratch);
     cfg.packages = vec!["tiny_schema".into()];
     cfg.index_scope = Some("tiny_schema".into());
-    cfg.schema = true;
     cfg.identity_sample = 0;
     cfg
 }
@@ -81,7 +80,7 @@ fn site_id_collision_resalts() {
 }
 
 #[test]
-fn schema_gates_and_differential_against_v1() {
+fn schema_gates_and_differential_self_consistent() {
     if !tools_ok() {
         eprintln!("skip: nextest or llvm-cov not available");
         return;
@@ -91,14 +90,8 @@ fn schema_gates_and_differential_against_v1() {
     let cfg = schema_cfg(repo.path(), scratch.path());
     let prepared = prepare(cfg, false, false).expect("prepare tiny_schema");
 
-    let (v1, _) = run_prepared(&prepared, 0, None).expect("v1 run");
-    assert!(!v1.is_empty(), "expected v1 outcomes for tiny_schema");
-
-    let mut cfg2 = schema_cfg(repo.path(), scratch.path());
-    cfg2.schema = true;
-    // Reuse the same scratch so the coverage index is cached.
-    let prepared2 = prepare(cfg2, false, false).expect("prepare schema");
-    let (v2, cargo_invocations) = run_schema(&prepared2, 0, None).expect("v2 schema run");
+    let (v2, cargo_invocations) = run_schema(&prepared, 0, None).expect("schema run");
+    assert!(!v2.is_empty(), "expected outcomes for tiny_schema");
     assert!(
         cargo_invocations >= 1,
         "schema path must cargo-build at least once"
@@ -151,10 +144,32 @@ fn schema_gates_and_differential_against_v1() {
         unique.map(|o| o.kind).collect::<Vec<_>>()
     );
 
-    let diffs = diff_verdicts(&v1, &v2);
+    assert!(by_kind(&v2, VerdictKind::Caught) >= 1);
+
+    // Self-consistency replaces the old v1 agreement check: the schema engine
+    // is the only executor, so the reference it has to match is another run of
+    // itself. Serialize run one as the `--json` report shape and gate run two
+    // against it.
+    let reference = scratch.path().join("reference.json");
+    cargo_quicksilver::report::write_json(&reference, &v2, None, cargo_invocations)
+        .expect("write reference report");
+
+    // Fresh state, same scratch so the coverage index and baseline are cached.
+    // `resume` is false in `scratch_cfg`, so run two decides every mutant again
+    // rather than reading back run one's outcomes.jsonl.
+    let cfg2 = schema_cfg(repo.path(), scratch.path());
+    assert!(!cfg2.resume, "run two must not resume run one's verdicts");
+    let prepared2 = prepare(cfg2, false, false).expect("prepare schema again");
+    let (v2b, _) = run_schema(&prepared2, 0, None).expect("second schema run");
+    assert_eq!(
+        v2b.len(),
+        v2.len(),
+        "both runs must decide the same mutant set"
+    );
+
+    let diffs = gate_differential(&reference, &v2b).expect("differential gate");
     assert!(
         diffs.is_empty(),
-        "differential gate: v1 and v2 must agree on every mutant id: {diffs:?}"
+        "differential gate: two schema runs must agree on every mutant id: {diffs:?}"
     );
-    assert!(by_kind(&v2, VerdictKind::Caught) >= 1);
 }
