@@ -1,0 +1,245 @@
+# Prove schema (v2) mutation testing on bifrost-core
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
+
+Maintain this document in accordance with `.agents/PLANS.md`. A novice with only the working tree, `.agents/PLANS.md`, and this file should be able to finish the proof or see why it is not yet finished.
+
+This plan is retroactive. Schema execution already exists in the tree (commit `9071b2e` and ancestors). The remaining job is not to invent v2. It is to make v2 verdicts trustworthy on a real crate so the older one-compile-per-mutant path (v1) can be deleted. Do not run an exhaustive v1 pass. v1 exists only as a sanity sample to compare against.
+
+## Purpose / Big Picture
+
+After this work, a user can run `cargo-quicksilver estimate --schema` (or `run --schema`) on a scoped crate, get one compile for that crate instead of one compile per mutant, and trust that a selected test that fails under `QS_MUTANT=site:variant` is the same kind of failure v1 would have reported. The observable proof is: the same 150-mutant sample of `brokk-bifrost-core` produces matching caught/missed/not-covered verdicts in the v1 JSON and the v2 JSON, with timeouts and infrastructure errors rare enough that they are not the headline. Until that match holds, v1 stays.
+
+## Progress
+
+- [x] (2026-08-27) Implement schema transform, runtime module `__qs_rt`, isolation rebuilds, null-schema gate, identity-mutant gate, and `run --schema` in `src/schema.rs` and `src/exec/schema.rs` (landed in `8021310` and follow-ups).
+- [x] (2026-08-27) Cut schema compile and null-gate cost to the mutated crate (`171fdaa`).
+- [x] (2026-08-27) Finish a v1 estimate sample of 150 mutants on `brokk-bifrost-core` (N = 1720 in scope). Report: `/mnt/optane/quicksilver/bringup/estimate-core.json`. Counts: 51 caught, 44 missed, 7 not covered, 37 unviable, 3 errored, 8 timeout.
+- [x] (2026-08-27) Diagnose v1 timeouts and errors: Stage B reload wiped test durations to 0.001 seconds so a 17-second green test died at a 5-second floor; SIGKILL from host pressure was labeled Errored. Fixed in `src/exec/test.rs`, `src/exec/process.rs`, `src/engine.rs`, `src/lib.rs`.
+- [x] (2026-08-27) Wire `estimate --schema` and `--diff-against` so the same sample can run v2 and print disagreements (`src/cli.rs`, `src/lib.rs` `cmd_estimate`).
+- [x] (2026-08-27) First v2 attempt: schema compiled; null-schema gate ran the union of selected tests (about 10,684 tests) serially; a 0.41-second test timed out at 5 seconds; all 143 covered mutants marked unviable.
+- [x] (2026-08-27) Null-schema gate now smokes the cheapest 8 tests with a 30-second floor (`src/exec/schema.rs` `NULL_GATE_TESTS`, `cheapest_tests`, `null_schema_gate`).
+- [x] (2026-08-27) Second v2 attempt: null-schema passed; identity-mutant gate ran thousands of tests for `hash_domain_bytes` and timed out; crate unviable again. Identity gate now uses the same cheapest-8 and 30-second floor.
+- [x] (2026-08-27 20:29 CDT – 21:12 CDT, about 44 minutes) Third v2 attempt executed mutants. Report: `/mnt/optane/quicksilver/bringup/estimate-core-v2.json`. Counts: 58 caught, 8 missed, 7 not covered, 41 unviable, 13 errored, 23 timeout. Differential gate: 91 agree, 59 disagree. Exit is treated as failure (`Ok(2)` from `cmd_estimate` when diffs are non-empty).
+- [ ] Drive timeouts and infrastructure errors down so they are not the main disagreement with v1. Completed: duration attach and SIGKILL classification. Remaining: schema binaries still time out 23 sample mutants (15 of those were Caught under v1); 12 errors are one test `i1_silent_on_scala_auxiliary_constructor_fixture` exiting 1.
+- [ ] Get a differential pass, or a documented allow-list of expected disagreements, on the same `--sample 150 --sample-seed 1` set. Remaining: 59 mismatches; the large useful shift is 22 v1-Missed becoming v2-Caught.
+- [ ] Only after a trusted v2 sample: delete or hide the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared` used as the default estimate runner). Do not do this yet.
+
+## Surprises & Discoveries
+
+- Observation: Index test rows all stored `duration_secs = 0.001` on disk even when baseline JUnit had real times (for example `a_jar_indexed_member_assertion_concludes_only_when_the_jar_was_read` is 16.993 seconds green). `attach_timings` matched 12,868 of 12,868 pairs in memory, then `stage_b_for_mutants` reloaded `coverage.json` and threw the durations away. Evidence: Python compare of `/mnt/optane/quicksilver/065e17f14dc00ece/index/coverage.json` versus `baseline.json`; timeout list in `estimate-core.json` all hit that jar test or other 5–17 second tests.
+
+- Observation: A 5-second floor times out any reverse-dependent integration test whose duration was missing. After attach, using 3 times the sum of every selected test would wait hundreds of seconds per test. Per-test budget `max(floor, 3 × this test)` is the right shape. Evidence: `src/exec/test.rs` `test_timeout` unit test `timeout_uses_this_test_not_the_selection_sum`.
+
+- Observation: SIGKILL (`exited None`) during the four-way sample swamp was classified Errored. That is host pressure or our process-group kill, not a libtest assertion (libtest failures are exit 101). Evidence: three v1 errors on `analyze_diff_builds_one_scope_index_per_distinct_source` with message `exited None`; `classify_exit` now maps `libc::SIGKILL` to Timeout.
+
+- Observation: Null-schema gate on a core-scoped sample is not a smoke test if it unions every selected test. That union was 10,684 tests, about 10,676 seconds of green wall time if run serially. Evidence: coverage invert over the 143 covered sample mutants; first v2 log line `Timeout value_flow_provider::provider_call_bindings_match_oracle_and_repeat_is_a_cache_hit` then `143 unviable`.
+
+- Observation: Identity-mutant gate for `hash_domain_bytes` selected 9,480 covering tests. Same failure mode. Evidence: line map walk on `crates/bifrost-core/src/analyzer/canonical_hash.rs`; second v2 log `identity-mutant gate failed for brokk_bifrost_core.analyzer.canonical_hash.hash_domain_bytes`.
+
+- Observation: Schema binaries are slower than per-mutant v1 binaries. Even after gates passed, 15 mutants that v1 Caught became v2 Timeout. A 0.41-second green test exceeded 5 seconds in the schema binary on the first attempt. Evidence: differential pairs `('caught', 'timeout'): 15` in the third v2 JSON; first-attempt timeout on `provider_call_bindings_match_oracle_and_repeat_is_a_cache_hit`.
+
+- Observation: Twelve v2 errors share one test, `i1_silent_on_scala_auxiliary_constructor_fixture`, exit code 1 (not 101). That is a process abort or clap/tool failure, not an assertion catch. Evidence: tail of `/mnt/optane/quicksilver/bringup/v2.log` on the third run.
+
+- Observation: Four v2 unviables are intentional: return kind `ref` is pre-filtered in `kind_is_schema_prefiltered`. The rest of the 41 unviables are rustc isolation diagnostics (`rustc diagnostic (round 1): site 0x…`). Evidence: message histogram on `estimate-core-v2.json`.
+
+- Observation: Shared-machine contention made “clean” serial timings a fiction and also broke cache keys. `maybe_preflight` edits `baseline/` in place while another process hashes that tree, so `--skip-baseline` shards rebuilt Stage A. Evidence: shards 2 and 3 logged `instrumented build into …/baseline-cov` while shards 1 and 4 logged `reusing coverage index`.
+
+## Decision Log
+
+- Decision: Do not run exhaustive v1. Keep v1 only as a 150-mutant sanity sample for `--diff-against`.
+  Rationale: The user stated v1 is a sanity check and can be deleted as soon as v2 is proven. Exhaustive v1 on 1,720 mutants is compile-bound hours and is not the product.
+  Date/Author: 2026-08-27 / Jonathan via bringup session.
+
+- Decision: Insertion prologue after `{`, original body left in place, identity arm is empty (`N => {}`) so execution falls through.
+  Rationale: Wrapping the body in a match changes drop order and non-lexical lifetimes on the unmutated path. Documented at the top of `src/schema.rs`.
+  Date/Author: schema design (`8021310`).
+
+- Decision: Only libtest exit 101 is Caught. Other nonzero exits are Errored. SIGKILL is Timeout.
+  Rationale: Dynamic linker failures and host kills must not inflate the kill rate. Assertion failures (101) are the mutation-testing signal.
+  Date/Author: process classifier; SIGKILL exception 2026-08-27.
+
+- Decision: Null-schema and identity-mutant gates smoke the cheapest 8 tests with a 30-second floor, not the full selected union.
+  Rationale: Full union is a 10k-test serial suite and failed the crate before any mutant ran. A smoke gate still catches a schema binary that cannot run short tests with `QS_MUTANT` unset or set to the identity variant.
+  Date/Author: 2026-08-27 after first two v2 attempts.
+
+- Decision: `estimate --schema` reuses the same sample seed as v1 and writes a separate state directory (`QS_STATE_SUBDIR=state-v2`). Do not `--resume` against v1 `outcomes.jsonl`.
+  Rationale: Resume would skip every mutant v1 already decided and never execute schema.
+  Date/Author: 2026-08-27.
+
+- Decision: Parallel Stage A uses `cargo nextest run --binaries-metadata` so partitions do not share cargo’s target lock. Probe directories and llvm-profdata temps are unique per process.
+  Rationale: Serial partitions left a 120-core box idle; four sample processes racing `.qs-probe` and `foo.tmp` produced EEXIST and ENOENT.
+  Date/Author: 2026-08-27, commit `9071b2e`.
+
+- Decision: Skip `maybe_preflight` when `--skip-baseline` is set.
+  Rationale: Preflight applies a mutant to the shared baseline clone. Parallel skip-baseline processes hashing that clone rebuilt Stage A.
+  Date/Author: 2026-08-27.
+
+## Outcomes & Retrospective
+
+v2 is implemented and has run on the real crate. It is not proven.
+
+What someone can do today: from `/home/jonathan/Projects/quicksilver`, after `unset RUSTUP_TOOLCHAIN` (the repo pins rustc 1.97.1 in `rust-toolchain.toml`; a shell `RUSTUP_TOOLCHAIN=stable` will fail the build), run `target/debug/cargo-quicksilver … estimate --schema --sample 150 --sample-seed 1 --skip-baseline --diff-against /mnt/optane/quicksilver/bringup/estimate-core.json`. On this host that completed in about 44 minutes wall clock on 2026-08-27, wrote 150 outcomes, and printed 59 differential disagreements.
+
+What they cannot yet do: treat v2 as a replacement for v1. Timeouts (23) and errors (13) still dominate the mismatch. v1 missed 44; v2 missed 8 because 22 of those became Caught under schema, which may be real (schema binary vs per-mutant binary) or noise. Unviable 41 is higher than v1’s 37; 4 of those are the `ref` prefilter.
+
+Lessons: gates that iterate every covering test do not scale to reverse-dependent suites. Duration metadata must survive every reload of `coverage.json`. A 5-second floor is wrong for this crate. Shared scratch plus in-place baseline mutation is not safe for parallel processes.
+
+Next proof, in order: (1) stop schema tests from timing out when v1 Caught them, (2) classify or skip the Scala fixture exit-1 cluster, (3) re-run the same 150-sample v2 with `--diff-against` and require disagreements to be empty or explicitly justified in this plan’s Decision Log, (4) only then remove v1 execute.
+
+## Context and Orientation
+
+This repository is `cargo-quicksilver`, a command-line tool that does mutation testing for Rust Cargo workspaces. Mutation testing means: change a function body on purpose, rebuild, run tests that should exercise that body, and see if a test fails. A failing test is Caught. A passing test is Missed. If no test ever executed that source span, the mutant is Not Covered. If the change does not compile, it is Unviable.
+
+v1 (the older execute path) clones a worker tree per build slot, applies one mutant, runs `cargo build --tests`, then runs selected tests against that binary. The entry is `src/exec/mod.rs` `execute`, called from `src/engine.rs` `run_prepared`. Estimate uses this unless `--schema` is set.
+
+v2, also called schemata in comments, inserts a short dispatch prologue after each selected function’s opening `{`. The original body stays. A small module `__qs_rt` (source string `QS_RT_SRC` in `src/schema.rs`) reads the environment variable `QS_MUTANT` once. Format is `site_id:variant` as two decimal or hex-capable integers joined by `:`. When unset, `active` returns `None` and every function runs its original body. When set, only that site takes the matching match-arm (a `return …` of the mutant replacement) or the identity arm (empty, fall through). Tests therefore share one compiled binary. The execute entry is `src/exec/schema.rs` `execute`, called from `src/engine.rs` `run_schema`.
+
+Stage A is a union coverage census: run reverse-dependent tests once with LLVM instrumentation, merge profiles, ask which source lines were hit. That fills `CoverageIndex.union` in `src/index.rs`. Stage B is per-test attribution for files that still need it, filling `CoverageIndex.lines`. Estimate pays Stage B only for the sample (`src/lib.rs` `cmd_estimate`).
+
+bifrost is the target workspace at `/home/jonathan/Projects/bifrost`. The scoped crate is `brokk-bifrost-core`. Scratch that supports copy-on-write file clones (Linux `FICLONE` / XFS reflink) lives at `/mnt/optane/quicksilver` on the machine that ran the bring-up. Session directory: `/mnt/optane/quicksilver/065e17f14dc00ece`. Identity pin for bifrost builds: environment `BIFROST_BUILD_IDENTITY_OVERRIDE=0cf3cc6478edbf56546f69b35c8bbd2e69da3c6f`.
+
+Verdict JSON is an object with `outcomes` (array of `src/types.rs` `Outcome`) and usually `estimate` plus `counts`. Differential comparison is `src/schema.rs` `gate_differential`, which reads that JSON as `JsonReport` and diffs by mutant id.
+
+Key files a novice will touch next: `src/exec/test.rs` (timeouts), `src/exec/process.rs` (exit classification), `src/exec/schema.rs` (gates and schema pool), `src/schema.rs` (prologue and runtime), `src/lib.rs` `cmd_estimate`, `src/index.rs` `attach_timings` and `stage_b_for_mutants`.
+
+Tiny fixture for local tests: `tests/fixtures/tiny/`, including `crate_schema`. Integration tests: `tests/schema.rs`, `tests/engine.rs`. Run with `unset RUSTUP_TOOLCHAIN` then `cargo test --offline --test schema --test engine` from the repo root.
+
+## Plan of Work
+
+The transform and runner already exist. Remaining work is to make the third-run v2 sample match v1 on decided tests.
+
+First, inspect the 23 v2 timeouts in `/mnt/optane/quicksilver/bringup/estimate-core-v2.json`. For each, look up the failing test name and that test’s `duration_secs` on the in-memory index after `attach_timings` (or in `baseline.json`). If 3× duration is still under the wall time the schema binary needs, raise the schema-path multiplier or floor in `src/exec/schema.rs` only (do not silently wait 120 seconds on every v1 test). If the test hangs, that is a prologue or environment bug: reproduce with one `QS_MUTANT` on the staged binary under `065e17f14dc00ece/runs-v2/`.
+
+Second, inspect the 13 v2 errors. The cluster on `i1_silent_on_scala_auxiliary_constructor_fixture` exiting 1 should either be treated as a documented infrastructure skip or the schema binary should be given the same working directory and environment v1 used. Do not count exit 1 as Caught.
+
+Third, keep rustc isolation unviables as Unviable. They are compile-time, not gate failures. Prefiltered `ref` stays Unviable.
+
+Fourth, re-run the same sample with a fresh `QS_STATE_SUBDIR` (do not resume the 143-unviable files from earlier failed gates). Compare with `--diff-against` the v1 JSON. Accept the run only if disagreements are empty or each remaining pair is written into this plan’s Decision Log with a one-sentence reason.
+
+Fifth, only after that pass, remove v1 execute and make `--schema` the default for `estimate` and `run`. That deletion is out of scope until the proof is green.
+
+Do not start four sample shards in parallel on this host. One process, `--build-jobs 4` or less. Schema is one crate compile plus a test pool.
+
+## Concrete Steps
+
+Working directory for all cargo-quicksilver commands: `/home/jonathan/Projects/quicksilver`. Always `unset RUSTUP_TOOLCHAIN`. Binary: `target/debug/cargo-quicksilver` after `cargo build --offline`.
+
+Reuse the existing scratch session so Stage A and Stage B are not rebuilt. Confirm these files exist:
+
+    /mnt/optane/quicksilver/065e17f14dc00ece/index/coverage.json
+    /mnt/optane/quicksilver/065e17f14dc00ece/index/baseline.json
+    /mnt/optane/quicksilver/bringup/estimate-core.json
+
+Expected: `coverage.json` version 3, about 12,868 tests, scope `brokk-bifrost-core`. `estimate-core.json` has 150 outcomes.
+
+To re-run v2 without mixing failed-gate unviables:
+
+    mkdir -p /mnt/optane/quicksilver/065e17f14dc00ece/state-v2 /mnt/optane/quicksilver/065e17f14dc00ece/runs-v2
+    rm -f /mnt/optane/quicksilver/065e17f14dc00ece/state-v2/outcomes.jsonl
+    export BIFROST_BUILD_IDENTITY_OVERRIDE=0cf3cc6478edbf56546f69b35c8bbd2e69da3c6f
+    export QS_STATE_SUBDIR=state-v2
+    export QS_RUNS_SUBDIR=runs-v2
+    export QS_WORKER_PREFIX=v2-
+    unset RUSTC_WRAPPER RUSTC_WORKSPACE_WRAPPER SCCACHE RUSTUP_TOOLCHAIN
+    ./target/debug/cargo-quicksilver \
+      --manifest-path /home/jonathan/Projects/bifrost/Cargo.toml \
+      --scratch-root /mnt/optane/quicksilver \
+      --clone-backend reflink \
+      --package brokk-bifrost-core \
+      --index-scope brokk-bifrost-core \
+      --build-jobs 4 \
+      --test-jobs 16 \
+      --json /mnt/optane/quicksilver/bringup/estimate-core-v2.json \
+      estimate --sample 150 --sample-seed 1 --skip-baseline --schema \
+      --diff-against /mnt/optane/quicksilver/bringup/estimate-core.json
+
+You should see, in order: reflink probe ok; `reusing coverage index (cache key match)` or a Stage B reuse line; `running sample of 150 mutants through the pipeline (schema v2)`; `schema exec: 143 mutants across 1 crates`; `null-schema gate: 8 of 10684 unique selected tests (cheapest)`. Wall clock on this host was about 44 minutes for the successful-gates run. If the process prints `differential gate failed: N disagreements` it still wrote outcomes; process exit 2 means the proof is not done.
+
+If Stage A starts (`instrumented build into …/baseline-cov`), stop. Another process mutated baseline or `coverage.json` does not match `source_cache_key`. Do not rebuild Stage A unless `--reindex` was passed.
+
+Local tests after timeout or gate edits:
+
+    unset RUSTUP_TOOLCHAIN
+    cargo test --offline --lib timeout_uses
+    cargo test --offline --lib sigkill_is_timeout
+    cargo test --offline --lib null_gate_uses_cheapest
+    cargo test --offline --test schema --test engine
+
+Expect those names to pass. `tests/clone_probe.rs` may fail if `/mnt/containers` is dead; that is unrelated.
+
+## Validation and Acceptance
+
+v2 is proven for this plan when all of the following are true on the same sample seed.
+
+One: `estimate --schema --sample 150 --sample-seed 1 --skip-baseline --diff-against /mnt/optane/quicksilver/bringup/estimate-core.json` prints `differential gate: 150 v1 verdicts matched` (or the same count as outcomes written) and exits 0.
+
+Two: v2 counts for timeout plus errored are not the majority of disagreements. A leftover timeout must be a test that also timed out under v1 or a test whose green duration times 3 still cannot finish in the schema binary after a documented multiplier change.
+
+Three: Not-covered stays 7. That is Stage A census, shared by both paths. If it moves, the index was rebuilt or the sample seed changed.
+
+Four: `cargo test --offline --test schema` still passes, including `schema_gates_and_differential_against_v1` on the tiny fixture.
+
+Until (1) holds, keep v1 execute. Do not delete `run_prepared`.
+
+The third run’s actual transcript, for comparison (failure, not acceptance):
+
+    differential gate failed: 59 disagreements
+    outcomes: 150 total — 58 caught, 8 missed, 7 not covered, 41 unviable, 13 errored, 23 timeout (139 mutant builds, 3 cargo invocations)
+
+## Idempotence and Recovery
+
+`--skip-baseline` plus existing `baseline.json` and `coverage.json` does not rebuild the green suite or Stage A if the coverage cache key matches. Deleting `state-v2/outcomes.jsonl` is the way to force v2 mutants to run again. Deleting `coverage.json` or passing `--reindex` rebuilds Stage A (hours on this crate); do not do that to retry v2.
+
+If a v2 process dies, `--resume` with the same `QS_STATE_SUBDIR=state-v2` continues from `outcomes.jsonl`. Do not resume a file that is 143 identical unviable rows from a failed crate-level gate; delete it and start clean.
+
+Scratch clones are copy-on-write on `/mnt/optane` (XFS reflink). If probe fails with EEXIST, you are on a binary older than unique `.qs-probe-<pid>-<n>` directories; rebuild `cargo-quicksilver` from current `master`.
+
+Host memory: one schema process with `--build-jobs 4`. Four parallel estimate shards previously drove load above 1,000 and crashed the machine.
+
+## Artifacts and Notes
+
+v1 sample (sanity), 2026-08-27:
+
+    Sampled scope: brokk-bifrost-core
+    N (mutants): 1720
+    f_nc: 0.063
+    Caught 51, Missed 44, NotCovered 7, Unviable 37, Errored 3, Timeout 8
+    Projected exhaustive: cargo-mutants 4.4 h, v1 1.6 h, v2 formula 1.5 min (one schema batch; not measured)
+
+v2 third run (gates passed, differential failed), 2026-08-27 21:12 CDT:
+
+    Caught 58, Missed 8, NotCovered 7, Unviable 41, Errored 13, Timeout 23
+    agree 91, disagree 59
+    missed→caught 22, caught→timeout 15, missed→errored 12, timeout→caught 3, caught→unviable 3, others small
+
+Log: `/mnt/optane/quicksilver/bringup/v2.log`. Session: `/mnt/optane/quicksilver/065e17f14dc00ece`. Git: `9071b2e` on `master` at the time this plan was written.
+
+## Interfaces and Dependencies
+
+Schema runtime, already in tree, `src/schema.rs`:
+
+    pub const QS_RT_SRC: &str; // module crate::__qs_rt with active(site: u32) -> Option<u32>
+    pub fn render_prologue(site: &Site) -> String;
+    pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<AppliedSite>)>;
+    pub fn qs_mutant_env(site_id: u32, variant: u32) -> (String, String); // ("QS_MUTANT", "{site}:{variant}")
+    pub fn gate_differential(path: &Path, v2: &[Outcome]) -> Result<Vec<VerdictDiff>>;
+
+Timeout helper, `src/exec/test.rs`:
+
+    pub fn test_timeout(duration_secs: f64, floor: Duration) -> Duration;
+
+Gate sampling, `src/exec/schema.rs`:
+
+    const NULL_GATE_TESTS: usize = 8;
+    fn cheapest_tests(tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo>;
+    fn null_schema_gate(...) -> Result<()>;
+    fn identity_gate(...) -> Result<()>;
+
+Estimate CLI already accepts `--schema`, `--diff-against`, `--sample`, `--sample-seed`, `--skip-baseline`. Keep those names.
+
+External tools: rustc 1.97.1, cargo, cargo-nextest, llvm-profdata and llvm-cov from the rustup toolchain (needed only if Stage A is rebuilt). Clone backend: reflink on XFS.
+
+## Revision note
+
+2026-08-27: Created this ExecPlan after the bifrost-core v1 sample and three v2 attempts. Written retroactive and status-heavy because the schema engine already landed; the open work is proving verdicts, not scaffolding. Source of truth for numbers is the JSON files named above, not chat memory.
