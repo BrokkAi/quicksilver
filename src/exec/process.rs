@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +98,92 @@ pub fn run_exact_with_env(
     }
 }
 
+/// Keep at most this much stderr. A panicking test prints its message and
+/// backtrace last, so we keep the tail, not the head.
+pub const STDERR_CAP: usize = 64 * 1024;
+
+/// Like [`run_exact_with_env`], but stderr is piped and drained into a capped
+/// buffer. Returns the wall time and the captured tail (lossy UTF-8).
+///
+/// The reader thread drains continuously so the child never blocks on a full
+/// pipe, including while `wait_timeout` is still counting down. After the wait
+/// (and the tree kill on timeout) the write end is gone, the reader sees EOF,
+/// and the join returns.
+pub fn run_exact_capture_with_env(
+    binary: &Path,
+    test_name: &str,
+    cwd: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<(RunStatus, Duration, String)> {
+    let mut cmd = Command::new(binary);
+    cmd.current_dir(cwd);
+    cmd.arg("--exact").arg(test_name);
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+    // Never inherit a mutant from the parent; an empty extra_env means
+    // "no mutant active", which is what the null runs depend on.
+    cmd.env_remove("QS_MUTANT");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let start = Instant::now();
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("spawn {}", binary.display()))?;
+    let reader = child.stderr.take().map(|mut pipe| {
+        std::thread::spawn(move || {
+            let mut buf: Vec<u8> = Vec::new();
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        // Amortized trim: only copy once per CAP bytes read.
+                        if buf.len() > STDERR_CAP * 2 {
+                            let drop_to = buf.len() - STDERR_CAP;
+                            buf.drain(..drop_to);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            if buf.len() > STDERR_CAP {
+                let drop_to = buf.len() - STDERR_CAP;
+                buf.drain(..drop_to);
+            }
+            buf
+        })
+    });
+
+    let wait = match child.wait_timeout(timeout).context("wait_timeout")? {
+        Some(status) => WaitResult::Exited(status),
+        None => {
+            kill_tree(&child);
+            let _ = child.wait();
+            WaitResult::Timeout
+        }
+    };
+    let elapsed = start.elapsed();
+    let bytes = match reader {
+        Some(h) => h.join().unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let status = match wait {
+        WaitResult::Exited(st) => classify_exit(st),
+        WaitResult::Timeout => RunStatus::Timeout,
+    };
+    Ok((status, elapsed, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
 fn kill_tree(child: &std::process::Child) {
     #[cfg(unix)]
     {
@@ -149,6 +236,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, RunStatus::Error { code: Some(1) });
+    }
+
+    #[test]
+    fn capture_keeps_the_stderr_tail() {
+        // `--exact <name>` is appended to the argv, so use a script that
+        // ignores its arguments.
+        // Unique per process: another `cargo test` may be running on this box.
+        let script = &format!("/tmp/qs_capture_probe_{}.sh", std::process::id());
+        std::fs::write(
+            script,
+            "#!/bin/sh\nfor i in $(seq 1 20000); do echo \"line $i\" >&2; done\nexit 101\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (status, _dur, err) = run_exact_capture_with_env(
+            Path::new(script),
+            "ignored",
+            Path::new("/"),
+            Duration::from_secs(30),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(status, RunStatus::Failed);
+        assert!(err.len() <= STDERR_CAP, "cap not applied: {}", err.len());
+        assert!(err.trim_end().ends_with("line 20000"), "kept head not tail");
+        let _ = std::fs::remove_file(script);
     }
 
     #[test]

@@ -3,7 +3,10 @@
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
 use crate::config::Config;
 use crate::exec::build::resolve_binary;
-use crate::exec::test::{run_mutant_tests_with_env, BinariesManifest, ManifestTest};
+use crate::exec::test::{
+    run_mutant_tests_policy, run_mutant_tests_with_env, BinariesManifest, ManifestTest,
+    TestRunPolicy,
+};
 use crate::exec::{append_outcome, load_resume, ExecResult};
 use crate::plan::Plan;
 use crate::schema::{
@@ -179,11 +182,16 @@ pub fn execute(
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    let outcome = run_mutant_tests_with_env(
+                    let policy = TestRunPolicy {
+                        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+                        slowdown: SCHEMA_SLOWDOWN,
+                        confirm: true,
+                    };
+                    let outcome = run_mutant_tests_policy(
                         &ready.planned,
                         &ready.run_dir,
                         &paths.baseline,
-                        cfg.timeout_floor,
+                        &policy,
                         &ready.env,
                     );
                     match outcome {
@@ -625,6 +633,10 @@ fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
 /// on bifrost-core is ~10k reverse-dep tests; running them all serially
 /// with `--exact` is a full-suite gate, not a schema check.
 const NULL_GATE_TESTS: usize = 8;
+
+/// Schema binaries carry a per-call dispatch check in every instrumented
+/// function, so 3× the green duration is not enough budget.
+const SCHEMA_SLOWDOWN: f64 = 3.0;
 
 fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
     tests.sort_by(|a, b| {

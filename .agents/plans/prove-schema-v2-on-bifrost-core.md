@@ -22,6 +22,10 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
 - [x] (2026-08-27) Second v2 attempt: null-schema passed; identity-mutant gate ran thousands of tests for `hash_domain_bytes` and timed out; crate unviable again. Identity gate now uses the same cheapest-8 and 30-second floor.
 - [x] (2026-08-27 20:29 CDT – 21:12 CDT, about 44 minutes) Third v2 attempt executed mutants. Report: `/mnt/optane/quicksilver/bringup/estimate-core-v2.json`. Counts: 58 caught, 8 missed, 7 not covered, 41 unviable, 13 errored, 23 timeout. Differential gate: 91 agree, 59 disagree. Exit is treated as failure (`Ok(2)` from `cmd_estimate` when diffs are non-empty).
 - [ ] Drive timeouts and infrastructure errors down so they are not the main disagreement with v1. Completed: duration attach and SIGKILL classification. Remaining: schema binaries still time out 23 sample mutants (15 of those were Caught under v1); 12 errors are one test `i1_silent_on_scala_auxiliary_constructor_fixture` exiting 1.
+- [x] (2026-08-27) Diagnose the 23 v2 timeouts without a rebuild: every timed-out test has a green duration of 0.04–0.97 seconds, so every one received exactly the 5-second floor budget. The gates were already raised to a 30-second floor for schema slowness (`src/exec/schema.rs` comment near `null_schema_gate`), but the mutant pool still passed plain `cfg.timeout_floor` (default 5000 ms, `src/cli.rs`). The first v2 attempt also timed out a 0.41-second test at 5 seconds with `QS_MUTANT` unset, so the slowdown is schema-binary overhead, not mutant-caused hangs.
+- [x] (2026-08-27) Diagnose the disagreement structure: `run_mutant_tests_with_env` returns on the first Timeout or Error, so one poison test decides every mutant it covers (5 timeout rows share `persisted_build_reports_cache_open_failure`; all 12 error rows share the Scala fixture test). Stderr is discarded (`Stdio::null`), so the exit-1 cause is not recoverable from logs. The fixture test is a plain libtest `#[test]` (assertions would exit 101, not 1) and `__qs_rt` has no exit path, so the exit-1 source is still unknown.
+- [ ] (2026-08-27, in flight) Re-run the v1 sanity sample with the fixed binary (duration attach, SIGKILL classification) as the new baseline: fresh `QS_STATE_SUBDIR=state-v1b`, output `/mnt/optane/quicksilver/bringup/estimate-core-v1b.json`, log `/mnt/optane/quicksilver/bringup/v1b.log`. The old baseline predates those fixes; its 8 timeouts and 3 errors are infrastructure artifacts.
+- [ ] (2026-08-27, in flight) Implement schema-pool budget parity and a confirmation machine: pool floor `max(cfg.timeout_floor, 30 s)` and slowdown factor 3.0 on the 3× green budget; on first-pass Failed/Timeout/Error, retry once, then run the same test with no mutant active to attribute the failure to the mutant or to the schema binary; skip infrastructure-broken tests and continue instead of poisoning the mutant; capture stderr on confirmation runs. v1 and gate behavior unchanged.
 - [ ] Get a differential pass, or a documented allow-list of expected disagreements, on the same `--sample 150 --sample-seed 1` set. Remaining: 59 mismatches; the large useful shift is 22 v1-Missed becoming v2-Caught.
 - [ ] Only after a trusted v2 sample: delete or hide the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared` used as the default estimate runner). Do not do this yet.
 
@@ -44,6 +48,12 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
 - Observation: Four v2 unviables are intentional: return kind `ref` is pre-filtered in `kind_is_schema_prefiltered`. The rest of the 41 unviables are rustc isolation diagnostics (`rustc diagnostic (round 1): site 0x…`). Evidence: message histogram on `estimate-core-v2.json`.
 
 - Observation: Shared-machine contention made “clean” serial timings a fiction and also broke cache keys. `maybe_preflight` edits `baseline/` in place while another process hashes that tree, so `--skip-baseline` shards rebuilt Stage A. Evidence: shards 2 and 3 logged `instrumented build into …/baseline-cov` while shards 1 and 4 logged `reusing coverage index`.
+
+- Observation: All 23 v2 timeouts are floor timeouts. Joining the timed-out test names against `baseline.json` durations: minimum 0.04 s, maximum 0.97 s green, so every budget was the 5-second floor, never the 3× term. No long test appears. Evidence: Python join of `estimate-core-v2.json` timeout rows with `baseline.json` `tests[].duration_secs`.
+
+- Observation: The gate fix was not applied to the pool. `null_schema_gate` and `identity_gate` use `cfg.timeout_floor.max(30 s)` with a comment that 3× green is not enough for schema binaries; the pool call site passes plain `cfg.timeout_floor` (5 s default). Evidence: `src/exec/schema.rs` pool spawn loop versus gate functions.
+
+- Observation: One poison test decides many mutants because `run_mutant_tests_with_env` returns on first Timeout or Error, and its stderr is discarded. Five timeout rows share `persisted_build_reports_cache_open_failure`; all 12 error rows share `i1_silent_on_scala_auxiliary_constructor_fixture`. That fixture test is a plain libtest `#[test]` (assertion failures exit 101, not 1) and `QS_RT_SRC` has no exit path, so exit 1 must come from the process environment; needs captured stderr to identify. Evidence: `src/exec/test.rs` match arms; `tests/mcp_property_fuzzer.rs` in bifrost; `src/schema.rs` lines 15–33.
 
 ## Decision Log
 
@@ -74,6 +84,14 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
 - Decision: Skip `maybe_preflight` when `--skip-baseline` is set.
   Rationale: Preflight applies a mutant to the shared baseline clone. Parallel skip-baseline processes hashing that clone rebuilt Stage A.
   Date/Author: 2026-08-27.
+
+- Decision: Refresh the v1 sanity baseline by re-running the same 150-mutant sample (seed 1) with the fixed binary, into `estimate-core-v1b.json`. The differential proof compares v2 against this file, not the original `estimate-core.json`.
+  Rationale: The original baseline predates the duration-attach and SIGKILL fixes; its 8 timeouts and 3 errors are infrastructure artifacts, and 5+ of the 59 disagreements trace to them. This is a sample refresh, not the forbidden exhaustive v1 run.
+  Date/Author: 2026-08-27 / Fable session.
+
+- Decision: Schema pool budgets get gate parity plus a slowdown factor: floor `max(cfg.timeout_floor, 30 s)`, budget `3 × green × 3.0`. Non-green first passes get a confirmation pass: retry once with the mutant, then run the same test with no mutant active. Null-run failure means the schema binary (not the mutant) is at fault: skip that test, continue with the rest, and record stderr. Null-run success attributes the signal to the mutant (Caught for 101, Errored for other exits, Timeout after a recalibrated re-run). Confirmation runs are serialized process-wide and capture stderr tails.
+  Rationale: All 23 sample timeouts were 5-second floor timeouts on sub-second tests; the gates already needed 30 s. First-failure-wins let one broken test poison 12 mutants with no diagnostics. Null-run attribution also adjudicates the 22 missed→caught rows: a catch that reproduces with no mutant active is a schema artifact, not a kill. v1 and gate code paths keep their old behavior so the baseline stays comparable.
+  Date/Author: 2026-08-27 / Fable session.
 
 ## Outcomes & Retrospective
 
