@@ -59,6 +59,27 @@ pub fn covering_seeds_from(packages: &[String], index_scope: Option<&str>) -> Ve
     pkgs
 }
 
+/// Packages whose incremental `cargo build --tests -p` we time for t_build.
+///
+/// A scoped estimate rebuilds the mutant's crate, not the whole workspace.
+/// Timing every member serializes a rustc on a shared box and then averages
+/// in unrelated crates, which both wastes cores and biases t_build.
+pub fn packages_for_rebuild_timing(
+    packages: &[String],
+    index_scope: Option<&str>,
+    meta: &Metadata,
+) -> Vec<String> {
+    let seeds = covering_seeds_from(packages, index_scope);
+    if seeds.is_empty() {
+        meta.workspace_packages()
+            .iter()
+            .map(|p| p.name.to_string())
+            .collect()
+    } else {
+        seeds
+    }
+}
+
 pub fn package_select(cfg: &Config, meta: &Metadata) -> PackageSelect {
     package_select_from(&cfg.packages, cfg.index_scope.as_deref(), meta)
 }
@@ -452,6 +473,18 @@ mod tests {
             "tiny_a does not depend on tiny_b: {php_like:?}"
         );
         assert!(!php_like.contains("tiny_c"));
+    }
+
+    #[test]
+    fn rebuild_timing_uses_seeds_not_the_whole_workspace() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let meta = load_metadata(&root).expect("tiny metadata");
+        let scoped = packages_for_rebuild_timing(&["tiny_a".into()], None, &meta);
+        assert_eq!(scoped, vec!["tiny_a".to_string()]);
+        let unscoped = packages_for_rebuild_timing(&[], None, &meta);
+        assert!(unscoped.len() >= 3, "{unscoped:?}");
+        assert!(unscoped.iter().any(|p| p == "tiny_a"));
+        assert!(unscoped.iter().any(|p| p == "tiny_b"));
     }
 
     #[test]

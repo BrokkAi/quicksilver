@@ -14,7 +14,7 @@ use std::fs;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,6 +156,17 @@ pub fn build_or_load(
                 info!("reusing coverage index (cache key match)");
                 return Ok(existing);
             }
+            info!(
+                "coverage index exists but does not match (version {} vs {}, key {} vs {}, scope {:?} vs {:?}); rebuilding Stage A",
+                existing.version,
+                INDEX_VERSION,
+                if existing.cache_key.len() >= 12 { &existing.cache_key[..12] } else { &existing.cache_key },
+                if key.len() >= 12 { &key[..12] } else { &key },
+                existing.scope,
+                cfg.index_scope
+            );
+        } else {
+            info!("no coverage index on disk; building Stage A");
         }
     }
     build_index(cfg, paths, key, baseline)
@@ -439,11 +450,7 @@ fn run_union_coverage(
         return Ok(HashMap::new());
     }
     let prof_root = paths.index.join("union-profraw");
-    let _ = fs::remove_dir_all(&prof_root);
     fs::create_dir_all(&prof_root)?;
-    let pattern = prof_root.join("%p_%m.profraw");
-    let junit = paths.index.join("stage-a-junit.xml");
-    let config_path = crate::cargo_cmd::write_nextest_config_junit(&paths.index, Some(&junit))?;
     let meta = load_metadata(&paths.baseline)?;
     let llvm_profdata = find_llvm_tool("llvm-profdata")?;
     let llvm_cov = find_llvm_tool("llvm-cov")?;
@@ -453,65 +460,143 @@ fn run_union_coverage(
     // One nextest of 12k instrumented tests wrote ~190G of profraw and filled
     // the disk. Concurrent drain merged half-written files. Shard instead:
     // run, merge only completed files, delete, then the next shard.
+    //
+    // Partitions used to run one at a time because they shared CARGO_TARGET_DIR
+    // and cargo's lock. On a shared machine that idle gap is wasted: other
+    // users already contend, so "clean" serial timings are a fiction. Run
+    // several partitions against pre-built binaries (no cargo lock) and merge
+    // under a mutex so llvm-profdata overlaps with other shards' tests.
     const SHARD: usize = 300;
     let n_shards = tests.len().div_ceil(SHARD).max(1);
+    let width = stage_a_shard_width(cfg.test_jobs, crate::util::nproc(), n_shards);
     let resume = if cfg.reindex {
         None
     } else {
         load_stage_a_progress(&progress_path, tests.len(), n_shards, &merged)
     };
-    let start_shard = resume.as_ref().map(|p| p.completed + 1).unwrap_or(1);
-    let mut instr_passed: HashSet<String> = resume
+    let done = resume.as_ref().map(done_from_progress).unwrap_or_default();
+    let instr_passed: HashSet<String> = resume
         .as_ref()
         .map(|p| p.passed.iter().cloned().collect())
         .unwrap_or_default();
-    let mut any_ok = resume.is_some();
-    if start_shard == 1 {
+    let resumed = !done.is_empty();
+    if done.is_empty() {
         let _ = fs::remove_file(&merged);
         let _ = fs::remove_file(&progress_path);
         let _ = fs::remove_dir_all(&prof_root);
         fs::create_dir_all(&prof_root)?;
     } else {
         info!(
-            "resuming Stage A at shard {start_shard}/{n_shards} (union.profdata kept, {} passed ids cached)",
+            "resuming Stage A with {}/{} shards already merged (union.profdata kept, {} passed ids cached)",
+            done.len(),
+            n_shards,
             instr_passed.len()
         );
         let _ = fs::remove_dir_all(&prof_root);
         fs::create_dir_all(&prof_root)?;
     }
 
-    info!("stage A nextest in {n_shards} shards of up to {SHARD} tests");
-    for shard in start_shard..=n_shards as u32 {
-        let _ = fs::remove_file(&junit);
-        let mut cmd = crate::cargo_cmd::cargo_command();
-        cmd.current_dir(&paths.baseline);
-        cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
-        apply_build_env(&mut cmd, cfg, true);
-        cmd.env("LLVM_PROFILE_FILE", &pattern);
-        cmd.args(["nextest", "run"]);
-        cmd.args(crate::cargo_cmd::nextest_profile_args());
-        cmd.arg("--config-file").arg(&config_path);
-        apply_package_select(&mut cmd, &package_select(cfg, &meta));
-        cmd.arg("--partition")
-            .arg(format!("count:{shard}/{n_shards}"));
-        cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
-        let status = cmd.status().context("stage A cargo nextest run")?;
-        if status.success() {
-            any_ok = true;
-        } else {
-            tracing::warn!("stage A shard {shard}/{n_shards} exited {status}");
+    let remaining: Vec<u32> = (1..=n_shards as u32)
+        .filter(|s| !done.contains(s))
+        .collect();
+    info!(
+        "stage A nextest in {n_shards} shards of up to {SHARD} tests, {} remaining, {width} at a time",
+        remaining.len()
+    );
+
+    let any_ok = AtomicBool::new(resumed);
+    let done = Mutex::new(done);
+    let passed = Mutex::new(instr_passed);
+    let mut binaries_meta = PathBuf::new();
+    let mut cargo_meta = PathBuf::new();
+    if !remaining.is_empty() {
+        let metas = write_stage_a_runner_metadata(cfg, paths, &meta)?;
+        binaries_meta = metas.0;
+        cargo_meta = metas.1;
+        let merge_lock = Mutex::new(());
+        let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let queue = Mutex::new(remaining.into_iter());
+
+        std::thread::scope(|scope| {
+            for _ in 0..width.max(1) {
+                let queue = &queue;
+                let done = &done;
+                let passed = &passed;
+                let errors = &errors;
+                let any_ok = &any_ok;
+                let merge_lock = &merge_lock;
+                let binaries_meta = &binaries_meta;
+                let cargo_meta = &cargo_meta;
+                let llvm_profdata = &llvm_profdata;
+                let merged = &merged;
+                let prof_root = &prof_root;
+                let progress_path = &progress_path;
+                scope.spawn(move || loop {
+                    let shard = queue.lock().unwrap().next();
+                    let Some(shard) = shard else {
+                        break;
+                    };
+                    match run_stage_a_shard(
+                        cfg,
+                        paths,
+                        shard,
+                        n_shards as u32,
+                        prof_root,
+                        binaries_meta,
+                        cargo_meta,
+                        llvm_profdata,
+                        merged,
+                        merge_lock,
+                    ) {
+                        Ok((ok, ids)) => {
+                            if ok {
+                                any_ok.store(true, Ordering::SeqCst);
+                            }
+                            let mut done = done.lock().unwrap();
+                            let mut passed = passed.lock().unwrap();
+                            passed.extend(ids);
+                            done.insert(shard);
+                            if let Err(err) = save_stage_a_progress(
+                                progress_path,
+                                tests.len(),
+                                n_shards,
+                                &done,
+                                &passed,
+                            ) {
+                                errors.lock().unwrap().push(format!("progress: {err:#}"));
+                                break;
+                            }
+                            drop(done);
+                            drop(passed);
+                            if let Err(err) = crate::scratch::check_free_space(
+                                &cfg.scratch_root,
+                                Some(8 * (1 << 30)),
+                            ) {
+                                errors.lock().unwrap().push(format!("disk: {err:#}"));
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            errors
+                                .lock()
+                                .unwrap()
+                                .push(format!("shard {shard}/{n_shards}: {err:#}"));
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let errors = errors.into_inner().unwrap();
+        if !errors.is_empty() {
+            bail!("{}", errors.join("; "));
         }
-        if junit.is_file() {
-            let xml = fs::read_to_string(&junit)?;
-            instr_passed.extend(crate::baseline::junit_passed_ids(&xml));
-        }
-        merge_all_profraw(&prof_root, &merged, &llvm_profdata)?;
-        save_stage_a_progress(&progress_path, tests.len(), n_shards, shard, &instr_passed)?;
-        crate::scratch::check_free_space(&cfg.scratch_root, Some(8 * (1 << 30)))?;
     }
 
-    if resume.is_some() && instr_passed.len() < tests.len() / 2 {
+    let instr_passed = passed.into_inner().unwrap();
+    let any_ok = any_ok.load(Ordering::SeqCst);
+    if resumed && instr_passed.len() < tests.len() / 2 {
         tracing::warn!(
             "Stage A resumed without a full JUnit pass list ({} ids); skipping the pass-count guard. Union coverage is still accumulated in union.profdata.",
             instr_passed.len()
@@ -534,12 +619,134 @@ fn run_union_coverage(
     let _ = fs::remove_dir_all(&prof_root);
     let _ = fs::remove_file(&merged);
     let _ = fs::remove_file(&progress_path);
+    let _ = fs::remove_file(&binaries_meta);
+    let _ = fs::remove_file(&cargo_meta);
 
     let mut union: HashMap<String, BTreeSet<u32>> = HashMap::new();
     for (file, lines) in hits {
         union.entry(file).or_default().extend(lines);
     }
     Ok(union)
+}
+
+/// Concurrent nextest partitions. Each already uses `test_jobs` threads.
+/// `div_ceil(cores, test_jobs)` keeps total in-flight tests around core count.
+fn stage_a_shard_width(test_jobs: usize, cores: usize, n_shards: usize) -> usize {
+    if n_shards <= 1 {
+        return 1;
+    }
+    let test_jobs = test_jobs.max(1);
+    let cores = cores.max(1);
+    cores.div_ceil(test_jobs).min(n_shards).max(1)
+}
+
+fn write_stage_a_runner_metadata(
+    cfg: &Config,
+    paths: &Paths,
+    meta: &cargo_metadata::Metadata,
+) -> Result<(PathBuf, PathBuf)> {
+    let binaries = paths.index.join("stage-a-binaries.json");
+    let cargo_meta = paths.index.join("stage-a-cargo-metadata.json");
+
+    let mut list = crate::cargo_cmd::cargo_command();
+    list.current_dir(&paths.baseline);
+    list.env("CARGO_TARGET_DIR", &paths.baseline_cov);
+    apply_build_env(&mut list, cfg, true);
+    list.args([
+        "nextest",
+        "list",
+        "--list-type",
+        "binaries-only",
+        "--message-format",
+        "json",
+        "--cargo-profile",
+        crate::cargo_cmd::PROFILE,
+    ]);
+    apply_package_select(&mut list, &package_select(cfg, meta));
+    let out = list
+        .output()
+        .context("cargo nextest list --list-type binaries-only")?;
+    if !out.status.success() {
+        bail!(
+            "cargo nextest list --list-type binaries-only failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    crate::util::write_atomic(&binaries, out.stdout)?;
+
+    let mut md = crate::cargo_cmd::cargo_command();
+    md.current_dir(&paths.baseline);
+    md.env("CARGO_TARGET_DIR", &paths.baseline_cov);
+    apply_build_env(&mut md, cfg, true);
+    md.args(["metadata", "--format-version", "1"]);
+    let out = md.output().context("cargo metadata --format-version 1")?;
+    if !out.status.success() {
+        bail!(
+            "cargo metadata --format-version 1 failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    crate::util::write_atomic(&cargo_meta, out.stdout)?;
+    Ok((binaries, cargo_meta))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_stage_a_shard(
+    cfg: &Config,
+    paths: &Paths,
+    shard: u32,
+    n_shards: u32,
+    prof_root: &Path,
+    binaries_meta: &Path,
+    cargo_meta: &Path,
+    llvm_profdata: &Path,
+    merged: &Path,
+    merge_lock: &Mutex<()>,
+) -> Result<(bool, HashSet<String>)> {
+    let shard_dir = prof_root.join(format!("s{shard}"));
+    let _ = fs::remove_dir_all(&shard_dir);
+    fs::create_dir_all(&shard_dir)?;
+    let cfg_dir = paths.index.join(format!("stage-a-s{shard}"));
+    fs::create_dir_all(&cfg_dir)?;
+    let junit = cfg_dir.join("junit.xml");
+    let _ = fs::remove_file(&junit);
+    let config_path = crate::cargo_cmd::write_nextest_config_junit(&cfg_dir, Some(&junit))?;
+    let pattern = shard_dir.join("%p_%m.profraw");
+
+    info!("stage A shard {shard}/{n_shards} (binaries-metadata, no cargo lock)");
+    let mut cmd = crate::cargo_cmd::cargo_command();
+    cmd.current_dir(&paths.baseline);
+    apply_build_env(&mut cmd, cfg, true);
+    cmd.env("LLVM_PROFILE_FILE", &pattern);
+    cmd.args(["nextest", "run"]);
+    // Nextest profile only. --cargo-profile would pull cargo (and its lock)
+    // back in; binaries-metadata is how we overlap partitions.
+    cmd.arg("--profile").arg(crate::cargo_cmd::PROFILE);
+    cmd.arg("--config-file").arg(&config_path);
+    cmd.arg("--binaries-metadata").arg(binaries_meta);
+    cmd.arg("--cargo-metadata").arg(cargo_meta);
+    cmd.arg("--workspace-remap").arg(&paths.baseline);
+    cmd.arg("--test-threads").arg(cfg.test_jobs.to_string());
+    cmd.arg("--partition")
+        .arg(format!("count:{shard}/{n_shards}"));
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    let status = cmd.status().context("stage A cargo nextest run")?;
+    let ok = status.success();
+    if !ok {
+        tracing::warn!("stage A shard {shard}/{n_shards} exited {status}");
+    }
+    let mut ids = HashSet::new();
+    if junit.is_file() {
+        let xml = fs::read_to_string(&junit)?;
+        ids.extend(crate::baseline::junit_passed_ids(&xml));
+    }
+    {
+        let _g = merge_lock.lock().unwrap();
+        merge_all_profraw(&shard_dir, merged, llvm_profdata)?;
+    }
+    let _ = fs::remove_dir_all(&shard_dir);
+    Ok((ok, ids))
 }
 
 fn check_stage_a_pass_ids(
@@ -603,9 +810,33 @@ fn check_stage_a_pass_ids(
 struct StageAProgress {
     n_tests: usize,
     n_shards: usize,
+    /// Longest prefix 1..=completed that is done. Kept for old readers.
     completed: u32,
     #[serde(default)]
     passed: Vec<String>,
+    /// Shards already merged into union.profdata. Out-of-order when parallel.
+    #[serde(default)]
+    done: Vec<u32>,
+}
+
+fn done_from_progress(p: &StageAProgress) -> BTreeSet<u32> {
+    if !p.done.is_empty() {
+        p.done.iter().copied().filter(|s| *s >= 1).collect()
+    } else {
+        (1..=p.completed).collect()
+    }
+}
+
+fn prefix_completed(done: &BTreeSet<u32>, n_shards: usize) -> u32 {
+    let mut c = 0u32;
+    for i in 1..=n_shards as u32 {
+        if done.contains(&i) {
+            c = i;
+        } else {
+            break;
+        }
+    }
+    c
 }
 
 fn load_stage_a_progress(
@@ -618,33 +849,33 @@ fn load_stage_a_progress(
         return None;
     }
     let p: StageAProgress = serde_json::from_str(&fs::read_to_string(path).ok()?).ok()?;
-    if p.n_tests == n_tests
-        && p.n_shards == n_shards
-        && p.completed >= 1
-        && p.completed < n_shards as u32
-    {
-        Some(p)
-    } else {
-        None
+    if p.n_tests != n_tests || p.n_shards != n_shards {
+        return None;
     }
+    let done = done_from_progress(&p);
+    if done.is_empty() || done.len() > n_shards {
+        return None;
+    }
+    Some(p)
 }
 
 fn save_stage_a_progress(
     path: &Path,
     n_tests: usize,
     n_shards: usize,
-    completed: u32,
+    done: &BTreeSet<u32>,
     passed: &HashSet<String>,
 ) -> Result<()> {
     let p = StageAProgress {
         n_tests,
         n_shards,
-        completed,
+        completed: prefix_completed(done, n_shards),
         passed: {
             let mut v: Vec<String> = passed.iter().cloned().collect();
             v.sort();
             v
         },
+        done: done.iter().copied().collect(),
     };
     crate::util::write_atomic(path, serde_json::to_vec_pretty(&p)?)
 }
@@ -698,7 +929,7 @@ fn drain_profraw(
     if raws.is_empty() {
         return Ok(0);
     }
-    let tmp = acc.with_extension("tmp");
+    let tmp = crate::util::unique_tmp_path(acc);
     if try_llvm_merge(llvm_profdata, acc, &raws, &tmp)? {
         for r in &raws {
             let _ = fs::remove_file(r);
@@ -1260,12 +1491,51 @@ end_of_record
         let merged = dir.path().join("union.profdata");
         fs::write(&merged, b"ok").unwrap();
         let p = dir.path().join("stage-a-progress.json");
-        save_stage_a_progress(&p, 12685, 43, 23, &HashSet::new()).unwrap();
+        let done: BTreeSet<u32> = (1..=23).collect();
+        save_stage_a_progress(&p, 12685, 43, &done, &HashSet::new()).unwrap();
         let got = load_stage_a_progress(&p, 12685, 43, &merged).expect("resume");
         assert_eq!(got.completed, 23);
+        assert_eq!(done_from_progress(&got).len(), 23);
         assert!(load_stage_a_progress(&p, 1, 43, &merged).is_none());
         assert!(load_stage_a_progress(&p, 12685, 40, &merged).is_none());
         assert!(load_stage_a_progress(&p, 12685, 43, &dir.path().join("missing")).is_none());
+    }
+
+    #[test]
+    fn stage_a_progress_old_completed_is_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("union.profdata");
+        fs::write(&merged, b"ok").unwrap();
+        let p = dir.path().join("stage-a-progress.json");
+        fs::write(
+            &p,
+            r#"{"n_tests":100,"n_shards":4,"completed":2,"passed":[]}"#,
+        )
+        .unwrap();
+        let got = load_stage_a_progress(&p, 100, 4, &merged).expect("resume");
+        assert_eq!(done_from_progress(&got), [1, 2].into_iter().collect());
+    }
+
+    #[test]
+    fn stage_a_progress_keeps_non_prefix_done_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let merged = dir.path().join("union.profdata");
+        fs::write(&merged, b"ok").unwrap();
+        let p = dir.path().join("stage-a-progress.json");
+        let done: BTreeSet<u32> = [1, 2, 4].into_iter().collect();
+        save_stage_a_progress(&p, 100, 4, &done, &HashSet::new()).unwrap();
+        let got = load_stage_a_progress(&p, 100, 4, &merged).expect("resume");
+        assert_eq!(got.completed, 2);
+        assert_eq!(done_from_progress(&got), done);
+    }
+
+    #[test]
+    fn stage_a_shard_width_fills_cores_without_one_nextest_per_core() {
+        assert_eq!(stage_a_shard_width(32, 120, 43), 4);
+        assert_eq!(stage_a_shard_width(120, 120, 43), 1);
+        assert_eq!(stage_a_shard_width(8, 8, 3), 1);
+        assert_eq!(stage_a_shard_width(4, 8, 3), 2);
+        assert_eq!(stage_a_shard_width(32, 120, 1), 1);
     }
 
     #[test]

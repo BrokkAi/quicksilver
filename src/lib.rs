@@ -125,7 +125,9 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
-    let _ = engine::maybe_preflight(&prepared)?;
+    if !args.skip_baseline {
+        let _ = engine::maybe_preflight(&prepared)?;
+    }
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
     let covered: Vec<_> = sample
         .iter()
@@ -185,11 +187,20 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
     let extras = ConfigExtras {
         sample: args.sample,
         sample_seed: args.sample_seed,
+        schema: args.schema,
+        schema_max_rounds: args.schema_max_rounds,
+        schema_batch_size: args.schema_batch_size,
+        diff_against: args.diff_against.clone(),
+        identity_sample: args.identity_sample,
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
-    let _ = engine::maybe_preflight(&prepared)?;
+    // Preflight mutates `baseline/` in place. Parallel --skip-baseline shards
+    // hashing that tree then see a different cache key and rebuild Stage A.
+    if !args.skip_baseline {
+        let _ = engine::maybe_preflight(&prepared)?;
+    }
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
     let covered_sample: Vec<_> = sample
         .iter()
@@ -206,11 +217,37 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         &mut prepared.index,
         &covered_sample,
     )?;
+    // Stage B reloads coverage.json, which used to wipe attached durations
+    // back to the 0.001s index default and 5s-timeout every slow test.
+    let _ = crate::index::attach_timings(&mut prepared.index, &prepared.baseline.tests);
     eprintln!(
-        "running sample of {} mutants through the pipeline",
-        sample.len()
+        "running sample of {} mutants through the pipeline{}",
+        sample.len(),
+        if prepared.cfg.schema {
+            " (schema v2)"
+        } else {
+            ""
+        }
     );
-    let (outcomes, cargo_invocations) = engine::run_prepared(&prepared, 0, Some(&sample))?;
+    let (outcomes, cargo_invocations) = if prepared.cfg.schema {
+        engine::run_schema(&prepared, 0, Some(&sample))?
+    } else {
+        engine::run_prepared(&prepared, 0, Some(&sample))?
+    };
+    if prepared.cfg.schema {
+        if let Some(path) = &prepared.cfg.diff_against {
+            let diffs = crate::schema::gate_differential(path, &outcomes)?;
+            if !diffs.is_empty() {
+                eprintln!("differential gate failed: {} disagreements", diffs.len());
+                for d in &diffs {
+                    eprintln!("  {}  {}  v1={:?} v2={:?}", d.mutant_id, d.fqn, d.v1, d.v2);
+                }
+                engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+                return Ok(2);
+            }
+            eprintln!("differential gate: {} v1 verdicts matched", outcomes.len());
+        }
+    }
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
     report.sample_counts.cargo_invocations = cargo_invocations as usize;
     print!("{}", estimate::render(&report));

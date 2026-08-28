@@ -227,9 +227,13 @@ fn attr(tag: &str, key: &str) -> Option<String> {
 pub fn measure_package_costs(cfg: &Config, paths: &Paths) -> Result<Vec<PackageCost>> {
     let meta = load_metadata(&paths.baseline)?;
     let target = paths.baseline.join("target");
+    let names = crate::cargo_cmd::packages_for_rebuild_timing(
+        &cfg.packages,
+        cfg.index_scope.as_deref(),
+        &meta,
+    );
     let mut costs = Vec::new();
-    for pkg in meta.workspace_packages() {
-        let name = pkg.name.to_string();
+    for name in names {
         let Some(src) = crate_root_source(&meta, &name) else {
             continue;
         };

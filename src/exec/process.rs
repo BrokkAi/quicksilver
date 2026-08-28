@@ -47,6 +47,15 @@ pub fn classify_exit(status: ExitStatus) -> RunStatus {
     } else if status.code() == Some(LIBTEST_FAILURE_CODE) {
         RunStatus::Failed
     } else {
+        // SIGKILL is OOM / our tree kill racing wait(), not a libtest fail.
+        // Leave SIGABRT/SEGV as Error: the mutant crashed the process.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if status.signal() == Some(libc::SIGKILL) {
+                return RunStatus::Timeout;
+            }
+        }
         RunStatus::Error {
             code: status.code(),
         }
@@ -140,5 +149,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, RunStatus::Error { code: Some(1) });
+    }
+
+    #[test]
+    fn sigkill_is_timeout_not_error() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "kill -9 $$"]);
+        cmd.stdout(Stdio::null());
+        cmd.stderr(Stdio::null());
+        match run_command_timeout(cmd, Duration::from_secs(5)).unwrap() {
+            WaitResult::Exited(st) => {
+                assert_eq!(classify_exit(st), RunStatus::Timeout)
+            }
+            WaitResult::Timeout => panic!("kill -9 should exit, not hang"),
+        }
     }
 }

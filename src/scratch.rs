@@ -138,15 +138,40 @@ pub fn probe_and_select(cfg: &Config) -> Result<(Arc<dyn CloneBackend>, ProbeRep
     Ok((backend, report))
 }
 
+struct ProbeDir(PathBuf);
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Unique per process so parallel estimate shards do not FICLONE into the
+/// same `.qs-probe/dst.bin` (EEXIST) or `remove_dir_all` each other's src.
+fn exclusive_probe_dir(scratch_root: &Path) -> Result<ProbeDir> {
+    let pid = std::process::id();
+    for n in 0..1024u32 {
+        let dir = scratch_root.join(format!(".qs-probe-{pid}-{n}"));
+        match fs::create_dir(&dir) {
+            Ok(()) => return Ok(ProbeDir(dir)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).with_context(|| format!("create probe dir {}", dir.display())),
+        }
+    }
+    bail!(
+        "could not allocate a unique probe directory under {}",
+        scratch_root.display()
+    )
+}
+
 pub fn probe(
     scratch_root: &Path,
     requested: CloneBackendKind,
     allow_copy: bool,
 ) -> Result<ProbeReport> {
     fs::create_dir_all(scratch_root)?;
-    let dir = scratch_root.join(".qs-probe");
-    let _ = fs::remove_dir_all(&dir);
-    fs::create_dir_all(&dir)?;
+    let probe_dir = exclusive_probe_dir(scratch_root)?;
+    let dir = &probe_dir.0;
     let src = dir.join("src.bin");
     let dst = dir.join("dst.bin");
     {
@@ -881,5 +906,34 @@ mod tests {
             classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, None),
             Sharing::ServerSideCopy
         );
+    }
+
+    #[test]
+    fn exclusive_probe_dir_does_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = exclusive_probe_dir(tmp.path()).unwrap();
+        let b = exclusive_probe_dir(tmp.path()).unwrap();
+        assert_ne!(a.0, b.0);
+        assert!(a.0.is_dir());
+        assert!(b.0.is_dir());
+    }
+
+    #[test]
+    fn concurrent_probes_do_not_share_a_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::thread::scope(|scope| {
+            let joins: Vec<_> = (0..4)
+                .map(|_| {
+                    let root = root.clone();
+                    scope.spawn(move || probe(&root, CloneBackendKind::Auto, true))
+                })
+                .collect();
+            for j in joins {
+                j.join()
+                    .unwrap()
+                    .expect("parallel probe must not race on the probe directory");
+            }
+        });
     }
 }

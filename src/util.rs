@@ -4,7 +4,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+static WRITE_ATOMIC_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn nproc() -> usize {
     std::thread::available_parallelism()
@@ -174,14 +177,32 @@ pub fn write_atomic(path: &Path, data: impl AsRef<[u8]>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    // Unique tmp per process. Parallel estimate shards share an index dir;
+    // `foo.json` → `foo.tmp` raced: one rename unlinked the other's tmp and
+    // the next rename returned ENOENT.
+    let tmp = unique_tmp_path(path);
     {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data.as_ref())?;
-        f.sync_all()?;
+        let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(data.as_ref())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("sync {}", tmp.display()))?;
     }
-    fs::rename(&tmp, path)?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
     Ok(())
+}
+
+pub fn unique_tmp_path(path: &Path) -> PathBuf {
+    let seq = WRITE_ATOMIC_SEQ.fetch_add(1, Ordering::Relaxed);
+    match path.file_name() {
+        Some(name) => path.with_file_name(format!(
+            ".{}.{}.{seq}.tmp",
+            name.to_string_lossy(),
+            std::process::id()
+        )),
+        None => path.with_extension(format!("{}.{seq}.tmp", std::process::id())),
+    }
 }
 
 pub fn statvfs_avail(path: &Path) -> Result<u64> {
@@ -269,5 +290,22 @@ mod tests {
         let col = src[..close + 1].chars().count();
         assert_eq!(line_col_to_offset(src, 1, col), close + 1);
         assert!(src[line_col_to_offset(src, 1, 0)..line_col_to_offset(src, 1, col)].ends_with('}'));
+    }
+
+    #[test]
+    fn write_atomic_survives_parallel_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cargo-metadata.json");
+        std::thread::scope(|scope| {
+            for i in 0..8u8 {
+                let path = path.clone();
+                scope.spawn(move || {
+                    let body = vec![b'a' + i; 64];
+                    write_atomic(&path, body).expect("parallel write_atomic");
+                });
+            }
+        });
+        assert!(path.is_file());
+        assert_eq!(fs::read(&path).unwrap().len(), 64);
     }
 }

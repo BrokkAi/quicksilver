@@ -139,6 +139,11 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
                 timing.total
             );
         }
+        if timing.matched > 0 {
+            if let Err(err) = index.save(&paths) {
+                tracing::warn!("failed to persist attached timings: {err:#}");
+            }
+        }
     }
     // Estimate pays Stage B only for the sample (cmd_estimate). Run/index
     // attribute every in-scope mutant now.
@@ -149,6 +154,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
             .cloned()
             .collect();
         index::stage_b_for_mutants(&cfg, &paths, &mut index, &covered)?;
+        let _ = index::attach_timings(&mut index, &baseline.tests);
     }
     let plan = plan::plan(&mutants, &index, &baseline, cfg.shard, cfg.build_jobs);
     eprintln!(

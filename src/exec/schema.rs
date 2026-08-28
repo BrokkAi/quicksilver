@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::{info, warn};
 
 struct SchemaReady {
@@ -620,6 +621,22 @@ fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
     tests
 }
 
+/// Smoke the schema binary. The union of selected tests for a crate sample
+/// on bifrost-core is ~10k reverse-dep tests; running them all serially
+/// with `--exact` is a full-suite gate, not a schema check.
+const NULL_GATE_TESTS: usize = 8;
+
+fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
+    tests.sort_by(|a, b| {
+        a.duration_secs
+            .partial_cmp(&b.duration_secs)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.id.cmp(&b.id))
+    });
+    tests.truncate(n.max(1));
+    tests
+}
+
 fn null_schema_gate(
     cfg: &Config,
     run_dir: &Path,
@@ -644,10 +661,21 @@ fn null_schema_gate(
                 replacement: String::new(),
                 return_kind: String::new(),
             }),
-        tests: union_selected_tests(planned),
+        tests: {
+            let union = union_selected_tests(planned);
+            info!(
+                "null-schema gate: {} of {} unique selected tests (cheapest)",
+                union.len().min(NULL_GATE_TESTS),
+                union.len()
+            );
+            cheapest_tests(union, NULL_GATE_TESTS)
+        },
         estimated_cost_secs: 0.0,
     };
-    let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, cfg.timeout_floor, &[])?;
+    // Schema binaries carry a prologue in every site. 3× green duration is
+    // not enough; a 0.4s test timed out at 5s and failed the whole crate.
+    let floor = cfg.timeout_floor.max(Duration::from_secs(30));
+    let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, floor, &[])?;
     match outcome.kind {
         VerdictKind::Caught | VerdictKind::Timeout | VerdictKind::Errored => {
             bail!(
@@ -693,6 +721,7 @@ fn identity_gate(
         if tests.is_empty() {
             continue;
         }
+        tests = cheapest_tests(tests, NULL_GATE_TESTS);
         let dummy = PlannedMutant {
             mutant: by_id
                 .get(&site.variants[0].mutant_id)
@@ -715,18 +744,23 @@ fn identity_gate(
             estimated_cost_secs: 0.0,
         };
         let env = vec![qs_mutant_env(site.site_id, site.identity_variant)];
-        let outcome =
-            run_mutant_tests_with_env(&dummy, run_dir, baseline, cfg.timeout_floor, &env)?;
+        let floor = cfg.timeout_floor.max(Duration::from_secs(30));
+        let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, floor, &env)?;
         match outcome.kind {
             crate::types::VerdictKind::Caught
             | crate::types::VerdictKind::Timeout
             | crate::types::VerdictKind::Errored => {
                 bail!(
-                    "identity-mutant gate failed for {} (QS_MUTANT={}:{}): {:?}",
+                    "identity-mutant gate failed for {} (QS_MUTANT={}:{}): {:?} {}",
                     site.fqn,
                     site.site_id,
                     site.identity_variant,
-                    outcome.kind
+                    outcome.kind,
+                    outcome
+                        .test
+                        .as_deref()
+                        .or(outcome.message.as_deref())
+                        .unwrap_or("")
                 );
             }
             _ => {}
@@ -911,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn null_gate_timeout_scales_with_selected_tests() {
+    fn null_gate_uses_cheapest_tests_not_the_whole_union() {
         let planned = vec![
             PlannedMutant {
                 mutant: mutant("a"),
@@ -920,20 +954,15 @@ mod tests {
             },
             PlannedMutant {
                 mutant: mutant("b"),
-                tests: vec![testinfo("t2", 10.0), testinfo("t3", 5.0)],
+                tests: vec![testinfo("t2", 10.0), testinfo("t3", 0.4)],
                 estimated_cost_secs: 0.0,
             },
         ];
-        let tests = union_selected_tests(&planned);
-        assert_eq!(tests.len(), 3);
-        let sum: f64 = tests.iter().map(|t| t.duration_secs).sum();
-        assert!((sum - 35.0).abs() < 1e-9, "union durations {sum}");
-        let timeout_floor: f64 = 5.0;
-        let timeout = timeout_floor.max(3.0 * sum);
-        assert!(
-            timeout > timeout_floor,
-            "null-gate timeout must not collapse to the 5s floor"
-        );
-        assert!((timeout - 105.0).abs() < 1e-9);
+        let union = union_selected_tests(&planned);
+        assert_eq!(union.len(), 3);
+        let gate = cheapest_tests(union, 1);
+        assert_eq!(gate.len(), 1);
+        assert_eq!(gate[0].id, "t3");
+        assert!((gate[0].duration_secs - 0.4).abs() < 1e-9);
     }
 }
