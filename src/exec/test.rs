@@ -206,6 +206,17 @@ fn run_selected_tests<R>(
 where
     R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
 {
+    // Running no test at all is not evidence that the mutant survived. An
+    // empty selection here means staging or attribution produced nothing (the
+    // manifest fallback in `resolve_tests` has already had its turn), so the
+    // mutant has to be reported as an error rather than a silent Missed.
+    if tests.is_empty() {
+        return Ok(Outcome::errored(
+            planned.mutant.clone(),
+            String::new(),
+            "no tests were staged for this mutant (empty per-test attribution)".into(),
+        ));
+    }
     let mut skipped: Vec<InfraSkip> = Vec::new();
     for t in tests {
         let budget = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
@@ -758,6 +769,24 @@ mod tests {
         assert!(!seen[0].capture, "the first pass never pipes stderr");
         // 0.41s green × 3 × 3 is under the 30s floor.
         assert_eq!(seen[0].timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_empty_staged_list_is_errored_not_missed() {
+        for confirm in [true, false] {
+            let (outcome, seen) = drive(confirm, &[], &[]);
+            assert!(seen.is_empty(), "nothing to run (confirm={confirm})");
+            assert_eq!(
+                outcome.kind,
+                VerdictKind::Errored,
+                "an unrun mutant is not a survivor (confirm={confirm})"
+            );
+            assert_eq!(
+                outcome.message.as_deref(),
+                Some("no tests were staged for this mutant (empty per-test attribution)"),
+                "confirm={confirm}"
+            );
+        }
     }
 
     #[test]

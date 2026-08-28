@@ -365,6 +365,12 @@ pub fn build_tests_captured(
     })
 }
 
+/// Test harnesses built by `cargo build --tests`, in build order.
+///
+/// Only artifacts with `profile.test == true` are kept. `--tests` also
+/// produces plain `bin` artifacts (a CLI, a fuzzer); every caller here stages
+/// binaries to run with `--exact <test name>`, which a plain bin either
+/// rejects with a nonzero exit or, worse, ignores.
 pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for line in stdout.split(|b| *b == b'\n') {
@@ -375,6 +381,14 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-artifact") {
+            continue;
+        }
+        let is_test = v
+            .get("profile")
+            .and_then(|p| p.get("test"))
+            .and_then(|t| t.as_bool())
+            .unwrap_or(false);
+        if !is_test {
             continue;
         }
         if let Some(exe) = v.get("executable").and_then(|e| e.as_str()) {
@@ -447,6 +461,29 @@ pub fn env_for_tests() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_executables_keeps_only_test_harnesses() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"brokk-bifrost-core"},"profile":{"test":true},"executable":"/t/quicksilver/deps/brokk_bifrost_core-c4d0bb3ad97e1f96"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"bifrost_mcp_property_fuzzer"},"profile":{"test":false},"executable":"/t/quicksilver/deps/bifrost_mcp_property_fuzzer-abcdef1234567890"}"#,
+            "\n",
+            // No profile at all: not provably a harness, so it is dropped.
+            r#"{"reason":"compiler-artifact","target":{"name":"odd"},"executable":"/t/quicksilver/deps/odd-1111111111111111"}"#,
+            "\n",
+            r#"{"reason":"build-finished","success":true}"#,
+            "\n",
+        );
+        let exes = parse_executables(stdout.as_bytes(), Path::new("/t"));
+        assert_eq!(
+            exes,
+            vec![PathBuf::from(
+                "/t/quicksilver/deps/brokk_bifrost_core-c4d0bb3ad97e1f96"
+            )],
+            "plain bin artifacts must not be staged as test binaries"
+        );
+    }
 
     #[test]
     fn package_select_unscoped_is_workspace() {
