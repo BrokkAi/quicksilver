@@ -151,6 +151,9 @@ pub struct EstimateArgs {
     /// 0 means every site in the batch.
     #[arg(long, default_value_t = 8)]
     pub identity_sample: usize,
+    /// Execute this many disjoint second-order mutant pairs after the sample.
+    #[arg(long, default_value_t = 0)]
+    pub second_order_pairs: usize,
 }
 
 #[derive(Args, Debug, Default)]

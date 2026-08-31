@@ -275,10 +275,18 @@ pub fn write_outputs(
     estimate: Option<&EstimateReport>,
     cargo_invocations: u64,
     triage: Option<&crate::higher_order::TriageReport>,
+    second_order: Option<&crate::higher_order::SecondOrderReport>,
 ) -> Result<()> {
     crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json(path, outcomes, estimate, cargo_invocations, triage)?;
+        crate::report::write_json(
+            path,
+            outcomes,
+            estimate,
+            cargo_invocations,
+            triage,
+            second_order,
+        )?;
     }
     Ok(())
 }

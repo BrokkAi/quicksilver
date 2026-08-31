@@ -100,6 +100,9 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     if let Some(triage) = &exec.triage {
         crate::report::print_triage(triage);
     }
+    if let Some(second_order) = &exec.second_order {
+        crate::report::print_second_order(second_order);
+    }
     if let Some(path) = &prepared.cfg.diff_against {
         let diffs = crate::schema::gate_differential(path, &outcomes)?;
         if !diffs.is_empty() {
@@ -116,6 +119,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
                 None,
                 cargo_invocations,
                 exec.triage.as_ref(),
+                exec.second_order.as_ref(),
             )?;
             return Ok(2);
         }
@@ -130,6 +134,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
         None,
         cargo_invocations,
         exec.triage.as_ref(),
+        exec.second_order.as_ref(),
     )?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
@@ -210,6 +215,7 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         schema_batch_size: args.schema_batch_size,
         diff_against: args.diff_against.clone(),
         identity_sample: args.identity_sample,
+        second_order_pairs: args.second_order_pairs,
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
@@ -242,9 +248,11 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         "running sample of {} mutants through the pipeline",
         sample.len()
     );
-    let (outcomes, cargo_invocations) = engine::run_schema(&prepared, 0, Some(&sample))?;
+    let exec = engine::run_schema_detailed(&prepared, 0, Some(&sample))?;
+    let outcomes = &exec.outcomes;
+    let cargo_invocations = exec.cargo_invocations;
     if let Some(path) = &prepared.cfg.diff_against {
-        let diffs = crate::schema::gate_differential(path, &outcomes)?;
+        let diffs = crate::schema::gate_differential(path, outcomes)?;
         if !diffs.is_empty() {
             eprintln!("differential gate failed: {} disagreements", diffs.len());
             for d in &diffs {
@@ -253,7 +261,14 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
                     d.mutant_id, d.fqn, d.v1, d.v2
                 );
             }
-            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations, None)?;
+            engine::write_outputs(
+                &prepared.cfg,
+                outcomes,
+                None,
+                cargo_invocations,
+                None,
+                exec.second_order.as_ref(),
+            )?;
             return Ok(2);
         }
         eprintln!(
@@ -261,15 +276,19 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
             outcomes.len()
         );
     }
-    let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
+    let mut report = engine::estimate_from(&prepared, &sample, outcomes);
     report.sample_counts.cargo_invocations = cargo_invocations as usize;
     print!("{}", estimate::render(&report));
+    if let Some(second_order) = &exec.second_order {
+        crate::report::print_second_order(second_order);
+    }
     engine::write_outputs(
         &prepared.cfg,
-        &outcomes,
+        outcomes,
         Some(&report),
         cargo_invocations,
         None,
+        exec.second_order.as_ref(),
     )?;
     Ok(0)
 }

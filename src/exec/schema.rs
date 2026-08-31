@@ -9,7 +9,9 @@ use crate::exec::test::{
 };
 use crate::exec::{append_outcome, load_resume, ExecResult};
 use crate::higher_order::{
-    choose_triage_pairs, classify_triage, union_tests, RunnableMutant, TriageFinding, TriageReport,
+    choose_second_order_pairs, choose_triage_pairs, classify_triage,
+    implied_first_order_probability, pair_id, summarize_vector, union_tests, RunnableMutant,
+    SecondOrderExperiment, SecondOrderReport, TriageFinding, TriageReport,
 };
 use crate::plan::Plan;
 use crate::schema::{
@@ -247,12 +249,23 @@ pub fn execute(
     } else {
         None
     };
+    let second_order = if cfg.second_order_pairs > 0 {
+        Some(run_second_order(
+            &cfg,
+            &paths.baseline,
+            &outcomes,
+            &runnable.lock().unwrap(),
+        )?)
+    } else {
+        None
+    };
     let _ = fs::remove_dir_all(paths.runs.join("schema"));
 
     Ok(ExecResult {
         cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
         outcomes,
         triage,
+        second_order,
     })
 }
 
@@ -353,6 +366,78 @@ fn run_triage(
     Ok(TriageReport {
         survivors,
         experiments,
+    })
+}
+
+fn run_second_order(
+    cfg: &Config,
+    baseline: &Path,
+    outcomes: &[Outcome],
+    runnable: &[RunnableMutant],
+) -> Result<SecondOrderReport> {
+    let (eligible_mutants, pairs) =
+        choose_second_order_pairs(runnable, outcomes, cfg.second_order_pairs, cfg.sample_seed);
+    info!(
+        "second-order estimate: {} pair(s) from {} eligible mutant(s)",
+        pairs.len(),
+        eligible_mutants
+    );
+    let policy = TestRunPolicy {
+        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+        slowdown: SCHEMA_SLOWDOWN,
+        confirm: true,
+    };
+    let mut experiments = Vec::new();
+    for pair in pairs {
+        let tests = union_tests(&pair.left.planned, &pair.right.planned);
+        let plan = PlannedMutant {
+            mutant: pair.left.planned.mutant.clone(),
+            tests,
+            estimated_cost_secs: 0.0,
+        };
+        let env = vec![qs_mutants_env(&[
+            (pair.left.site_id, pair.left.variant),
+            (pair.right.site_id, pair.right.variant),
+        ])];
+        let run =
+            run_mutant_tests_observed(&plan, &pair.left.run_dir, baseline, &policy, &env, true)?;
+        let vector = summarize_vector(&run.observations, run.complete);
+        let left = pair.left.planned.mutant.id.clone();
+        let right = pair.right.planned.mutant.id.clone();
+        experiments.push(SecondOrderExperiment {
+            pair_id: pair_id(&left, &right),
+            mutant_ids: [left, right],
+            vector,
+        });
+    }
+    let completed_pairs = experiments
+        .iter()
+        .filter(|experiment| experiment.vector.complete && experiment.vector.comparable)
+        .count();
+    let caught_pairs = experiments
+        .iter()
+        .filter(|experiment| {
+            experiment.vector.complete
+                && experiment.vector.comparable
+                && !experiment.vector.killed_test_ids.is_empty()
+        })
+        .count();
+    let higher_order_kill_rate = if completed_pairs == 0 {
+        0.0
+    } else {
+        caught_pairs as f64 / completed_pairs as f64
+    };
+    Ok(SecondOrderReport {
+        requested_pairs: cfg.second_order_pairs,
+        eligible_mutants,
+        completed_pairs,
+        caught_pairs,
+        higher_order_kill_rate,
+        implied_first_order_kill_probability: implied_first_order_probability(
+            higher_order_kill_rate,
+        ),
+        experiments,
+        assumption: "p = 1 - sqrt(1 - h) assumes independently killable, equally distributed first-order constituents within this paired sample; it supplements rather than replaces first-order verdicts".into(),
     })
 }
 

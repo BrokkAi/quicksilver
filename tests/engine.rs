@@ -153,6 +153,7 @@ fn coverage_caught_missed_notcovered_timeout() {
 
     prepared.cfg.triage = true;
     prepared.cfg.triage_neighbors = 1;
+    prepared.cfg.second_order_pairs = 1;
     let triaged = run_schema_detailed(
         &prepared,
         0,
@@ -166,6 +167,11 @@ fn coverage_caught_missed_notcovered_timeout() {
         triage.experiments[0].classification,
         TriageClassification::LikelyEquivalent
     );
+    let second_order = triaged.second_order.expect("second-order report");
+    assert_eq!(second_order.requested_pairs, 1);
+    assert_eq!(second_order.completed_pairs, 1);
+    assert_eq!(second_order.caught_pairs, 1);
+    assert_eq!(second_order.implied_first_order_kill_probability, 1.0);
 
     let hang = prepared
         .mutants

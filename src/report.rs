@@ -15,6 +15,8 @@ pub struct JsonReport {
     pub counts: CountReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub triage: Option<crate::higher_order::TriageReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub second_order: Option<crate::higher_order::SecondOrderReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +99,7 @@ pub fn write_json(
     estimate: Option<&EstimateReport>,
     cargo_invocations: u64,
     triage: Option<&crate::higher_order::TriageReport>,
+    second_order: Option<&crate::higher_order::SecondOrderReport>,
 ) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
     let mut report = JsonReport {
@@ -104,6 +107,7 @@ pub fn write_json(
         estimate: estimate.cloned(),
         counts: CountReport::from(&counts),
         triage: triage.cloned(),
+        second_order: second_order.cloned(),
     };
     report.counts.cargo_invocations = cargo_invocations;
     crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
@@ -128,6 +132,19 @@ pub fn print_triage(report: &crate::higher_order::TriageReport) {
             finding.pair.killed_test_ids.len()
         );
     }
+}
+
+pub fn print_second_order(report: &crate::higher_order::SecondOrderReport) {
+    eprintln!("=== cargo-quicksilver second-order estimate ===");
+    eprintln!(
+        "pairs: {}/{} completed ({} caught); h={:.3}; implied first-order p={:.3}",
+        report.completed_pairs,
+        report.requested_pairs,
+        report.caught_pairs,
+        report.higher_order_kill_rate,
+        report.implied_first_order_kill_probability
+    );
+    eprintln!("assumption: {}", report.assumption);
 }
 
 pub fn print_exhaustive(outcomes: &[Outcome]) {

@@ -3,6 +3,8 @@
 use crate::types::{
     Mutant, Outcome, PlannedMutant, TestInfo, TestObservation, TestVerdict, VerdictKind,
 };
+use rand::seq::SliceRandom;
+use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -19,6 +21,12 @@ pub(crate) struct RunnableMutant {
 pub(crate) struct TriagePair {
     pub survivor: RunnableMutant,
     pub control: RunnableMutant,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SecondOrderPair {
+    pub left: RunnableMutant,
+    pub right: RunnableMutant,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -63,6 +71,25 @@ pub struct TriageFinding {
 pub struct TriageReport {
     pub survivors: usize,
     pub experiments: Vec<TriageFinding>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecondOrderExperiment {
+    pub pair_id: String,
+    pub mutant_ids: [String; 2],
+    pub vector: VectorSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecondOrderReport {
+    pub requested_pairs: usize,
+    pub eligible_mutants: usize,
+    pub completed_pairs: usize,
+    pub caught_pairs: usize,
+    pub higher_order_kill_rate: f64,
+    pub implied_first_order_kill_probability: f64,
+    pub experiments: Vec<SecondOrderExperiment>,
+    pub assumption: String,
 }
 
 /// Choose nearby caught controls for each survivor. Only mutants in the same
@@ -113,6 +140,69 @@ fn neighbor_key(survivor: &Mutant, control: &Mutant) -> (u8, usize, String) {
     )
 }
 
+/// Select disjoint, reproducible pairs. A pair must share a staged schema
+/// binary and activate distinct sites. Only decided first-order Caught/Missed
+/// mutants are eligible.
+pub(crate) fn choose_second_order_pairs(
+    runnable: &[RunnableMutant],
+    outcomes: &[Outcome],
+    requested: usize,
+    seed: u64,
+) -> (usize, Vec<SecondOrderPair>) {
+    let verdicts: HashMap<&str, VerdictKind> = outcomes
+        .iter()
+        .map(|outcome| (outcome.mutant.id.as_str(), outcome.kind))
+        .collect();
+    let mut eligible: Vec<RunnableMutant> = runnable
+        .iter()
+        .filter(|r| {
+            matches!(
+                verdicts.get(r.planned.mutant.id.as_str()),
+                Some(VerdictKind::Caught | VerdictKind::Missed)
+            )
+        })
+        .cloned()
+        .collect();
+    eligible.sort_by(|a, b| a.planned.mutant.id.cmp(&b.planned.mutant.id));
+    let eligible_count = eligible.len();
+    eligible.shuffle(&mut rand::rngs::StdRng::seed_from_u64(seed));
+
+    let mut used = vec![false; eligible.len()];
+    let mut pairs = Vec::new();
+    for left_index in 0..eligible.len() {
+        if used[left_index] || pairs.len() >= requested {
+            continue;
+        }
+        let Some(right_index) = (left_index + 1..eligible.len()).find(|&right_index| {
+            !used[right_index]
+                && eligible[left_index].run_dir == eligible[right_index].run_dir
+                && eligible[left_index].site_id != eligible[right_index].site_id
+        }) else {
+            continue;
+        };
+        used[left_index] = true;
+        used[right_index] = true;
+        pairs.push(SecondOrderPair {
+            left: eligible[left_index].clone(),
+            right: eligible[right_index].clone(),
+        });
+    }
+    (eligible_count, pairs)
+}
+
+pub fn pair_id(left: &str, right: &str) -> String {
+    if left <= right {
+        format!("{left}+{right}")
+    } else {
+        format!("{right}+{left}")
+    }
+}
+
+pub fn implied_first_order_probability(higher_order_kill_rate: f64) -> f64 {
+    let h = higher_order_kill_rate.clamp(0.0, 1.0);
+    1.0 - (1.0 - h).sqrt()
+}
+
 pub(crate) fn union_tests(a: &PlannedMutant, b: &PlannedMutant) -> Vec<TestInfo> {
     let mut by_id: BTreeMap<String, TestInfo> = BTreeMap::new();
     for test in a.tests.iter().chain(&b.tests) {
@@ -141,9 +231,9 @@ pub(crate) fn classify_triage(
     VectorSummary,
     VectorSummary,
 ) {
-    let survivor = summarize(survivor, survivor_complete);
-    let control = summarize(control, control_complete);
-    let pair = summarize(pair, pair_complete);
+    let survivor = summarize_vector(survivor, survivor_complete);
+    let control = summarize_vector(control, control_complete);
+    let pair = summarize_vector(pair, pair_complete);
     let comparable = survivor.complete
         && control.complete
         && pair.complete
@@ -176,7 +266,7 @@ pub(crate) fn classify_triage(
     (class, survivor, control, pair)
 }
 
-fn summarize(observations: &[TestObservation], complete: bool) -> VectorSummary {
+pub(crate) fn summarize_vector(observations: &[TestObservation], complete: bool) -> VectorSummary {
     let comparable = observations
         .iter()
         .all(|o| matches!(o.verdict, TestVerdict::Passed | TestVerdict::Killed));
@@ -239,5 +329,18 @@ mod tests {
             classify_triage(&pass, true, &infra, true, &pass, true).0,
             TriageClassification::Inconclusive
         );
+    }
+
+    #[test]
+    fn second_order_inversion_has_expected_boundaries_and_midpoint() {
+        assert_eq!(implied_first_order_probability(0.0), 0.0);
+        assert_eq!(implied_first_order_probability(1.0), 1.0);
+        let p = implied_first_order_probability(0.75);
+        assert!((p - 0.5).abs() < 1e-12, "p={p}");
+    }
+
+    #[test]
+    fn pair_id_is_order_independent() {
+        assert_eq!(pair_id("a", "b"), pair_id("b", "a"));
     }
 }

@@ -13,6 +13,7 @@ pub struct ExecResult {
     /// Real `cargo` invocations, not per-mutant Outcome.build flags.
     pub cargo_invocations: u64,
     pub triage: Option<crate::higher_order::TriageReport>,
+    pub second_order: Option<crate::higher_order::SecondOrderReport>,
 }
 
 pub(crate) fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {

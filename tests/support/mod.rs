@@ -111,5 +111,6 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         identity_sample: 0,
         triage: false,
         triage_neighbors: 1,
+        second_order_pairs: 0,
     }
 }

@@ -151,7 +151,7 @@ fn schema_gates_and_differential_self_consistent() {
     // itself. Serialize run one as the `--json` report shape and gate run two
     // against it.
     let reference = scratch.path().join("reference.json");
-    cargo_quicksilver::report::write_json(&reference, &v2, None, cargo_invocations, None)
+    cargo_quicksilver::report::write_json(&reference, &v2, None, cargo_invocations, None, None)
         .expect("write reference report");
 
     // Fresh state, same scratch so the coverage index and baseline are cached.

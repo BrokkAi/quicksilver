@@ -90,6 +90,7 @@ pub struct Config {
     pub identity_sample: usize,
     pub triage: bool,
     pub triage_neighbors: usize,
+    pub second_order_pairs: usize,
 }
 
 impl Config {
@@ -218,6 +219,7 @@ pub fn merge_config(
         identity_sample: extras.identity_sample,
         triage: extras.triage,
         triage_neighbors: extras.triage_neighbors.max(1),
+        second_order_pairs: extras.second_order_pairs,
     })
 }
 
@@ -243,4 +245,5 @@ pub struct ConfigExtras {
     pub identity_sample: usize,
     pub triage: bool,
     pub triage_neighbors: usize,
+    pub second_order_pairs: usize,
 }
