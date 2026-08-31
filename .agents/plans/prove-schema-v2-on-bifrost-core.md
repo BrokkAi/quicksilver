@@ -1,14 +1,14 @@
-# Prove schema (v2) mutation testing on bifrost-core
+# Prove schema (v2) mutation testing and build higher-order evidence on bifrost-core
 
 This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds.
 
 Maintain this document in accordance with `.agents/PLANS.md`. A novice with only the working tree, `.agents/PLANS.md`, and this file should be able to finish the proof or see why it is not yet finished.
 
-This plan is retroactive. Schema execution already exists in the tree (commit `9071b2e` and ancestors). The remaining job is not to invent v2. It is to make v2 verdicts trustworthy on a real crate so the older one-compile-per-mutant path (v1) can be deleted. Do not run an exhaustive v1 pass. v1 exists only as a sanity sample to compare against.
+This plan began retroactively: schema execution already existed in the tree (commit `9071b2e` and ancestors), and the first job was to make its verdicts trustworthy enough to delete the older one-compile-per-mutant path. That proof is complete. The active continuation adds three evidence layers in this order: survivor triage, pooled second-order estimation, and a persistent coupling matrix. Do not restore or run the deleted v1 executor.
 
 ## Purpose / Big Picture
 
-After this work, a user can run `cargo-quicksilver estimate --schema` (or `run --schema`) on a scoped crate, get one compile for that crate instead of one compile per mutant, and trust that a selected test that fails under `QS_MUTANT=site:variant` is the same kind of failure v1 would have reported. The observable proof is: the same 150-mutant sample of `brokk-bifrost-core` produces matching caught/missed/not-covered verdicts in the v1 JSON and the v2 JSON, with timeouts and infrastructure errors rare enough that they are not the headline. Until that match holds, v1 stays.
+After the completed proof, a user can run `cargo-quicksilver estimate` or `run` on a scoped crate, get one compile for that crate instead of one compile per mutant, and trust its first-order verdicts. The continuation lets that user ask what a survivor means instead of receiving only a flat Missed inventory. Opt-in triage combines a survivor with nearby caught mutants and compares complete per-test kill vectors. Opt-in second-order estimation executes reproducible mutant pairs and reports the first-order kill probability implied by the observed pair kill rate using `p = 1 - sqrt(1 - h)`. Every actually observed mutant-by-test result is merged into a versioned matrix under the session index and, when `--json` is used, summarized in the report. These behaviors must work on the tiny fixture without Bifrost and must not query Bifrost's usage graph, so issue 2771 is not on their critical path.
 
 ## Progress
 
@@ -38,6 +38,10 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
 - [x] (2026-08-28) Differential allow-list documented (Decision Log). Criterion One of Validation (literal empty diff, exit 0) is NOT met, so per that section the v1 execute path stays in the tree for now.
 - [x] Get a differential pass, or a documented allow-list of expected disagreements, on the same `--sample 150 --sample-seed 1` set. Completed 2026-08-28: 15 disagreements, all allow-listed in the Decision Log (4 `ref`-prefilter, 11 v1 floor-timeouts). The 22 v1-Missed→v2-Caught shift was real — v1's Missed verdicts were vacuous (empty selections) and v1 itself confirms the catches on the healed index.
 - [x] (2026-08-28) Delete the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared`) and make schemata the only engine. Authorized by the user on 2026-08-28 after reviewing the v2c differential: the documented allow-list is accepted as the trust bar in place of Validation criterion One. `--schema` remains as a hidden accepted no-op flag.
+- [ ] (2026-08-30) Milestone 1, survivor triage. Add multi-site activation as the minimum execution substrate, collect complete confirmed kill vectors only for opt-in experiments, pair each survivor with deterministic nearby caught controls, classify interaction evidence, expose it through `run --triage`, and prove it on the tiny fixture.
+- [ ] Milestone 2, pooled second-order estimation. Add deterministic disjoint pair sampling, execute those pairs through the same schema binary and confirmation policy, report pair kill rate and the inversion `1 - sqrt(1 - h)` with explicit assumptions, and expose it through `estimate --second-order-pairs N`.
+- [ ] Milestone 3, persistent coupling artifacts. Merge first-order prefixes and complete experimental vectors into `index/coupling-v1.json`, invalidate rows and columns by stable mutant/test identities plus the coverage source cache key, derive subsumption only from complete comparable vectors, surface artifact counts in JSON, and test incremental reuse/invalidation.
+- [ ] Run formatting, focused unit/integration tests, the full offline library and schema/engine suites, and clippy; record exact evidence and close the continuation retrospective.
 
 ## Surprises & Discoveries
 
@@ -127,6 +131,22 @@ After this work, a user can run `cargo-quicksilver estimate --schema` (or `run -
   Rationale: The plan accepts "a documented allow-list of expected disagreements" in place of an empty diff. Both classes are mechanically identifiable from the reports alone and neither indicts a schema verdict.
   Date/Author: 2026-08-28 / Fable session.
 
+- Decision: Implement the requested sequence as user-visible milestones while allowing the smallest dependency-first internal edits. Multi-site `QS_MUTANT` parsing and observation records land during triage because survivor/control combinations cannot run without them; the general pair sampler and estimator remain Milestone 2, and durable cross-run merging remains Milestone 3.
+  Rationale: The three ideas have a dependency cycle if interpreted as file order: triage requires higher-order activation and kill vectors, while subsumption requires matrix rows. Preserving the requested order at the observable-feature level avoids a fake triage implementation while still delivering triage first.
+  Date/Author: 2026-08-30 / Codex.
+
+- Decision: Higher-order modes are opt-in and supplemental. They never rewrite a first-order `Outcome`, never turn a non-101 exit into Caught, never interpret an empty selection as survival, and use the existing confirmation/null-calibration policy.
+  Rationale: The schema proof established strict verdict semantics. Exploratory pairing must not weaken or silently replace them.
+  Date/Author: 2026-08-30 / Codex.
+
+- Decision: Neighbor selection is deterministic and Bifrost-independent: prefer the nearest byte span in the same file, then the nearest stable mutant id in the same package, while requiring a caught first-order control and a distinct site. Pair tests are the deduplicated union of both selections.
+  Rationale: Variants at the same function site cannot both be active. Syntactic locality is already available from discovery and avoids issue 2771. The caught control makes comparison interpretable and the union avoids under-selecting either constituent.
+  Date/Author: 2026-08-30 / Codex.
+
+- Decision: A kill vector is complete only when every selected test has a confirmed canonical result. Subsumption is computed only between complete rows over the same test-column universe; prefixes collected during ordinary fail-fast execution remain useful for scheduling priors but cannot prove subsumption or equivalence.
+  Rationale: Treating an unexecuted suffix as passing would manufacture dominance relationships. This is the matrix analogue of refusing vacuous Missed verdicts.
+  Date/Author: 2026-08-30 / Codex.
+
 ## Outcomes & Retrospective
 
 v2 verdicts on the 150-mutant seed-1 sample are now trustworthy, and on this sample v2 is strictly more reliable than v1: zero timeouts (v1: 11 floor timeouts), every non-green verdict confirmed by a retry plus a no-mutant run, errored and not-covered in exact agreement, and 29 minutes wall against v1's roughly two hours. The final differential (`estimate-core-v2c.json` vs `estimate-core-v1f.json`) has 15 disagreements, all in the two allow-listed classes in the Decision Log; none indicts a schema verdict.
@@ -159,7 +179,15 @@ Tiny fixture for local tests: `tests/fixtures/tiny/`, including `crate_schema`. 
 
 ## Plan of Work
 
-The transform and runner already exist. Remaining work is to make the third-run v2 sample match v1 on decided tests.
+The transform and first-order runner already exist, and the v2 proof described below is historical and complete. The active continuation is implemented in three user-visible milestones. Keep the historical steps after this continuation because they explain the verdict invariants the new experiment runner must preserve.
+
+Milestone 1 adds survivor triage. Extend `src/schema.rs` so `QS_MUTANT` accepts one or more `site:variant` entries separated by semicolons and caches the parsed list once; retain the existing single-entry spelling exactly. Add a structured observation API in `src/exec/test.rs` that can either fail fast for ordinary verdicts or continue through every selected test for an experiment, applying the same retry and null-run attribution rules. Add `src/higher_order.rs` for deterministic neighbor choice, pair identity, kill-vector comparison, and triage classifications. Thread `run --triage` through `src/cli.rs`, `src/config.rs`, `src/lib.rs`, and `src/exec/schema.rs`. A survivor/control experiment must activate two distinct sites, run the deduplicated union of selected tests, and leave the survivor's first-order Outcome unchanged. The human report and JSON must name both mutant ids, the control's first-order verdict, the pair's test vector, and whether the survivor preserved, suppressed, or added kills relative to the caught control. If a complete comparison cannot be obtained, report it as inconclusive rather than likely equivalent or a test gap.
+
+Milestone 2 adds pooled second-order estimation. In `src/higher_order.rs`, choose deterministic disjoint pairs from eligible schema mutants using the existing sample seed; exclude two variants of the same site and mutants that are NotCovered, Unviable, Errored, or Timeout. `estimate --second-order-pairs N` executes at most N pairs through the binaries already built for the first-order sample. Report eligible pairs requested and completed, caught pair count, observed higher-order kill rate `h`, and implied first-order kill probability `1 - sqrt(1 - h)`. Label this an independence-model estimate, not a replacement verdict. Split pair kills by running constituent vectors when attribution is needed; never claim which constituent caused a pair kill from the pair result alone.
+
+Milestone 3 persists coupling evidence. Add `src/coupling.rs` with a versioned, serde-backed artifact at `Paths.index/coupling-v1.json`. Each row identifies an activation (one mutant or a stable pair id), records constituent mutant ids, the exact test ids selected, canonical per-test observations, and whether the row is complete. Store the coverage index `cache_key` and discard old rows on a mismatch. Within a matching source state, merge by stable mutant and test ids so reruns add columns without erasing prior evidence. Compute kill-vector subsumption only for complete first-order rows with the same selected-test universe; emit dominator/subsumed relationships and never use prefix rows as negative evidence. Persist atomically after execution and include a compact artifact summary in `--json` output.
+
+Tests proceed from pure to end-to-end. Unit tests cover multi-site parsing/rendering, pair determinism, the inversion formula at boundaries and a known interior point, complete-versus-prefix vector semantics, merge/invalidation, and subsumption direction. Extend the tiny schema fixture so one missed mutant combined with a nearby caught control produces a known triage comparison and second-order pair. Integration acceptance must demonstrate the CLI options, JSON fields, and a reusable `coupling-v1.json` without running Bifrost or depending on its graph.
 
 First, inspect the 23 v2 timeouts in `/mnt/optane/quicksilver/bringup/estimate-core-v2.json`. For each, look up the failing test name and that test’s `duration_secs` on the in-memory index after `attach_timings` (or in `baseline.json`). If 3× duration is still under the wall time the schema binary needs, raise the schema-path multiplier or floor in `src/exec/schema.rs` only (do not silently wait 120 seconds on every v1 test). If the test hangs, that is a prologue or environment bug: reproduce with one `QS_MUTANT` on the staged binary under `065e17f14dc00ece/runs-v2/`.
 
