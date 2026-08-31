@@ -35,3 +35,13 @@ only complete, comparable vectors are used to report mutation subsumption.
 the corresponding evidence exists.
 
 See `cargo quicksilver --help`.
+
+## Research notes
+
+The [`papers/`](papers/) directory contains research notes related to mutation
+testing, causal program dependence, and higher-order mutants.
+
+## License
+
+This project is licensed under the GNU Lesser General Public License, version
+3.0. See [LICENSE](LICENSE) for the complete license text.
