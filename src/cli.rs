@@ -110,9 +110,9 @@ pub struct CommonOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Sample plus extrapolate exhaustive-run wall clock (the v1 deliverable).
+    /// Sample mutation outcomes and extrapolate exhaustive-run wall clock.
     Estimate(EstimateArgs),
-    /// Execute mutants (scoped; exhaustive runs are v2).
+    /// Execute mutants with the schema engine.
     Run(RunArgs),
     /// Print the mutant catalog and exit.
     List(ListArgs),
@@ -183,7 +183,7 @@ pub struct RunArgs {
     #[arg(long)]
     pub triage: bool,
     /// Nearby caught controls to combine with each survivor.
-    #[arg(long, default_value_t = 1, requires = "triage")]
+    #[arg(long, default_value_t = 1)]
     pub triage_neighbors: usize,
 }
 

@@ -2,10 +2,11 @@
 
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
 use crate::config::Config;
+use crate::coupling::CouplingRow;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
-    run_mutant_tests_observed, run_mutant_tests_policy, run_mutant_tests_with_env,
-    BinariesManifest, ManifestTest, TestRunPolicy,
+    run_mutant_tests_observed, run_mutant_tests_with_env, BinariesManifest, ManifestTest,
+    ObservedRun, TestRunPolicy,
 };
 use crate::exec::{append_outcome, load_resume, ExecResult};
 use crate::higher_order::{
@@ -86,6 +87,7 @@ pub fn execute(
 
     let cargo_invocations = Arc::new(AtomicU64::new(0));
     let runnable = Arc::new(Mutex::new(Vec::<RunnableMutant>::new()));
+    let coupling_rows = Arc::new(Mutex::new(Vec::<CouplingRow>::new()));
     let jobs: Vec<(String, Vec<PlannedMutant>)> = by_pkg.into_iter().collect();
     let n_mutants: usize = jobs.iter().map(|(_, v)| v.len()).sum();
     info!(
@@ -193,6 +195,7 @@ pub fn execute(
             let paths = Arc::clone(&paths);
             let cfg = Arc::clone(&cfg);
             let cancel = Arc::clone(&cancel);
+            let coupling_rows = Arc::clone(&coupling_rows);
             scope.spawn(move || {
                 while let Ok(ready) = ready_rx.recv() {
                     if cancel.load(Ordering::Relaxed) {
@@ -203,16 +206,23 @@ pub fn execute(
                         slowdown: SCHEMA_SLOWDOWN,
                         confirm: true,
                     };
-                    let outcome = run_mutant_tests_policy(
+                    let observed = run_mutant_tests_observed(
                         &ready.planned,
                         &ready.run_dir,
                         &paths.baseline,
                         &policy,
                         &ready.env,
+                        false,
                     );
-                    match outcome {
-                        Ok(o) => {
-                            let _ = out_tx.send(o);
+                    match observed {
+                        Ok(run) => {
+                            coupling_rows.lock().unwrap().push(row_from_run(
+                                ready.planned.mutant.id.clone(),
+                                vec![ready.planned.mutant.id.clone()],
+                                &ready.planned,
+                                &run,
+                            ));
+                            let _ = out_tx.send(run.outcome);
                         }
                         Err(err) => {
                             let _ = out_tx.send(Outcome::unviable(
@@ -239,23 +249,20 @@ pub fn execute(
     });
 
     pb.finish_and_clear();
+    let mut evidence_rows = coupling_rows.lock().unwrap().clone();
     let triage = if cfg.triage {
-        Some(run_triage(
-            &cfg,
-            &paths.baseline,
-            &outcomes,
-            &runnable.lock().unwrap(),
-        )?)
+        let (report, rows) =
+            run_triage(&cfg, &paths.baseline, &outcomes, &runnable.lock().unwrap())?;
+        evidence_rows.extend(rows);
+        Some(report)
     } else {
         None
     };
     let second_order = if cfg.second_order_pairs > 0 {
-        Some(run_second_order(
-            &cfg,
-            &paths.baseline,
-            &outcomes,
-            &runnable.lock().unwrap(),
-        )?)
+        let (report, rows) =
+            run_second_order(&cfg, &paths.baseline, &outcomes, &runnable.lock().unwrap())?;
+        evidence_rows.extend(rows);
+        Some(report)
     } else {
         None
     };
@@ -266,6 +273,8 @@ pub fn execute(
         outcomes,
         triage,
         second_order,
+        coupling_rows: evidence_rows,
+        coupling: None,
     })
 }
 
@@ -280,7 +289,7 @@ fn run_triage(
     baseline: &Path,
     outcomes: &[Outcome],
     runnable: &[RunnableMutant],
-) -> Result<TriageReport> {
+) -> Result<(TriageReport, Vec<CouplingRow>)> {
     let pairs = choose_triage_pairs(runnable, outcomes, cfg.triage_neighbors);
     let survivors = outcomes
         .iter()
@@ -297,6 +306,7 @@ fn run_triage(
         confirm: true,
     };
     let mut experiments = Vec::new();
+    let mut rows = Vec::new();
     for pair in pairs {
         let tests = union_tests(&pair.survivor.planned, &pair.control.planned);
         let survivor_plan = PlannedMutant {
@@ -352,10 +362,30 @@ fn run_triage(
             &pair_run.observations,
             pair_run.complete,
         );
+        let survivor_id = pair.survivor.planned.mutant.id.clone();
+        let control_id = pair.control.planned.mutant.id.clone();
+        rows.push(row_from_run(
+            survivor_id.clone(),
+            vec![survivor_id.clone()],
+            &survivor_plan,
+            &survivor_run,
+        ));
+        rows.push(row_from_run(
+            control_id.clone(),
+            vec![control_id.clone()],
+            &control_plan,
+            &control_run,
+        ));
+        rows.push(row_from_run(
+            pair_id(&survivor_id, &control_id),
+            vec![survivor_id.clone(), control_id.clone()],
+            &pair_plan,
+            &pair_run,
+        ));
         experiments.push(TriageFinding {
-            survivor_id: pair.survivor.planned.mutant.id.clone(),
+            survivor_id,
             survivor_fqn: pair.survivor.planned.mutant.fqn.clone(),
-            control_id: pair.control.planned.mutant.id.clone(),
+            control_id,
             control_fqn: pair.control.planned.mutant.fqn.clone(),
             classification,
             survivor,
@@ -363,10 +393,13 @@ fn run_triage(
             pair: pair_summary,
         });
     }
-    Ok(TriageReport {
-        survivors,
-        experiments,
-    })
+    Ok((
+        TriageReport {
+            survivors,
+            experiments,
+        },
+        rows,
+    ))
 }
 
 fn run_second_order(
@@ -374,7 +407,7 @@ fn run_second_order(
     baseline: &Path,
     outcomes: &[Outcome],
     runnable: &[RunnableMutant],
-) -> Result<SecondOrderReport> {
+) -> Result<(SecondOrderReport, Vec<CouplingRow>)> {
     let (eligible_mutants, pairs) =
         choose_second_order_pairs(runnable, outcomes, cfg.second_order_pairs, cfg.sample_seed);
     info!(
@@ -388,6 +421,7 @@ fn run_second_order(
         confirm: true,
     };
     let mut experiments = Vec::new();
+    let mut rows = Vec::new();
     for pair in pairs {
         let tests = union_tests(&pair.left.planned, &pair.right.planned);
         let plan = PlannedMutant {
@@ -404,8 +438,15 @@ fn run_second_order(
         let vector = summarize_vector(&run.observations, run.complete);
         let left = pair.left.planned.mutant.id.clone();
         let right = pair.right.planned.mutant.id.clone();
+        let activation_id = pair_id(&left, &right);
+        rows.push(row_from_run(
+            activation_id.clone(),
+            vec![left.clone(), right.clone()],
+            &plan,
+            &run,
+        ));
         experiments.push(SecondOrderExperiment {
-            pair_id: pair_id(&left, &right),
+            pair_id: activation_id,
             mutant_ids: [left, right],
             vector,
         });
@@ -427,7 +468,7 @@ fn run_second_order(
     } else {
         caught_pairs as f64 / completed_pairs as f64
     };
-    Ok(SecondOrderReport {
+    Ok((SecondOrderReport {
         requested_pairs: cfg.second_order_pairs,
         eligible_mutants,
         completed_pairs,
@@ -438,7 +479,32 @@ fn run_second_order(
         ),
         experiments,
         assumption: "p = 1 - sqrt(1 - h) assumes independently killable, equally distributed first-order constituents within this paired sample; it supplements rather than replaces first-order verdicts".into(),
-    })
+    }, rows))
+}
+
+fn row_from_run(
+    activation_id: String,
+    mutant_ids: Vec<String>,
+    planned: &PlannedMutant,
+    run: &ObservedRun,
+) -> CouplingRow {
+    CouplingRow::new(
+        activation_id,
+        mutant_ids,
+        planned
+            .tests
+            .iter()
+            .map(|test| {
+                if test.id.is_empty() {
+                    test.name.clone()
+                } else {
+                    test.id.clone()
+                }
+            })
+            .collect(),
+        run.observations.clone(),
+        run.complete,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

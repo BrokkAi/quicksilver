@@ -2,6 +2,7 @@ pub mod baseline;
 pub mod cargo_cmd;
 pub mod cli;
 pub mod config;
+pub mod coupling;
 pub mod discover;
 pub mod engine;
 pub mod estimate;
@@ -96,15 +97,18 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     let exec = engine::run_schema_detailed(&prepared, args.limit, None)?;
     let outcomes = &exec.outcomes;
     let cargo_invocations = exec.cargo_invocations;
-    crate::report::print_exhaustive(&outcomes);
+    crate::report::print_exhaustive(outcomes);
     if let Some(triage) = &exec.triage {
         crate::report::print_triage(triage);
     }
     if let Some(second_order) = &exec.second_order {
         crate::report::print_second_order(second_order);
     }
+    if let Some(coupling) = &exec.coupling {
+        crate::report::print_coupling(coupling);
+    }
     if let Some(path) = &prepared.cfg.diff_against {
-        let diffs = crate::schema::gate_differential(path, &outcomes)?;
+        let diffs = crate::schema::gate_differential(path, outcomes)?;
         if !diffs.is_empty() {
             eprintln!("differential gate failed: {} disagreements", diffs.len());
             for d in &diffs {
@@ -120,6 +124,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
                 cargo_invocations,
                 exec.triage.as_ref(),
                 exec.second_order.as_ref(),
+                exec.coupling.as_ref(),
             )?;
             return Ok(2);
         }
@@ -135,6 +140,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
         cargo_invocations,
         exec.triage.as_ref(),
         exec.second_order.as_ref(),
+        exec.coupling.as_ref(),
     )?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
@@ -268,6 +274,7 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
                 cargo_invocations,
                 None,
                 exec.second_order.as_ref(),
+                exec.coupling.as_ref(),
             )?;
             return Ok(2);
         }
@@ -282,6 +289,9 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
     if let Some(second_order) = &exec.second_order {
         crate::report::print_second_order(second_order);
     }
+    if let Some(coupling) = &exec.coupling {
+        crate::report::print_coupling(coupling);
+    }
     engine::write_outputs(
         &prepared.cfg,
         outcomes,
@@ -289,6 +299,7 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         cargo_invocations,
         None,
         exec.second_order.as_ref(),
+        exec.coupling.as_ref(),
     )?;
     Ok(0)
 }

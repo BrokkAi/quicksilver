@@ -24,7 +24,7 @@ After the completed proof, a user can run `cargo-quicksilver estimate` or `run` 
 - [x] Drive timeouts and infrastructure errors down so they are not the main disagreement with v1. Completed 2026-08-28: v2 timeouts 23 → 0 (pool floor parity + confirmation), error cluster eliminated (binary resolution fix); see the dated entries below.
 - [x] (2026-08-27) Diagnose the 23 v2 timeouts without a rebuild: every timed-out test has a green duration of 0.04–0.97 seconds, so every one received exactly the 5-second floor budget. The gates were already raised to a 30-second floor for schema slowness (`src/exec/schema.rs` comment near `null_schema_gate`), but the mutant pool still passed plain `cfg.timeout_floor` (default 5000 ms, `src/cli.rs`). The first v2 attempt also timed out a 0.41-second test at 5 seconds with `QS_MUTANT` unset, so the slowdown is schema-binary overhead, not mutant-caused hangs.
 - [x] (2026-08-27) Diagnose the disagreement structure: `run_mutant_tests_with_env` returns on the first Timeout or Error, so one poison test decides every mutant it covers (5 timeout rows share `persisted_build_reports_cache_open_failure`; all 12 error rows share the Scala fixture test). Stderr is discarded (`Stdio::null`), so the exit-1 cause is not recoverable from logs. The fixture test is a plain libtest `#[test]` (assertions would exit 101, not 1) and `__qs_rt` has no exit path, so the exit-1 source is still unknown.
-- [ ] (2026-08-27, in flight) Re-run the v1 sanity sample with the fixed binary (duration attach, SIGKILL classification) as the new baseline: fresh `QS_STATE_SUBDIR=state-v1b`, output `/mnt/optane/quicksilver/bringup/estimate-core-v1b.json`, log `/mnt/optane/quicksilver/bringup/v1b.log`. The old baseline predates those fixes; its 8 timeouts and 3 errors are infrastructure artifacts.
+- [x] (2026-08-27) Re-ran the v1 sanity sample with the fixed binary as `estimate-core-v1b.json`; the later healed-index `estimate-core-v1f.json` superseded it.
 - [x] (2026-08-27) Implement schema-pool budget parity and a confirmation machine: pool floor `max(cfg.timeout_floor, 30 s)` and slowdown factor 3.0 on the 3× green budget; on first-pass Failed/Timeout/Error, retry once, then run the same test with no mutant active to attribute the failure to the mutant or to the schema binary; skip infrastructure-broken tests and continue instead of poisoning the mutant; capture stderr on confirmation runs. v1 and gate behavior unchanged. Commit `ea6e467`.
 - [x] (2026-08-27) v1 baseline refreshed with the fixed binary: `estimate-core-v1b.json`, 54 caught / 44 missed / 7 not covered / 37 unviable / 3 errored / 5 timeout. Only 9 rows moved vs the stale baseline, all timeout-related. v1b's own noise: 5 floor timeouts on 0.46–0.68 s tests and 2 signal-death errors on `persisted_build_reports_cache_open_failure`.
 - [x] (2026-08-28) Fourth v2 run (confirmation machinery, diff against v1b): `estimate-core-v2b.json`, 79 caught / 10 missed / 7 not covered / 41 unviable / 13 errored / **0 timeout**. Disagreements 59 → 43. All 23 old timeouts gone.
@@ -40,13 +40,16 @@ After the completed proof, a user can run `cargo-quicksilver estimate` or `run` 
 - [x] (2026-08-28) Delete the v1 execute path (`src/exec/mod.rs` `execute`, `engine::run_prepared`) and make schemata the only engine. Authorized by the user on 2026-08-28 after reviewing the v2c differential: the documented allow-list is accepted as the trust bar in place of Validation criterion One. `--schema` remains as a hidden accepted no-op flag.
 - [x] (2026-08-30) Milestone 1, survivor triage. Added cached multi-site activation, complete confirmed observation vectors, deterministic nearby caught controls, five evidence classifications plus inconclusive, `run --triage`/`--triage-neighbors`, human and JSON reporting, and a tiny-workspace end-to-end proof.
 - [x] (2026-08-30) Milestone 2, pooled second-order estimation. Added seeded disjoint pair sampling within a staged schema binary, complete confirmed pair vectors, `estimate --second-order-pairs N`, human/JSON reporting, boundary-tested inversion `1 - sqrt(1 - h)`, and an explicit independence-model caveat. The tiny end-to-end case completed and caught one requested pair.
-- [ ] Milestone 3, persistent coupling artifacts. Merge first-order prefixes and complete experimental vectors into `index/coupling-v1.json`, invalidate rows and columns by stable mutant/test identities plus the coverage source cache key, derive subsumption only from complete comparable vectors, surface artifact counts in JSON, and test incremental reuse/invalidation.
-- [ ] Run formatting, focused unit/integration tests, the full offline library and schema/engine suites, and clippy; record exact evidence and close the continuation retrospective.
+- [x] (2026-08-30) Milestone 3, persistent coupling artifacts. Ordinary first-order prefixes and complete experimental vectors merge into versioned `index/coupling-v1.json`; source-key mismatches invalidate stale evidence; stable activation/test ids merge reruns; cross-process file locking prevents shard lost updates; only complete comparable equal-column vectors produce subsumption relations; summaries appear in human and JSON output.
+- [x] (2026-08-30) Verification completed. `cargo test --offline --lib --test schema --test engine` passed 82 library, 4 engine, and 3 schema tests outside the sandbox; the focused evidence/JSON fixture passed in 65.54 seconds; clippy completed with the same 12 pre-existing style warnings and no warnings introduced by this work.
 
 ## Surprises & Discoveries
 
 - Observation: The sandbox denies the signal-handler pipe operation used by `wait-timeout` while Stage B indexes fixture tests, aborting the process with `bad error on write fd: Operation not permitted`. The identical focused integration test passes outside the sandbox in 65.52 seconds.
   Evidence: sandbox run exited by SIGABRT in `wait_timeout::imp::sigchld_handler`; approved rerun reported `1 passed; 0 failed` including the new triage assertion.
+
+- Observation: Durable coupling writes need process-level serialization, not only atomic rename. Multiple shards can load the same old artifact and atomically overwrite one another with individually valid but incomplete snapshots.
+  Evidence: `src/coupling.rs::merge_and_save` now holds `flock(LOCK_EX)` across load, merge, and atomic save; this follows the earlier Stage B lost-update failure documented in this plan.
 
 - Observation: Index test rows all stored `duration_secs = 0.001` on disk even when baseline JUnit had real times (for example `a_jar_indexed_member_assertion_concludes_only_when_the_jar_was_read` is 16.993 seconds green). `attach_timings` matched 12,868 of 12,868 pairs in memory, then `stage_b_for_mutants` reloaded `coverage.json` and threw the durations away. Evidence: Python compare of `/mnt/optane/quicksilver/065e17f14dc00ece/index/coverage.json` versus `baseline.json`; timeout list in `estimate-core.json` all hit that jar test or other 5–17 second tests.
 
@@ -150,6 +153,10 @@ After the completed proof, a user can run `cargo-quicksilver estimate` or `run` 
   Rationale: Treating an unexecuted suffix as passing would manufacture dominance relationships. This is the matrix analogue of refusing vacuous Missed verdicts.
   Date/Author: 2026-08-30 / Codex.
 
+- Decision: Persist coupling evidence automatically for every schema run in `index/coupling-v1.json`; no extra recording flag is required. Invalidate the artifact conservatively when the coverage source cache key changes, and serialize cross-process merge/save with a file lock.
+  Rationale: Automatic sparse capture has negligible execution cost and makes ordinary runs useful as priors. Global source-key invalidation is less incremental than per-file fingerprints but is sound with the identities available today; stable row and column ids still merge repeated runs within one exact source state.
+  Date/Author: 2026-08-30 / Codex.
+
 ## Outcomes & Retrospective
 
 v2 verdicts on the 150-mutant seed-1 sample are now trustworthy, and on this sample v2 is strictly more reliable than v1: zero timeouts (v1: 11 floor timeouts), every non-green verdict confirmed by a retry plus a no-mutant run, errored and not-covered in exact agreement, and 29 minutes wall against v1's roughly two hours. The final differential (`estimate-core-v2c.json` vs `estimate-core-v1f.json`) has 15 disagreements, all in the two allow-listed classes in the Decision Log; none indicts a schema verdict.
@@ -158,9 +165,11 @@ The proof detour mattered more than the proof: the original disagreement count (
 
 What someone can do today: from the repo root after `unset RUSTUP_TOOLCHAIN`, run the v2c command in Concrete Steps. It reuses the healed index (Stage B cache now covers the sample), compiles the schema batch once, runs gates, executes 143 mutants through the confirmation pool, and diffs against `estimate-core-v1f.json`, exiting 2 with exactly the 15 allow-listed rows.
 
-What remains before deleting v1 (Validation criterion One is deliberately strict — empty diff, exit 0 — and is not met): either teach `gate_differential` the two allow-list classes so an accepted run exits 0, or accept the documented-allow-list bar and remove v1 by decision. Also worth doing before exhaustive runs: fix the `edge_weight_only_merge_sums_distinct_file_line_sites` stack overflow in bifrost (it aborts under every engine), and consider a Stage B attribution sanity check (attributed lines per file far below union lines should fail loudly, not select nothing).
+The earlier “before deleting v1” question is resolved: the user accepted the documented allow-list and v1 was removed in `1886365`. Independent follow-ups remain worthwhile: fix the `edge_weight_only_merge_sums_distinct_file_line_sites` stack overflow in bifrost, and consider a Stage B attribution sanity check that fails loudly when attributed lines are implausibly sparse.
 
 Lessons: gates that iterate every covering test do not scale to reverse-dependent suites. Duration metadata must survive every reload of `coverage.json`. A 5-second floor is wrong for this crate under load, for v1 too. Shared scratch plus in-place baseline mutation is not safe for parallel processes, and neither is a shared profraw directory — the shard-era races quietly destroyed per-test attribution while leaving union coverage intact, which made the damage invisible until a differential run contradicted itself. Substring binary matching is never acceptable: its bad path is not an error but a silent vacuous pass. Never report Missed for a mutant that ran zero tests. Confirmation-with-null-attribution turned every anomaly in this bring-up into a self-diagnosing log line; it is the single change that made the rest findable.
+
+The 2026-08-30 continuation delivered the requested ideas in order. `run --triage` now produces bounded, auditable survivor classifications from three complete vectors on a common test universe. `estimate --second-order-pairs N` produces reproducible pair observations and an explicitly assumption-bound inversion without rewriting first-order evidence. Every schema run contributes observations to a durable matrix, while prefixes remain visibly incomplete and subsumption requires complete comparable vectors. The tiny fixture proves multi-site activation, one likely-equivalent triage case, one caught second-order pair, artifact persistence, and all three JSON sections. No Bifrost graph query was added, so issue 2771 does not block any of these paths.
 
 ## Context and Orientation
 
@@ -308,6 +317,7 @@ Schema runtime, already in tree, `src/schema.rs`:
     pub fn render_prologue(site: &Site) -> String;
     pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<AppliedSite>)>;
     pub fn qs_mutant_env(site_id: u32, variant: u32) -> (String, String); // ("QS_MUTANT", "{site}:{variant}")
+    pub fn qs_mutants_env(activations: &[(u32, u32)]) -> (String, String); // semicolon-separated, sorted sites
     pub fn gate_differential(path: &Path, v2: &[Outcome]) -> Result<Vec<VerdictDiff>>;
 
 Timeout helper, `src/exec/test.rs`:
@@ -323,6 +333,10 @@ Gate sampling, `src/exec/schema.rs`:
 
 Estimate CLI already accepts `--schema`, `--diff-against`, `--sample`, `--sample-seed`, `--skip-baseline`. Keep those names.
 
+Higher-order evidence in `src/higher_order.rs` exposes serializable `TriageReport` and `SecondOrderReport`. `run --triage --triage-neighbors N` controls survivor experiments. `estimate --second-order-pairs N` controls disjoint pair sampling. `src/exec/test.rs::run_mutant_tests_observed` is the shared execution primitive; `complete_vector=false` retains ordinary fail-fast behavior and `true` executes every selected test.
+
+Persistent evidence in `src/coupling.rs` uses `CouplingRow`, `CouplingArtifact`, and `CouplingSummary`. `coupling::merge_and_save(paths, source_cache_key, rows)` locks, merges, and atomically writes `index/coupling-v1.json`. `report::write_json` retains its original compatibility signature; `report::write_json_with_evidence` adds the optional triage, second-order, and coupling sections used by the CLI.
+
 External tools: rustc 1.97.1, cargo, cargo-nextest, llvm-profdata and llvm-cov from the rustup toolchain (needed only if Stage A is rebuilt). Clone backend: reflink on XFS.
 
 ## Revision note
@@ -330,3 +344,5 @@ External tools: rustc 1.97.1, cargo, cargo-nextest, llvm-profdata and llvm-cov f
 2026-08-27: Created this ExecPlan after the bifrost-core v1 sample and three v2 attempts. Written retroactive and status-heavy because the schema engine already landed; the open work is proving verdicts, not scaffolding. Source of truth for numbers is the JSON files named above, not chat memory.
 
 2026-08-28: Proof completed and closed out. Recorded the diagnosis chain (pool budgets, binary resolution, Stage B corruption), the healed-index baselines (v1f/v2c), the 15-row allow-list, and the user-authorized removal of the v1 execute path. Schemata is the only engine as of this date.
+
+2026-08-30: Extended and completed the plan for survivor triage, pooled second-order estimation, and persistent coupling evidence. Recorded conservative completeness/subsumption rules, source invalidation, cross-process locking, CLI/JSON behavior, and final verification.

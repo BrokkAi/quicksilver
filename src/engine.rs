@@ -200,14 +200,21 @@ pub fn run_schema_detailed(
     } else {
         prepared.plan.clone()
     };
-    crate::exec::schema::execute(
+    let mut exec = crate::exec::schema::execute(
         &prepared.cfg,
         &prepared.paths,
         Arc::clone(&prepared.backend),
         plan,
         cancel,
         limit,
-    )
+    )?;
+    let rows = std::mem::take(&mut exec.coupling_rows);
+    exec.coupling = Some(crate::coupling::merge_and_save(
+        &prepared.paths,
+        &prepared.index.cache_key,
+        rows,
+    )?);
+    Ok(exec)
 }
 
 pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
@@ -276,16 +283,18 @@ pub fn write_outputs(
     cargo_invocations: u64,
     triage: Option<&crate::higher_order::TriageReport>,
     second_order: Option<&crate::higher_order::SecondOrderReport>,
+    coupling: Option<&crate::coupling::CouplingSummary>,
 ) -> Result<()> {
     crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json(
+        crate::report::write_json_with_evidence(
             path,
             outcomes,
             estimate,
             cargo_invocations,
             triage,
             second_order,
+            coupling,
         )?;
     }
     Ok(())

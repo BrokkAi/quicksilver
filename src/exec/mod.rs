@@ -14,6 +14,8 @@ pub struct ExecResult {
     pub cargo_invocations: u64,
     pub triage: Option<crate::higher_order::TriageReport>,
     pub second_order: Option<crate::higher_order::SecondOrderReport>,
+    pub(crate) coupling_rows: Vec<crate::coupling::CouplingRow>,
+    pub coupling: Option<crate::coupling::CouplingSummary>,
 }
 
 pub(crate) fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {

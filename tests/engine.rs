@@ -144,7 +144,7 @@ fn coverage_caught_missed_notcovered_timeout() {
         .cloned()
         .expect("always_ok -> false");
     let (missed, _) =
-        run_schema(&prepared, 0, Some(&[always_false.clone()])).expect("run always_ok");
+        run_schema(&prepared, 0, Some(std::slice::from_ref(&always_false))).expect("run always_ok");
     assert!(
         missed.iter().any(|o| o.kind == VerdictKind::Missed),
         "always_ok -> false is a genuine gap: {:?}",
@@ -160,18 +160,49 @@ fn coverage_caught_missed_notcovered_timeout() {
         Some(&[add0_for_triage(&prepared), always_false.clone()]),
     )
     .expect("triage survivor against add control");
-    let triage = triaged.triage.expect("triage report");
+    let triage = triaged.triage.as_ref().expect("triage report");
     assert_eq!(triage.survivors, 1);
     assert_eq!(triage.experiments.len(), 1);
     assert_eq!(
         triage.experiments[0].classification,
         TriageClassification::LikelyEquivalent
     );
-    let second_order = triaged.second_order.expect("second-order report");
+    let second_order = triaged.second_order.as_ref().expect("second-order report");
     assert_eq!(second_order.requested_pairs, 1);
     assert_eq!(second_order.completed_pairs, 1);
     assert_eq!(second_order.caught_pairs, 1);
     assert_eq!(second_order.implied_first_order_kill_probability, 1.0);
+    let coupling = triaged.coupling.as_ref().expect("coupling summary");
+    assert!(
+        coupling.path.is_file(),
+        "artifact path: {}",
+        coupling.path.display()
+    );
+    assert!(coupling.rows >= 3, "single and pair rows: {coupling:?}");
+    assert!(
+        coupling.complete_rows >= 3,
+        "triage completes all three vectors"
+    );
+    assert!(
+        coupling.test_columns >= 2,
+        "union tests must become columns"
+    );
+    let evidence_json = scratch.path().join("evidence.json");
+    cargo_quicksilver::report::write_json_with_evidence(
+        &evidence_json,
+        &triaged.outcomes,
+        None,
+        triaged.cargo_invocations,
+        triaged.triage.as_ref(),
+        triaged.second_order.as_ref(),
+        triaged.coupling.as_ref(),
+    )
+    .expect("write evidence JSON");
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&fs::read(evidence_json).unwrap()).unwrap();
+    assert!(evidence["triage"].is_object());
+    assert!(evidence["second_order"].is_object());
+    assert!(evidence["coupling"].is_object());
 
     let hang = prepared
         .mutants
