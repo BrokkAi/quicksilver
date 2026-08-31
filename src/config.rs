@@ -88,6 +88,8 @@ pub struct Config {
     pub diff_against: Option<PathBuf>,
     /// Identity-mutant gate sample per schema batch. 0 means every site.
     pub identity_sample: usize,
+    pub triage: bool,
+    pub triage_neighbors: usize,
 }
 
 impl Config {
@@ -214,6 +216,8 @@ pub fn merge_config(
         schema_batch_size: extras.schema_batch_size,
         diff_against: extras.diff_against,
         identity_sample: extras.identity_sample,
+        triage: extras.triage,
+        triage_neighbors: extras.triage_neighbors.max(1),
     })
 }
 
@@ -237,4 +241,6 @@ pub struct ConfigExtras {
     pub schema_batch_size: usize,
     pub diff_against: Option<PathBuf>,
     pub identity_sample: usize,
+    pub triage: bool,
+    pub triage_neighbors: usize,
 }

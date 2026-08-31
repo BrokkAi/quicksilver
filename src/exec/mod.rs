@@ -12,6 +12,7 @@ pub struct ExecResult {
     pub outcomes: Vec<Outcome>,
     /// Real `cargo` invocations, not per-mutant Outcome.build flags.
     pub cargo_invocations: u64,
+    pub triage: Option<crate::higher_order::TriageReport>,
 }
 
 pub(crate) fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {

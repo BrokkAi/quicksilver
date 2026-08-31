@@ -17,17 +17,33 @@ pub const QS_RT_SRC: &str = r#"
 #[allow(dead_code)]
 pub mod __qs_rt {
     use std::sync::LazyLock;
-    static ACTIVE: LazyLock<(u32, u32)> = LazyLock::new(|| {
-        std::env::var("QS_MUTANT").ok().and_then(|s| {
-            let (a, b) = s.split_once(':')?;
-            Some((a.parse().ok()?, b.parse().ok()?))
-        })
-        .unwrap_or((u32::MAX, 0))
+    static ACTIVE: LazyLock<Vec<(u32, u32)>> = LazyLock::new(|| {
+        fn number(s: &str) -> Option<u32> {
+            s.strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .map(|digits| u32::from_str_radix(digits, 16).ok())
+                .unwrap_or_else(|| s.parse().ok())
+        }
+        let mut active: Vec<(u32, u32)> = std::env::var("QS_MUTANT")
+            .ok()
+            .into_iter()
+            .flat_map(|value| {
+                value.split(';').filter_map(|entry| {
+                    let (site, variant) = entry.split_once(':')?;
+                    Some((number(site)?, number(variant)?))
+                }).collect::<Vec<_>>()
+            })
+            .collect();
+        active.sort_unstable_by_key(|&(site, _)| site);
+        active.dedup_by_key(|entry| entry.0);
+        active
     });
     #[inline(always)]
     pub fn active(site: u32) -> Option<u32> {
-        let (s, v) = *ACTIVE;
-        if s == site { Some(v) } else { None }
+        ACTIVE
+            .binary_search_by_key(&site, |&(active, _)| active)
+            .ok()
+            .map(|index| ACTIVE[index].1)
     }
 }
 "#;
@@ -535,7 +551,21 @@ pub fn chunk_sites(sites: Vec<Site>, batch_size: usize) -> Vec<Vec<Site>> {
 }
 
 pub fn qs_mutant_env(site_id: u32, variant: u32) -> (String, String) {
-    ("QS_MUTANT".into(), format!("{site_id}:{variant}"))
+    qs_mutants_env(&[(site_id, variant)])
+}
+
+/// Render one or more active schema variants. Entries are sorted by site id
+/// so pair identities and environment values are reproducible.
+pub fn qs_mutants_env(activations: &[(u32, u32)]) -> (String, String) {
+    let mut activations = activations.to_vec();
+    activations.sort_unstable();
+    activations.dedup_by_key(|entry| entry.0);
+    let value = activations
+        .iter()
+        .map(|(site, variant)| format!("{site}:{variant}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    ("QS_MUTANT".into(), value)
 }
 
 pub fn lookup_variant<'a>(sites: &'a [Site], mutant_id: &str) -> Option<(&'a Site, u32)> {
@@ -616,6 +646,15 @@ mod tests {
             replacement_to_return("{ Default::default() }"),
             "return Default::default()"
         );
+    }
+
+    #[test]
+    fn multi_site_environment_is_sorted_and_deduplicated() {
+        assert_eq!(
+            qs_mutants_env(&[(9, 2), (3, 1), (9, 7)]),
+            ("QS_MUTANT".into(), "3:1;9:2".into())
+        );
+        assert_eq!(qs_mutant_env(3, 1).1, "3:1");
     }
 
     #[test]

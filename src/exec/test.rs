@@ -1,7 +1,7 @@
 use crate::exec::process::{
     run_exact_capture_with_env, run_exact_with_env, RunStatus, LIBTEST_FAILURE_CODE,
 };
-use crate::types::{Outcome, PlannedMutant};
+use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -52,10 +52,19 @@ pub struct RunSpec {
 /// A manifest test joined with the green duration from the plan.
 #[derive(Debug, Clone)]
 struct ResolvedTest {
+    id: String,
     name: String,
     binary: PathBuf,
     cwd: PathBuf,
     duration_secs: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedRun {
+    pub outcome: Outcome,
+    pub observations: Vec<TestObservation>,
+    /// True only when every selected test was executed to a canonical result.
+    pub complete: bool,
 }
 
 /// Confirmations are serialized process-wide. A confirmation costs up to a
@@ -93,6 +102,23 @@ pub fn run_mutant_tests_policy(
     policy: &TestRunPolicy,
     extra_env: &[(String, String)],
 ) -> Result<Outcome> {
+    Ok(
+        run_mutant_tests_observed(planned, run_dir, baseline_root, policy, extra_env, false)?
+            .outcome,
+    )
+}
+
+/// Run selected tests and retain their canonical results. `complete_vector`
+/// keeps going after a kill/error/timeout; ordinary verdict execution passes
+/// false and preserves fail-fast behavior.
+pub fn run_mutant_tests_observed(
+    planned: &PlannedMutant,
+    run_dir: &Path,
+    baseline_root: &Path,
+    policy: &TestRunPolicy,
+    extra_env: &[(String, String)],
+    complete_vector: bool,
+) -> Result<ObservedRun> {
     let tests = resolve_tests(planned, run_dir, baseline_root)?;
     let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, String)> {
         if spec.capture {
@@ -115,7 +141,14 @@ pub fn run_mutant_tests_policy(
             Ok((status, started.elapsed(), String::new()))
         }
     };
-    run_selected_tests(planned, &tests, policy, extra_env, &mut run)
+    run_selected_tests_observed(
+        planned,
+        &tests,
+        policy,
+        extra_env,
+        complete_vector,
+        &mut run,
+    )
 }
 
 fn resolve_tests(
@@ -150,6 +183,7 @@ fn resolve_tests(
     Ok(tests
         .into_iter()
         .map(|t| ResolvedTest {
+            id: t.id.clone(),
             name: t.name.clone(),
             binary: run_dir.join(&t.binary),
             cwd: if t.cwd_rel.is_empty() {
@@ -187,13 +221,14 @@ enum Step {
     Done(Outcome),
 }
 
-fn run_selected_tests<R>(
+fn run_selected_tests_observed<R>(
     planned: &PlannedMutant,
     tests: &[ResolvedTest],
     policy: &TestRunPolicy,
     extra_env: &[(String, String)],
+    complete_vector: bool,
     run: &mut R,
-) -> Result<Outcome>
+) -> Result<ObservedRun>
 where
     R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
 {
@@ -202,21 +237,28 @@ where
     // manifest fallback in `resolve_tests` has already had its turn), so the
     // mutant has to be reported as an error rather than a silent Missed.
     if tests.is_empty() {
-        return Ok(Outcome::errored(
-            planned.mutant.clone(),
-            String::new(),
-            "no tests were staged for this mutant (empty per-test attribution)".into(),
-        ));
+        return Ok(ObservedRun {
+            outcome: Outcome::errored(
+                planned.mutant.clone(),
+                String::new(),
+                "no tests were staged for this mutant (empty per-test attribution)".into(),
+            ),
+            observations: Vec::new(),
+            complete: false,
+        });
     }
     let mut skipped: Vec<InfraSkip> = Vec::new();
+    let mut observations = Vec::new();
+    let mut decisive: Option<Outcome> = None;
     for t in tests {
         let budget = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
         let (first, first_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
         if first == RunStatus::Passed {
+            observations.push(observation(t, TestVerdict::Passed, first_secs));
             continue;
         }
         if !policy.confirm {
-            return Ok(match first {
+            let outcome = match first {
                 RunStatus::Passed => unreachable!(),
                 RunStatus::Failed => Outcome::caught(planned.mutant.clone(), t.name.clone()),
                 RunStatus::Error { code } => Outcome::errored(
@@ -228,7 +270,17 @@ where
                     ),
                 ),
                 RunStatus::Timeout => Outcome::timeout(planned.mutant.clone(), t.name.clone()),
-            });
+            };
+            observations.push(observation(t, verdict_for_outcome(&outcome), first_secs));
+            if !complete_vector {
+                return Ok(ObservedRun {
+                    outcome,
+                    observations,
+                    complete: false,
+                });
+            }
+            decisive.get_or_insert(outcome);
+            continue;
         }
         tracing::info!(
             "confirm {}: first pass {:?} in {:.2}s (budget {:.1}s, green {:.3}s)",
@@ -244,13 +296,37 @@ where
             confirm_failure(planned, t, first, budget, extra_env, run)?
         };
         match step {
-            Step::Next => continue,
-            Step::Skip(s) => skipped.push(s),
-            Step::Done(o) => return Ok(o),
+            Step::Next => observations.push(observation(t, TestVerdict::Passed, first_secs)),
+            Step::Skip(s) => {
+                observations.push(observation(t, TestVerdict::Infrastructure, first_secs));
+                skipped.push(s);
+            }
+            Step::Done(o) => {
+                observations.push(observation(t, verdict_for_outcome(&o), first_secs));
+                if !complete_vector {
+                    return Ok(ObservedRun {
+                        outcome: o,
+                        observations,
+                        complete: false,
+                    });
+                }
+                decisive.get_or_insert(o);
+            }
         }
     }
+    if let Some(outcome) = decisive {
+        return Ok(ObservedRun {
+            outcome,
+            observations,
+            complete: true,
+        });
+    }
     if skipped.is_empty() {
-        return Ok(Outcome::missed(planned.mutant.clone()));
+        return Ok(ObservedRun {
+            outcome: Outcome::missed(planned.mutant.clone()),
+            observations,
+            complete: true,
+        });
     }
     let first = &skipped[0];
     let message = format!(
@@ -261,11 +337,46 @@ where
         first.stderr
     );
     tracing::info!("confirm: {}", message);
-    Ok(Outcome::errored(
-        planned.mutant.clone(),
-        first.test.clone(),
-        message,
-    ))
+    Ok(ObservedRun {
+        outcome: Outcome::errored(planned.mutant.clone(), first.test.clone(), message),
+        observations,
+        complete: true,
+    })
+}
+
+#[cfg(test)]
+fn run_selected_tests<R>(
+    planned: &PlannedMutant,
+    tests: &[ResolvedTest],
+    policy: &TestRunPolicy,
+    extra_env: &[(String, String)],
+    run: &mut R,
+) -> Result<Outcome>
+where
+    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
+{
+    Ok(run_selected_tests_observed(planned, tests, policy, extra_env, false, run)?.outcome)
+}
+
+fn observation(t: &ResolvedTest, verdict: TestVerdict, wall: Duration) -> TestObservation {
+    TestObservation {
+        test_id: t.id.clone(),
+        test_name: t.name.clone(),
+        verdict,
+        wall_secs: wall.as_secs_f64(),
+    }
+}
+
+fn verdict_for_outcome(outcome: &Outcome) -> TestVerdict {
+    match outcome.kind {
+        crate::types::VerdictKind::Caught => TestVerdict::Killed,
+        crate::types::VerdictKind::Timeout => TestVerdict::Timeout,
+        crate::types::VerdictKind::Errored => TestVerdict::Errored,
+        crate::types::VerdictKind::Missed => TestVerdict::Passed,
+        crate::types::VerdictKind::NotCovered | crate::types::VerdictKind::Unviable => {
+            TestVerdict::Infrastructure
+        }
+    }
 }
 
 /// First pass was Failed or Error. Re-run once (flakes are common under a
@@ -559,6 +670,7 @@ mod tests {
         names
             .iter()
             .map(|n| ResolvedTest {
+                id: format!("id-{n}"),
                 name: (*n).into(),
                 binary: PathBuf::from("/bin/true"),
                 cwd: PathBuf::from("/"),

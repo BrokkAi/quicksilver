@@ -1,7 +1,8 @@
 mod support;
 
 use cargo_quicksilver::discover::{discover, mutant_id, DiscoverFilter};
-use cargo_quicksilver::engine::{prepare, run_schema};
+use cargo_quicksilver::engine::{prepare, run_schema, run_schema_detailed};
+use cargo_quicksilver::higher_order::TriageClassification;
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 
@@ -94,7 +95,7 @@ fn coverage_caught_missed_notcovered_timeout() {
     let scratch = tempfile::tempdir().unwrap();
     let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
     cfg.timeout_floor = std::time::Duration::from_millis(800);
-    let prepared = prepare(cfg, false, false).expect("prepare");
+    let mut prepared = prepare(cfg, false, false).expect("prepare");
 
     let covering = prepared.index.tests_covering("crate_a/src/lib.rs", 1, 3);
     assert!(
@@ -142,11 +143,28 @@ fn coverage_caught_missed_notcovered_timeout() {
         .find(|m| m.fqn.contains("always_ok") && m.replacement.contains("false"))
         .cloned()
         .expect("always_ok -> false");
-    let (missed, _) = run_schema(&prepared, 0, Some(&[always_false])).expect("run always_ok");
+    let (missed, _) =
+        run_schema(&prepared, 0, Some(&[always_false.clone()])).expect("run always_ok");
     assert!(
         missed.iter().any(|o| o.kind == VerdictKind::Missed),
         "always_ok -> false is a genuine gap: {:?}",
         missed
+    );
+
+    prepared.cfg.triage = true;
+    prepared.cfg.triage_neighbors = 1;
+    let triaged = run_schema_detailed(
+        &prepared,
+        0,
+        Some(&[add0_for_triage(&prepared), always_false.clone()]),
+    )
+    .expect("triage survivor against add control");
+    let triage = triaged.triage.expect("triage report");
+    assert_eq!(triage.survivors, 1);
+    assert_eq!(triage.experiments.len(), 1);
+    assert_eq!(
+        triage.experiments[0].classification,
+        TriageClassification::LikelyEquivalent
     );
 
     let hang = prepared
@@ -162,6 +180,17 @@ fn coverage_caught_missed_notcovered_timeout() {
         "maybe_hang -> true should timeout (Caught as Timeout): {:?}",
         to
     );
+}
+
+fn add0_for_triage(
+    prepared: &cargo_quicksilver::engine::Prepared,
+) -> cargo_quicksilver::types::Mutant {
+    prepared
+        .mutants
+        .iter()
+        .find(|m| m.fqn.contains("add") && m.replacement.contains('0'))
+        .cloned()
+        .expect("add -> 0")
 }
 
 #[test]

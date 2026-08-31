@@ -179,6 +179,15 @@ pub fn run_schema(
     limit: usize,
     sample: Option<&[Mutant]>,
 ) -> Result<(Vec<Outcome>, u64)> {
+    let exec = run_schema_detailed(prepared, limit, sample)?;
+    Ok((exec.outcomes, exec.cargo_invocations))
+}
+
+pub fn run_schema_detailed(
+    prepared: &Prepared,
+    limit: usize,
+    sample: Option<&[Mutant]>,
+) -> Result<crate::exec::ExecResult> {
     let cancel = install_ctrlc();
     let plan = if let Some(sample) = sample {
         plan::plan(
@@ -191,15 +200,14 @@ pub fn run_schema(
     } else {
         prepared.plan.clone()
     };
-    let exec = crate::exec::schema::execute(
+    crate::exec::schema::execute(
         &prepared.cfg,
         &prepared.paths,
         Arc::clone(&prepared.backend),
         plan,
         cancel,
         limit,
-    )?;
-    Ok((exec.outcomes, exec.cargo_invocations))
+    )
 }
 
 pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
@@ -266,10 +274,11 @@ pub fn write_outputs(
     outcomes: &[Outcome],
     estimate: Option<&EstimateReport>,
     cargo_invocations: u64,
+    triage: Option<&crate::higher_order::TriageReport>,
 ) -> Result<()> {
     crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json(path, outcomes, estimate, cargo_invocations)?;
+        crate::report::write_json(path, outcomes, estimate, cargo_invocations, triage)?;
     }
     Ok(())
 }

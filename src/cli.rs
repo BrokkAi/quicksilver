@@ -176,6 +176,12 @@ pub struct RunArgs {
     /// 0 means every site in the batch.
     #[arg(long, default_value_t = 8)]
     pub identity_sample: usize,
+    /// Run higher-order survivor triage after first-order verdicts.
+    #[arg(long)]
+    pub triage: bool,
+    /// Nearby caught controls to combine with each survivor.
+    #[arg(long, default_value_t = 1, requires = "triage")]
+    pub triage_neighbors: usize,
 }
 
 #[derive(Args, Debug)]

@@ -13,6 +13,8 @@ pub struct JsonReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<EstimateReport>,
     pub counts: CountReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage: Option<crate::higher_order::TriageReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,16 +96,38 @@ pub fn write_json(
     outcomes: &[Outcome],
     estimate: Option<&EstimateReport>,
     cargo_invocations: u64,
+    triage: Option<&crate::higher_order::TriageReport>,
 ) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
     let mut report = JsonReport {
         outcomes: outcomes.to_vec(),
         estimate: estimate.cloned(),
         counts: CountReport::from(&counts),
+        triage: triage.cloned(),
     };
     report.counts.cargo_invocations = cargo_invocations;
     crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     Ok(())
+}
+
+pub fn print_triage(report: &crate::higher_order::TriageReport) {
+    eprintln!("=== cargo-quicksilver survivor triage ===");
+    eprintln!(
+        "survivors: {}  experiments: {}",
+        report.survivors,
+        report.experiments.len()
+    );
+    for finding in &report.experiments {
+        eprintln!(
+            "  {} + {}  {:?}  kills survivor/control/pair={}/{}/{}",
+            finding.survivor_id,
+            finding.control_id,
+            finding.classification,
+            finding.survivor.killed_test_ids.len(),
+            finding.control.killed_test_ids.len(),
+            finding.pair.killed_test_ids.len()
+        );
+    }
 }
 
 pub fn print_exhaustive(outcomes: &[Outcome]) {

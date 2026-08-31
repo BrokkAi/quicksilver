@@ -6,6 +6,7 @@ pub mod discover;
 pub mod engine;
 pub mod estimate;
 pub mod exec;
+pub mod higher_order;
 pub mod index;
 pub mod outcome;
 pub mod plan;
@@ -85,13 +86,20 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
         schema_batch_size: args.schema_batch_size,
         diff_against: args.diff_against.clone(),
         identity_sample: args.identity_sample,
+        triage: args.triage,
+        triage_neighbors: args.triage_neighbors,
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let prepared = engine::prepare(cfg, args.skip_baseline, false)?;
     let _ = engine::maybe_preflight(&prepared)?;
-    let (outcomes, cargo_invocations) = engine::run_schema(&prepared, args.limit, None)?;
+    let exec = engine::run_schema_detailed(&prepared, args.limit, None)?;
+    let outcomes = &exec.outcomes;
+    let cargo_invocations = exec.cargo_invocations;
     crate::report::print_exhaustive(&outcomes);
+    if let Some(triage) = &exec.triage {
+        crate::report::print_triage(triage);
+    }
     if let Some(path) = &prepared.cfg.diff_against {
         let diffs = crate::schema::gate_differential(path, &outcomes)?;
         if !diffs.is_empty() {
@@ -102,7 +110,13 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
                     d.mutant_id, d.fqn, d.v1, d.v2
                 );
             }
-            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+            engine::write_outputs(
+                &prepared.cfg,
+                outcomes,
+                None,
+                cargo_invocations,
+                exec.triage.as_ref(),
+            )?;
             return Ok(2);
         }
         eprintln!(
@@ -110,7 +124,13 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
             outcomes.len()
         );
     }
-    engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+    engine::write_outputs(
+        &prepared.cfg,
+        outcomes,
+        None,
+        cargo_invocations,
+        exec.triage.as_ref(),
+    )?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
 }
@@ -233,7 +253,7 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
                     d.mutant_id, d.fqn, d.v1, d.v2
                 );
             }
-            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations)?;
+            engine::write_outputs(&prepared.cfg, &outcomes, None, cargo_invocations, None)?;
             return Ok(2);
         }
         eprintln!(
@@ -244,7 +264,13 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
     let mut report = engine::estimate_from(&prepared, &sample, &outcomes);
     report.sample_counts.cargo_invocations = cargo_invocations as usize;
     print!("{}", estimate::render(&report));
-    engine::write_outputs(&prepared.cfg, &outcomes, Some(&report), cargo_invocations)?;
+    engine::write_outputs(
+        &prepared.cfg,
+        &outcomes,
+        Some(&report),
+        cargo_invocations,
+        None,
+    )?;
     Ok(0)
 }
 

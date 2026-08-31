@@ -109,5 +109,7 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         schema_batch_size: 0,
         diff_against: None,
         identity_sample: 0,
+        triage: false,
+        triage_neighbors: 1,
     }
 }

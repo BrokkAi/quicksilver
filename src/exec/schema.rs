@@ -4,15 +4,18 @@ use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, C
 use crate::config::Config;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
-    run_mutant_tests_policy, run_mutant_tests_with_env, BinariesManifest, ManifestTest,
-    TestRunPolicy,
+    run_mutant_tests_observed, run_mutant_tests_policy, run_mutant_tests_with_env,
+    BinariesManifest, ManifestTest, TestRunPolicy,
 };
 use crate::exec::{append_outcome, load_resume, ExecResult};
+use crate::higher_order::{
+    choose_triage_pairs, classify_triage, union_tests, RunnableMutant, TriageFinding, TriageReport,
+};
 use crate::plan::Plan;
 use crate::schema::{
     apply_schema_to_tree, attribute_spans, build_sites, chunk_sites, disable_attributed,
     disable_sites, inject_runtime, lookup_variant, parse_compiler_error_spans, qs_mutant_env,
-    restore_files, snapshot_sources, Site,
+    qs_mutants_env, restore_files, snapshot_sources, Site,
 };
 use crate::scratch::{ensure_worker, CloneBackend};
 use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo, VerdictKind};
@@ -27,10 +30,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{info, warn};
 
+#[derive(Clone)]
 struct SchemaReady {
     planned: PlannedMutant,
     run_dir: PathBuf,
     env: Vec<(String, String)>,
+    site_id: u32,
+    variant: u32,
 }
 
 pub fn execute(
@@ -77,6 +83,7 @@ pub fn execute(
     }
 
     let cargo_invocations = Arc::new(AtomicU64::new(0));
+    let runnable = Arc::new(Mutex::new(Vec::<RunnableMutant>::new()));
     let jobs: Vec<(String, Vec<PlannedMutant>)> = by_pkg.into_iter().collect();
     let n_mutants: usize = jobs.iter().map(|(_, v)| v.len()).sum();
     info!(
@@ -110,6 +117,7 @@ pub fn execute(
             let paths = Arc::clone(&paths);
             let cancel = Arc::clone(&cancel);
             let cargo_invocations = Arc::clone(&cargo_invocations);
+            let runnable = Arc::clone(&runnable);
             scope.spawn(move || {
                 let mut worker: Option<PathBuf> = None;
                 while let Ok((package, planned)) = job_rx.recv() {
@@ -151,6 +159,12 @@ pub fn execute(
                                 }
                             }
                             for r in ready {
+                                runnable.lock().unwrap().push(RunnableMutant {
+                                    planned: r.planned.clone(),
+                                    run_dir: r.run_dir.clone(),
+                                    site_id: r.site_id,
+                                    variant: r.variant,
+                                });
                                 if ready_tx.send(r).is_err() {
                                     return;
                                 }
@@ -223,11 +237,22 @@ pub fn execute(
     });
 
     pb.finish_and_clear();
+    let triage = if cfg.triage {
+        Some(run_triage(
+            &cfg,
+            &paths.baseline,
+            &outcomes,
+            &runnable.lock().unwrap(),
+        )?)
+    } else {
+        None
+    };
     let _ = fs::remove_dir_all(paths.runs.join("schema"));
 
     Ok(ExecResult {
         cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
         outcomes,
+        triage,
     })
 }
 
@@ -235,6 +260,100 @@ struct CrateDone {
     unviable: Vec<Outcome>,
     ready: Vec<SchemaReady>,
     keep: Vec<PathBuf>,
+}
+
+fn run_triage(
+    cfg: &Config,
+    baseline: &Path,
+    outcomes: &[Outcome],
+    runnable: &[RunnableMutant],
+) -> Result<TriageReport> {
+    let pairs = choose_triage_pairs(runnable, outcomes, cfg.triage_neighbors);
+    let survivors = outcomes
+        .iter()
+        .filter(|outcome| outcome.kind == VerdictKind::Missed)
+        .count();
+    info!(
+        "triage: {} survivor(s), {} survivor/control experiment(s)",
+        survivors,
+        pairs.len()
+    );
+    let policy = TestRunPolicy {
+        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+        slowdown: SCHEMA_SLOWDOWN,
+        confirm: true,
+    };
+    let mut experiments = Vec::new();
+    for pair in pairs {
+        let tests = union_tests(&pair.survivor.planned, &pair.control.planned);
+        let survivor_plan = PlannedMutant {
+            mutant: pair.survivor.planned.mutant.clone(),
+            tests: tests.clone(),
+            estimated_cost_secs: 0.0,
+        };
+        let control_plan = PlannedMutant {
+            mutant: pair.control.planned.mutant.clone(),
+            tests: tests.clone(),
+            estimated_cost_secs: 0.0,
+        };
+        let pair_plan = PlannedMutant {
+            mutant: pair.survivor.planned.mutant.clone(),
+            tests,
+            estimated_cost_secs: 0.0,
+        };
+        let survivor_env = vec![qs_mutant_env(pair.survivor.site_id, pair.survivor.variant)];
+        let control_env = vec![qs_mutant_env(pair.control.site_id, pair.control.variant)];
+        let pair_env = vec![qs_mutants_env(&[
+            (pair.survivor.site_id, pair.survivor.variant),
+            (pair.control.site_id, pair.control.variant),
+        ])];
+        let survivor_run = run_mutant_tests_observed(
+            &survivor_plan,
+            &pair.survivor.run_dir,
+            baseline,
+            &policy,
+            &survivor_env,
+            true,
+        )?;
+        let control_run = run_mutant_tests_observed(
+            &control_plan,
+            &pair.control.run_dir,
+            baseline,
+            &policy,
+            &control_env,
+            true,
+        )?;
+        let pair_run = run_mutant_tests_observed(
+            &pair_plan,
+            &pair.survivor.run_dir,
+            baseline,
+            &policy,
+            &pair_env,
+            true,
+        )?;
+        let (classification, survivor, control, pair_summary) = classify_triage(
+            &survivor_run.observations,
+            survivor_run.complete,
+            &control_run.observations,
+            control_run.complete,
+            &pair_run.observations,
+            pair_run.complete,
+        );
+        experiments.push(TriageFinding {
+            survivor_id: pair.survivor.planned.mutant.id.clone(),
+            survivor_fqn: pair.survivor.planned.mutant.fqn.clone(),
+            control_id: pair.control.planned.mutant.id.clone(),
+            control_fqn: pair.control.planned.mutant.fqn.clone(),
+            classification,
+            survivor,
+            control,
+            pair: pair_summary,
+        });
+    }
+    Ok(TriageReport {
+        survivors,
+        experiments,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -347,6 +466,8 @@ fn run_crate(
                     planned: p.clone(),
                     run_dir: run_dir.clone(),
                     env: vec![qs_mutant_env(site.site_id, variant)],
+                    site_id: site.site_id,
+                    variant,
                 });
             }
         }

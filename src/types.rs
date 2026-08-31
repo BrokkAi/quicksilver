@@ -82,6 +82,27 @@ pub struct Outcome {
     pub build: bool,
 }
 
+/// Canonical result of one selected test under one mutant activation. A
+/// libtest assertion failure is `Killed`; other process failures stay
+/// distinct so they cannot inflate mutation evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestVerdict {
+    Passed,
+    Killed,
+    Errored,
+    Timeout,
+    Infrastructure,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TestObservation {
+    pub test_id: String,
+    pub test_name: String,
+    pub verdict: TestVerdict,
+    pub wall_secs: f64,
+}
+
 impl Outcome {
     pub fn not_covered(mutant: Mutant) -> Self {
         Self {
