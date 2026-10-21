@@ -45,3 +45,8 @@ wait-timeout = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Match brokk-bifrost's dev profile so Bifrost and its dependencies hit the
+# shared mbx build cache.
+[profile.dev]
+debug = "line-tables-only"
