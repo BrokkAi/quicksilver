@@ -6,11 +6,16 @@
 #
 # Usage: run_bench.sh QS_BIN SUBJECT_URL SUBJECT_SHA OUT_DIR [MODES]
 #   MODES: space-separated subset of
-#          "cm-fn cm-all qs-coverage qs-sites qs-static replay"
+#          "cm-fn cm-fn-ws cm-all qs-coverage qs-sites qs-static replay"
+#          cm-fn-ws is cm-fn with --test-workspace=true: every workspace test
+#          for every mutant, the like-for-like test set for QS, which runs
+#          the tests of every package that depends on the mutated one.
 #   QS_BIN may be "-" when no QS mode runs (cargo-mutants legs only).
 # Env:   CM_JOBS (default 8), QS_BUILD_JOBS (4), QS_TEST_JOBS (nproc),
 #        REPLAY_COMMITS (10), QS_SELECTIONS ("sites") for the replay,
 #        REPLAY_TOOLS ("cm qs"): which tools the replay runs.
+#        CM_ARGS: extra cargo-mutants arguments for every cm run, e.g.
+#        "--workspace" when the root package is a thin front end.
 set -euo pipefail
 
 QS="${1:?QS_BIN}"; URL="${2:?SUBJECT_URL}"; SHA="${3:?SUBJECT_SHA}"; OUT="${4:?OUT_DIR}"
@@ -21,6 +26,7 @@ QS_TEST_JOBS="${QS_TEST_JOBS:-$(nproc)}"
 REPLAY_COMMITS="${REPLAY_COMMITS:-10}"
 QS_SELECTIONS="${QS_SELECTIONS:-sites}"
 REPLAY_TOOLS="${REPLAY_TOOLS:-cm qs}"
+read -r -a CM_EXTRA <<< "${CM_ARGS:-}"
 want() { [[ " $REPLAY_TOOLS " == *" $1 "* ]]; }
 # cargo-mutants FnValue only: everything except operator, match-guard and
 # match-arm mutants. Operator tokens contain no letters.
@@ -51,12 +57,17 @@ for mode in $MODES; do
   case "$mode" in
     cm-fn)
       fresh_copy "$WORK/cm-fn"
-      (cd "$WORK/cm-fn" && record cm-fn cargo mutants --test-tool nextest -j "$CM_JOBS" \
+      (cd "$WORK/cm-fn" && record cm-fn cargo mutants "${CM_EXTRA[@]}" --test-tool nextest -j "$CM_JOBS" \
         --exclude-re "$FN_ONLY" -o "$OUT/cm-fn")
+      ;;
+    cm-fn-ws)
+      fresh_copy "$WORK/cm-fn-ws"
+      (cd "$WORK/cm-fn-ws" && record cm-fn-ws cargo mutants "${CM_EXTRA[@]}" --test-workspace=true \
+        --test-tool nextest -j "$CM_JOBS" --exclude-re "$FN_ONLY" -o "$OUT/cm-fn-ws")
       ;;
     cm-all)
       fresh_copy "$WORK/cm-all"
-      (cd "$WORK/cm-all" && record cm-all cargo mutants -j "$CM_JOBS" -o "$OUT/cm-all")
+      (cd "$WORK/cm-all" && record cm-all cargo mutants "${CM_EXTRA[@]}" -j "$CM_JOBS" -o "$OUT/cm-all")
       ;;
     qs-coverage|qs-sites|qs-static)
       sel="${mode#qs-}"
@@ -76,7 +87,7 @@ for mode in $MODES; do
         while read -r c; do
           git -C "$WORK/replay-pick" checkout -q --detach "$c"
           git -C "$SRC" diff "$c^" "$c" > "$WORK/pick.diff"
-          n="$(cd "$WORK/replay-pick" && cargo mutants --list --in-diff "$WORK/pick.diff" \
+          n="$(cd "$WORK/replay-pick" && cargo mutants "${CM_EXTRA[@]}" --list --in-diff "$WORK/pick.diff" \
                  --exclude-re "$FN_ONLY" 2>/dev/null | grep -c . || true)"
           echo "$c $n" >> "$OUT/replay-pick.txt"
           [[ "$n" -gt 0 ]] && picked+=("$c")
@@ -95,7 +106,7 @@ for mode in $MODES; do
         git -C "$SRC" diff "$c^" "$c" > "$OUT/replay-$short.diff"
         if want cm; then
           fresh_copy "$WORK/replay-cm"; git -C "$WORK/replay-cm" checkout -q --detach "$c"
-          (cd "$WORK/replay-cm" && record "replay-cm-$short" cargo mutants --test-tool nextest \
+          (cd "$WORK/replay-cm" && record "replay-cm-$short" cargo mutants "${CM_EXTRA[@]}" --test-tool nextest \
             -j "$CM_JOBS" --exclude-re "$FN_ONLY" --in-diff "$OUT/replay-$short.diff" -o "$OUT/replay-cm-$short")
         fi
         for sel in $QS_SELECTIONS; do
