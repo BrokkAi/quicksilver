@@ -146,6 +146,10 @@ impl Graph {
 
 pub struct ReachIndex {
     graph: Graph,
+    /// nextest tests no test-context graph node maps to (macro-generated
+    /// tests, for example). Static analysis cannot rule them out, so every
+    /// selection that could include them does.
+    unmapped: HashSet<u32>,
     /// (path, primary range start byte) -> node. Discovery uses the same
     /// primary range, so a mutant maps by exact position, not by name.
     by_site: HashMap<(String, usize), u32>,
@@ -352,8 +356,12 @@ impl ReachIndex {
         stats.nextest_tests = tests.len();
         stats.unmapped_tests = unmapped.len();
         stats.unmapped_test_examples = unmapped.iter().take(20).map(|t| t.id.clone()).collect();
+        let unmapped_set: HashSet<u32> = (0..tests.len() as u32)
+            .filter(|i| !mapped.contains(i))
+            .collect();
         Self {
             graph,
+            unmapped: unmapped_set,
             by_site,
             by_fqn,
             tests_of_node,
@@ -427,6 +435,105 @@ impl ReachIndex {
             reached_functions: walk.reached,
             fallback_reason: walk.incomplete,
         }
+    }
+}
+
+/// `--test-selection static`: a complete walk gives the mutant's tests plus
+/// the unmapped tests of its candidate packages; an incomplete walk falls
+/// back to every candidate test, the same set `sites` mode starts from.
+pub struct StaticSelector {
+    fallback: crate::plan::PackageSelector,
+    by_mutant: HashMap<String, Option<Vec<TestInfo>>>,
+    pub summary: StaticSummary,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StaticSummary {
+    pub mutants: usize,
+    pub complete: usize,
+    pub fallback: usize,
+    pub not_covered: usize,
+    pub mean_selected: f64,
+    pub mean_candidates: f64,
+    pub graph_secs: f64,
+    pub fallback_reasons: Vec<(String, usize)>,
+}
+
+impl StaticSelector {
+    pub fn build(
+        reach: &ReachIndex,
+        mutants: &[Mutant],
+        fallback: crate::plan::PackageSelector,
+    ) -> Self {
+        use crate::plan::TestSelector;
+        let mut by_mutant = HashMap::new();
+        let mut summary = StaticSummary {
+            mutants: mutants.len(),
+            graph_secs: reach.stats.graph_secs,
+            ..StaticSummary::default()
+        };
+        let mut reasons: HashMap<String, usize> = HashMap::new();
+        let (mut selected_total, mut candidate_total) = (0usize, 0usize);
+        for m in mutants {
+            let candidates = fallback.tests_for(m);
+            candidate_total += candidates.len();
+            let sel = reach.select(m);
+            if !sel.complete {
+                summary.fallback += 1;
+                selected_total += candidates.len();
+                let why = sel.fallback_reason.unwrap_or_default();
+                let key = why.split(" (").next().unwrap_or(&why).to_string();
+                *reasons.entry(key).or_default() += 1;
+                by_mutant.insert(m.id.clone(), None);
+                continue;
+            }
+            summary.complete += 1;
+            let mut ids: HashSet<String> = sel.tests.iter().map(|t| t.id.clone()).collect();
+            let unmapped: HashSet<&str> = reach
+                .unmapped
+                .iter()
+                .filter_map(|&i| reach.tests.get(i as usize).map(|t| t.id.as_str()))
+                .collect();
+            for t in &candidates {
+                if unmapped.contains(t.id.as_str()) {
+                    ids.insert(t.id.clone());
+                }
+            }
+            let chosen: Vec<TestInfo> = candidates
+                .into_iter()
+                .filter(|t| ids.contains(&t.id))
+                .collect();
+            summary.not_covered += usize::from(chosen.is_empty());
+            selected_total += chosen.len();
+            by_mutant.insert(m.id.clone(), Some(chosen));
+        }
+        let n = mutants.len().max(1) as f64;
+        summary.mean_selected = selected_total as f64 / n;
+        summary.mean_candidates = candidate_total as f64 / n;
+        let mut reasons: Vec<(String, usize)> = reasons.into_iter().collect();
+        reasons.sort_by_key(|r| std::cmp::Reverse(r.1));
+        reasons.truncate(8);
+        summary.fallback_reasons = reasons;
+        Self {
+            fallback,
+            by_mutant,
+            summary,
+        }
+    }
+}
+
+impl crate::plan::TestSelector for StaticSelector {
+    fn covers(&self, m: &Mutant) -> bool {
+        !self.tests_for(m).is_empty()
+    }
+    fn tests_for(&self, m: &Mutant) -> Vec<TestInfo> {
+        match self.by_mutant.get(&m.id) {
+            Some(Some(tests)) => tests.clone(),
+            _ => self.fallback.tests_for(m),
+        }
+    }
+    fn catalog(&self) -> &[TestInfo] {
+        self.fallback.catalog()
     }
 }
 

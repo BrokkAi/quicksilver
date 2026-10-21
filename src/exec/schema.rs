@@ -971,6 +971,14 @@ fn mutant_pool_policy(cfg: &Config) -> TestRunPolicy {
             slowdown: SCHEMA_SLOWDOWN,
             confirm: true,
         },
+        // Static selection runs no test before mutants, so durations come
+        // from the baseline binary as in coverage mode; the floor is lower
+        // because the confirmation re-run still guards against a slow host.
+        TestSelection::Static => TestRunPolicy {
+            floor: cfg.timeout_floor.max(Duration::from_secs(10)),
+            slowdown: SCHEMA_SLOWDOWN,
+            confirm: true,
+        },
     }
 }
 
