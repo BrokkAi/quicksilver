@@ -160,6 +160,10 @@ pub fn run_mutant_tests_observed(
 pub struct SiteRecording {
     /// Test id (name when the manifest has no id) -> site ids it entered.
     pub sites_by_test: std::collections::HashMap<String, std::collections::BTreeSet<u32>>,
+    /// Test id (or name) -> wall seconds of its green run under the schema
+    /// binary. Mutant budgets in sites mode come from this, not from the
+    /// baseline binary's timing times a guessed schema slowdown.
+    pub secs_by_test: std::collections::HashMap<String, f64>,
     /// Tests that did not pass with no mutant active. They select nothing:
     /// the schema binary cannot judge a mutant with a test that is not green.
     pub not_green: Vec<(String, String)>,
@@ -167,6 +171,13 @@ pub struct SiteRecording {
 }
 
 impl SiteRecording {
+    pub fn recorded_secs(&self, test: &crate::types::TestInfo) -> Option<f64> {
+        [test.id.as_str(), test.name.as_str()]
+            .iter()
+            .filter(|key| !key.is_empty())
+            .find_map(|key| self.secs_by_test.get(*key).copied())
+    }
+
     pub fn entered(&self, test: &crate::types::TestInfo, site: u32) -> bool {
         [test.id.as_str(), test.name.as_str()]
             .iter()
@@ -180,7 +191,10 @@ impl SiteRecording {
 }
 
 /// One test's recorded sites, or why it selects nothing.
-type RecordResult = (String, Result<std::collections::BTreeSet<u32>, String>);
+type RecordResult = (
+    String,
+    Result<(std::collections::BTreeSet<u32>, f64), String>,
+);
 
 pub fn record_site_hits(
     planned_union: &PlannedMutant,
@@ -217,7 +231,8 @@ pub fn record_site_hits(
     };
     for (key, result) in results.into_inner().unwrap() {
         match result {
-            Ok(sites) => {
+            Ok((sites, secs)) => {
+                recording.secs_by_test.insert(key.clone(), secs);
                 recording.sites_by_test.insert(key, sites);
             }
             Err(why) => recording.not_green.push((key, why)),
@@ -232,7 +247,7 @@ fn record_one(
     index: usize,
     dir: &Path,
     policy: &TestRunPolicy,
-) -> Result<std::collections::BTreeSet<u32>, String> {
+) -> Result<(std::collections::BTreeSet<u32>, f64), String> {
     let path = dir.join(format!("{index:06}.txt"));
     fs::write(&path, b"").map_err(|err| format!("create {}: {err}", path.display()))?;
     let timeout = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
@@ -240,8 +255,10 @@ fn record_one(
         "QS_RECORD_SITES".to_string(),
         path.to_string_lossy().into_owned(),
     )];
+    let started = Instant::now();
     let status = run_exact_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
         .map_err(|err| format!("{err:#}"))?;
+    let secs = started.elapsed().as_secs_f64();
     match status {
         RunStatus::Passed => {}
         RunStatus::Failed => return Err("failed with no mutant active".into()),
@@ -250,7 +267,10 @@ fn record_one(
     }
     let text =
         fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
-    Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    Ok((
+        text.lines().filter_map(|l| l.trim().parse().ok()).collect(),
+        secs,
+    ))
 }
 
 fn resolve_tests(
@@ -586,9 +606,14 @@ fn confirm_timeout<R>(
 where
     R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
 {
-    let _guard = confirm_lock();
+    // Only the calibration can take minutes; the re-run that follows is
+    // budgeted from it, so it runs without the lock. Holding the lock across
+    // both made N hanging mutants cost N full re-runs in series.
     let calibration = policy.floor.max(Duration::from_secs(120));
-    let (null, null_secs, null_err) = run(&spec_for(t, calibration, &[], true))?;
+    let (null, null_secs, null_err) = {
+        let _guard = confirm_lock();
+        run(&spec_for(t, calibration, &[], true))?
+    };
     tracing::info!(
         "confirm {}: null calibration {:?} in {:.2}s (budget {:.1}s)",
         t.name,

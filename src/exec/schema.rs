@@ -201,11 +201,7 @@ pub fn execute(
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    let policy = TestRunPolicy {
-                        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
-                        slowdown: SCHEMA_SLOWDOWN,
-                        confirm: true,
-                    };
+                    let policy = mutant_pool_policy(&cfg);
                     let observed = run_mutant_tests_observed(
                         &ready.planned,
                         &ready.run_dir,
@@ -629,6 +625,11 @@ fn run_crate(
                     selected
                         .tests
                         .retain(|t| recording.entered(t, site.site_id));
+                    for t in &mut selected.tests {
+                        if let Some(secs) = recording.recorded_secs(t) {
+                            t.duration_secs = secs;
+                        }
+                    }
                     if selected.tests.is_empty() {
                         unviable.push(Outcome::not_covered(p.mutant.clone()));
                         continue;
@@ -932,6 +933,27 @@ const NULL_GATE_TESTS: usize = 8;
 /// Schema binaries carry a per-call dispatch check in every instrumented
 /// function, so 3× the green duration is not enough budget.
 const SCHEMA_SLOWDOWN: f64 = 3.0;
+
+/// Budget for mutant runs. Coverage selection only has green durations from
+/// the baseline binary, so it pads them for the schema binary and keeps a
+/// 30 s floor. Sites selection timed every selected test under this schema
+/// binary with no mutant active, so 3x that time over the ordinary floor is
+/// enough; the 30 s floor made each hanging mutant cost 30 s per run on tests
+/// that take milliseconds.
+fn mutant_pool_policy(cfg: &Config) -> TestRunPolicy {
+    match cfg.test_selection {
+        TestSelection::Sites => TestRunPolicy {
+            floor: cfg.timeout_floor,
+            slowdown: 1.0,
+            confirm: true,
+        },
+        TestSelection::Coverage => TestRunPolicy {
+            floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+            slowdown: SCHEMA_SLOWDOWN,
+            confirm: true,
+        },
+    }
+}
 
 fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
     tests.sort_by(|a, b| {
