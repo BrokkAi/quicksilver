@@ -564,18 +564,22 @@ where
             RunStatus::Error { code } => code,
             _ => status_code(retry),
         };
+        // A deterministic crash (stack overflow, abort, OOM kill, a nonzero
+        // non-101 exit) under the mutant, on the same schema binary that
+        // passes without it, is a test detecting the mutant.
         let message = format!(
-            "test {} exited {:?} (libtest failures are 101; this is not Caught); stderr: {}",
+            "{} ({}) and passes without it; test {}; stderr: {}",
+            crate::types::CRASH_PREFIX,
+            crate::types::describe_exit(code),
             t.name,
-            code,
             tail(&retry_err, MESSAGE_TAIL)
         );
         tracing::info!(
-            "confirm {}: ERRORED under mutant, passes without: {}",
+            "confirm {}: CAUGHT by crash ({}), passes without",
             t.name,
-            message
+            crate::types::describe_exit(code)
         );
-        return Ok(Step::Done(Outcome::errored(
+        return Ok(Step::Done(Outcome::caught_by_crash(
             planned.mutant.clone(),
             t.name.clone(),
             message,
@@ -672,11 +676,17 @@ where
         }
         RunStatus::Error { code } => {
             let message = format!(
-                "test {} exited {:?} (libtest failures are 101; this is not Caught)",
-                t.name, code
+                "{} ({}) on the calibrated re-run; it passed without the mutant in {:.2}s; test {}",
+                crate::types::CRASH_PREFIX,
+                crate::types::describe_exit(code),
+                null_secs.as_secs_f64(),
+                t.name
             );
-            tracing::info!("confirm {}: ERRORED on the calibrated re-run", t.name);
-            Ok(Step::Done(Outcome::errored(
+            tracing::info!(
+                "confirm {}: CAUGHT by crash on the calibrated re-run",
+                t.name
+            );
+            Ok(Step::Done(Outcome::caught_by_crash(
                 planned.mutant.clone(),
                 t.name.clone(),
                 message,
@@ -992,6 +1002,27 @@ mod tests {
     }
 
     #[test]
+    fn confirm_timeout_then_crash_on_the_rerun_is_caught_by_crash() {
+        // A runaway mutant: the first pass times out, the test passes with no
+        // mutant, and the calibrated re-run is killed (an OOM kill shows up
+        // as a signal, code None).
+        let (outcome, seen) = drive(
+            true,
+            &fake_tests(&["t1"]),
+            &[
+                (RunStatus::Timeout, 30.0, ""),
+                (RunStatus::Passed, 0.5, ""),
+                (RunStatus::Error { code: None }, 4.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        let msg = outcome.message.unwrap();
+        assert!(msg.starts_with(crate::types::CRASH_PREFIX), "{msg}");
+        assert!(msg.contains("killed by a signal"), "{msg}");
+        assert_eq!(seen.len(), 3);
+    }
+
+    #[test]
     fn confirm_timeout_with_null_timeout_is_infra_skip() {
         let (outcome, seen) = drive(
             true,
@@ -1026,7 +1057,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_error_twice_then_null_pass_reports_stderr() {
+    fn confirm_crash_twice_then_null_pass_is_caught_by_crash() {
         let (outcome, _) = drive(
             true,
             &fake_tests(&["t1"]),
@@ -1040,9 +1071,10 @@ mod tests {
                 (RunStatus::Passed, 0.5, ""),
             ],
         );
-        assert_eq!(outcome.kind, VerdictKind::Errored);
+        assert_eq!(outcome.kind, VerdictKind::Caught);
         let msg = outcome.message.unwrap();
-        assert!(msg.contains("exited Some(1)"), "{msg}");
+        assert!(msg.starts_with(crate::types::CRASH_PREFIX), "{msg}");
+        assert!(msg.contains("(exit 1)"), "{msg}");
         assert!(
             msg.contains("stderr: error while loading shared libraries"),
             "{msg}"

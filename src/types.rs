@@ -124,6 +124,20 @@ impl Outcome {
         }
     }
 
+    /// Caught by a test that crashed (a signal, or an exit other than 0 and
+    /// libtest's 101) with the mutant active, crashed again on retry, and
+    /// passed with no mutant active. The message starts with
+    /// [`CRASH_PREFIX`] so reports can count crash kills separately.
+    pub fn caught_by_crash(mutant: Mutant, test: String, message: String) -> Self {
+        Self {
+            mutant,
+            kind: VerdictKind::Caught,
+            test: Some(test),
+            message: Some(message),
+            build: true,
+        }
+    }
+
     pub fn missed(mutant: Mutant) -> Self {
         Self {
             mutant,
@@ -173,6 +187,17 @@ impl Outcome {
             message: Some(message),
             build: true,
         }
+    }
+}
+
+/// Prefix of a [`Outcome::caught_by_crash`] message.
+pub const CRASH_PREFIX: &str = "crashed under the mutant";
+
+/// "exit 3" or "killed by a signal" for a non-libtest test failure.
+pub fn describe_exit(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!("exit {c}"),
+        None => "killed by a signal".into(),
     }
 }
 

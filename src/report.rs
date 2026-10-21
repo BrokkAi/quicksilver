@@ -54,9 +54,10 @@ impl From<&OutcomeCounts> for CountReport {
 pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
     let c = OutcomeCounts::from_outcomes(outcomes);
     eprintln!(
-        "outcomes: {} total — {} caught, {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
+        "outcomes: {} total — {} caught ({} by crash), {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
         c.total(),
         c.caught,
+        c.caught_by_crash,
         c.missed,
         c.not_covered,
         c.unviable,

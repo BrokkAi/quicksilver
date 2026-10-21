@@ -97,6 +97,10 @@ After this plan, a user can run QS with `--test-selection static`. QS then picks
   Rationale: QS generates only function-body replacements and runs tests with nextest, which skips doctests; cargo-mutants' default adds operator mutants and runs `cargo test`.
   Date/Author: 2026-10-21, agent.
 
+- Decision: a confirmed crash counts as Caught. When a test crashes under the mutant (a signal, or an exit other than 0 and 101), crashes again on the retry, and passes with no mutant active, QS records Caught with a message starting "crashed under the mutant", and reports count those kills separately. A crash on the calibrated re-run after a timeout is treated the same way. Errored remains for infrastructure failures (missing binary, spawn failure, a test that also fails without the mutant), and gates that run without confirmation still report Errored.
+  Rationale: the "only exit 101 is Caught" rule kept host-pressure kills on bifrost-core out of the score; the retry plus the no-mutant run now does that. A deterministic crash caused by the mutant is a test detecting it, and cargo-mutants counts any failing test as caught. Affected: 5 semver mutants, 17 clap mutants, and the runaway-allocation mutant in clap that the OOM killer stops.
+  Date/Author: 2026-10-21, owner approved the agent's recommendation.
+
 ## Outcomes & Retrospective
 
 Not started.

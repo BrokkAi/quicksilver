@@ -3,6 +3,9 @@ use crate::types::{Outcome, VerdictKind};
 #[derive(Debug, Clone, Default)]
 pub struct OutcomeCounts {
     pub caught: usize,
+    /// Of `caught`, the kills by a confirmed crash rather than a libtest
+    /// assertion failure.
+    pub caught_by_crash: usize,
     pub missed: usize,
     pub not_covered: usize,
     pub unviable: usize,
@@ -19,7 +22,15 @@ impl OutcomeCounts {
                 c.builds += 1;
             }
             match o.kind {
-                VerdictKind::Caught => c.caught += 1,
+                VerdictKind::Caught => {
+                    c.caught += 1;
+                    if o.message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with(crate::types::CRASH_PREFIX))
+                    {
+                        c.caught_by_crash += 1;
+                    }
+                }
                 VerdictKind::Missed => c.missed += 1,
                 VerdictKind::NotCovered => c.not_covered += 1,
                 VerdictKind::Unviable => c.unviable += 1,
