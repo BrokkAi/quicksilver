@@ -18,7 +18,10 @@ After this plan, a user can run QS with `--test-selection static`. QS then picks
 - [x] (2026-10-21) Milestone 1 code: build against the local Bifrost checkout through the uncommitted patch; fixed the four API breaks (`build_ephemeral` → persisted store in `src/bifrost.rs`, `AnalyzeDiffParams.call_edges`, `analyze_diff_at_root` cancellation token); discovery now uses `bifrost::open_workspace`.
 - [x] (2026-10-21) Fixed a pre-existing Stage A failure (also on unmodified `5d8131f`): `util::find_llvm_tool` and `rustc_verbose_version` now ask the target workspace's toolchain, not QS's; the tiny fixture pins 1.97.1. `cargo test --lib --test engine --test schema`: 84 + 4 + 3 passed.
 - [x] (2026-10-21) Milestone 2 prototype: `src/reach.rs` and hidden `graph-probe`. On the tiny fixture all 12 nextest tests map to graph nodes and 24 of 25 mutants get a complete selection (the 25th, `as_mut`, falls back because the name is unresolved somewhere).
-- [ ] Milestone 1 remainder: cold vs warm discovery and graph timings on the small subject `semver` with a release build. Switch to `=0.14.0` when published.
+- [x] (2026-10-21) Aligned QS with Bifrost master for the shared mbx cache: toolchain 1.99.1, `[profile.dev] debug = "line-tables-only"`, `LIBSQLITE3_FLAGS` in a committed `.cargo/config.toml` (commit `4d93551`).
+- [x] (2026-10-21) Measured on `semver` (debug build, owner's instruction): Bifrost store open 2.17 s cold, 0.18 s warm; `usage_graph` about 18–21 s warm for 158 nodes and 333 edges, almost all in `usage_graph::resolve_rust`, recomputed by every process.
+- [x] (2026-10-21) Found and fixed unsound static selection: `unresolved_names=None` now marks every walk incomplete (Bifrost's documented contract), and trait methods Rust calls implicitly (`fmt`, `eq`, `cmp`, `drop`, `deref`, `clone`, …) mark a walk incomplete. On `semver` every mutant now falls back to all 34 tests.
+- [ ] Switch to `=0.14.0` when published.
 - [ ] Milestone 2 remainder: fixture cases for trait dispatch, default-method overrides, function references, macro-wrapped calls, integration tests under `tests/`; compare static against dynamic selection on the fixture.
 - [ ] Milestone 3: `--test-selection static` execution mode that skips Stage A and Stage B, with conservative fallback for incomplete reachability; in-place baseline sync that keeps `target/` and the Bifrost cache across commits.
 - [ ] Milestone 4: audit static selection against dynamic Stage B selection on a `brokk-bifrost-core` sample (soundness: every dynamically selected test must also be statically selected).
@@ -38,6 +41,11 @@ After this plan, a user can run QS with `--test-selection static`. QS then picks
 - Observation: Stage A reported every profile as corrupt because `find_llvm_tool` ran `rustc --print sysroot` in QS's own directory (pinned 1.97.1, LLVM 22) while the target built with the rustup default (1.99.1, LLVM 23, no `llvm-tools` component), and then fell back to whatever `llvm-profdata` was on PATH.
   Evidence: `RUST_LOG=cargo_quicksilver=debug cargo-quicksilver index` on the fixture: `batch profraw merge failed (8 files)` then `stage A produced no merged profdata`; `rustc -vV` in the fixture copy reports 1.99.1 / LLVM 23.1.1.
 - Observation: the Bifrost workspace (3,464 Rust files, 29 crates, about 12,900 tests) is far too large as a development or benchmark subject. The owner stopped a probe on it.
+
+- Observation: on `semver`, the usage graph gives no sound narrowing. Before the fix, 63 of 110 mutants had zero selected tests and looked complete, including `Display::fmt`, `PartialEq::eq`, `Ord::cmp`, `Drop::drop`, `Deref::deref`, `Clone::clone`, and `Comparator::matches`, which the tests call. Causes: Bifrost reports `unresolved_names=None` (some unresolved reference has no readable name, so its contract says abstain on the whole pass), and implicit calls (operators, formatting, drop, auto-deref, `#[derive]` output) produce no reference site and so no edge.
+  Evidence: `/mnt/optane/tmp/probe-semver-warm.out` (before) and `/mnt/optane/tmp/probe-semver-fixed.out` (after: `0 complete`).
+- Observation: the usage graph is not persisted. Each process pays `usage_graph::resolve_rust` again: about 21 s in a debug build on `semver` with `BIFROST_TIMING=1`, against 2.3 s for the whole analyzer build.
+  Evidence: aggregated `[bifrost-timing]` scopes in `/mnt/optane/tmp/semver-timing.err`.
 
 ## Decision Log
 
