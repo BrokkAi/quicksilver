@@ -147,11 +147,33 @@ pub fn apply_package_select(cmd: &mut Command, select: &PackageSelect) {
             cmd.arg("--workspace");
         }
         PackageSelect::Packages(pkgs) => {
-            for p in pkgs {
+            let root = cmd.get_current_dir().map(Path::to_path_buf);
+            for p in package_specs(root.as_deref(), pkgs) {
                 cmd.arg("-p").arg(p);
             }
         }
     }
+}
+
+/// `-p` values that name workspace members unambiguously. A bare name is
+/// ambiguous when a dependency has the same name (itertools' dev-dependencies
+/// pull in a registry itertools), and cargo then refuses the whole command.
+/// The package id from `cargo metadata` is unique by construction.
+pub fn package_specs(root: Option<&Path>, packages: &[String]) -> Vec<String> {
+    let meta = root.and_then(|r| load_metadata(r).ok());
+    packages
+        .iter()
+        .map(|p| {
+            meta.as_ref()
+                .and_then(|m| {
+                    m.workspace_packages()
+                        .into_iter()
+                        .find(|w| w.name.as_str() == p)
+                        .map(|w| w.id.repr.clone())
+                })
+                .unwrap_or_else(|| p.clone())
+        })
+        .collect()
 }
 
 pub fn rustflags(coverage: bool) -> String {
@@ -280,7 +302,7 @@ pub fn build_tests(
     if packages.is_empty() {
         cmd.arg("--workspace");
     } else {
-        for p in packages {
+        for p in package_specs(Some(root), packages) {
             cmd.arg("-p").arg(p);
         }
     }
@@ -343,7 +365,7 @@ pub fn build_tests_captured(
     if packages.is_empty() {
         cmd.arg("--workspace");
     } else {
-        for p in packages {
+        for p in package_specs(Some(root), packages) {
             cmd.arg("-p").arg(p);
         }
     }
@@ -461,6 +483,21 @@ pub fn env_for_tests() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_specs_name_members_by_package_id() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let specs = package_specs(Some(&root), &["tiny_a".into(), "not_a_member".into()]);
+        assert!(
+            specs[0].starts_with("path+file://") && specs[0].ends_with("#tiny_a@0.1.0"),
+            "{specs:?}"
+        );
+        assert_eq!(specs[1], "not_a_member");
+        assert_eq!(
+            package_specs(None, &["tiny_a".into()]),
+            vec!["tiny_a".to_string()]
+        );
+    }
 
     #[test]
     fn parse_executables_keeps_only_test_harnesses() {
