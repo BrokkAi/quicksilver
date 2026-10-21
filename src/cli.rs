@@ -52,6 +52,11 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub in_diff: Option<String>,
 
+    /// How each mutant's tests are chosen: `coverage` (LLVM Stage A and B)
+    /// or `sites` (one schema-binary run that records mutation-site hits).
+    #[arg(long, global = true, value_enum, default_value_t = crate::config::TestSelection::Coverage)]
+    pub test_selection: crate::config::TestSelection,
+
     /// Limit union coverage reporting to this crate's sources (sound).
     /// Tests from reverse-dependent crates are still run.
     #[arg(long, global = true)]

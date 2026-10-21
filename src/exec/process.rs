@@ -85,8 +85,10 @@ pub fn run_exact_with_env(
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
     // Never inherit a mutant from the parent. Null-schema and identity gates
-    // rely on an empty extra_env meaning "no mutant active".
+    // rely on an empty extra_env meaning "no mutant active". Site recording
+    // is likewise only on when the caller asks for it.
     cmd.env_remove("QS_MUTANT");
+    cmd.env_remove("QS_RECORD_SITES");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -124,6 +126,7 @@ pub fn run_exact_capture_with_env(
     // Never inherit a mutant from the parent; an empty extra_env means
     // "no mutant active", which is what the null runs depend on.
     cmd.env_remove("QS_MUTANT");
+    cmd.env_remove("QS_RECORD_SITES");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }

@@ -1,7 +1,7 @@
 //! Schema pool + test pool. Test binaries do not change between mutants.
 
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
-use crate::config::Config;
+use crate::config::{Config, TestSelection};
 use crate::coupling::CouplingRow;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
@@ -611,10 +611,33 @@ fn run_crate(
         )?;
         null_schema_gate(cfg, &run_dir, &paths.baseline, &planned)?;
         identity_gate(cfg, &run_dir, &paths.baseline, &isolated.sites, &by_id)?;
+        let recording = if cfg.test_selection == TestSelection::Sites {
+            Some(record_sites(
+                cfg,
+                &run_dir,
+                &paths.baseline,
+                &planned,
+                &isolated.sites,
+            )?)
+        } else {
+            None
+        };
         for p in &planned {
             if let Some((site, variant)) = lookup_variant(&isolated.sites, &p.mutant.id) {
+                let mut selected = p.clone();
+                if let Some(recording) = &recording {
+                    selected
+                        .tests
+                        .retain(|t| recording.entered(t, site.site_id));
+                    if selected.tests.is_empty() {
+                        unviable.push(Outcome::not_covered(p.mutant.clone()));
+                        continue;
+                    }
+                    selected.estimated_cost_secs =
+                        selected.tests.iter().map(|t| t.duration_secs).sum();
+                }
                 ready.push(SchemaReady {
-                    planned: p.clone(),
+                    planned: selected,
                     run_dir: run_dir.clone(),
                     env: vec![qs_mutant_env(site.site_id, variant)],
                     site_id: site.site_id,
@@ -974,6 +997,63 @@ fn null_schema_gate(
         }
         _ => Ok(()),
     }
+}
+
+/// One run of every candidate test under the schema binary with no mutant
+/// active, recording which sites each test enters. This replaces LLVM
+/// Stage A and Stage B: a mutant's tests are exactly the green tests that
+/// entered its site, and a site no green test entered is NotCovered.
+fn record_sites(
+    cfg: &Config,
+    run_dir: &Path,
+    baseline: &Path,
+    planned: &[PlannedMutant],
+    sites: &[Site],
+) -> Result<crate::exec::test::SiteRecording> {
+    let Some(first) = planned.first() else {
+        return Ok(Default::default());
+    };
+    let union = PlannedMutant {
+        mutant: first.mutant.clone(),
+        tests: union_selected_tests(planned),
+        estimated_cost_secs: 0.0,
+    };
+    let policy = TestRunPolicy {
+        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+        slowdown: SCHEMA_SLOWDOWN,
+        confirm: false,
+    };
+    let recording =
+        crate::exec::test::record_site_hits(&union, run_dir, baseline, &policy, cfg.test_jobs)?;
+    let site_ids: BTreeSet<u32> = sites.iter().map(|s| s.site_id).collect();
+    let entered: BTreeSet<u32> = recording
+        .sites_by_test
+        .values()
+        .flat_map(|s| s.iter().copied())
+        .filter(|s| site_ids.contains(s))
+        .collect();
+    info!(
+        "site recording: {} tests in {:.1}s, {} not green; {} of {} sites entered",
+        recording.sites_by_test.len() + recording.not_green.len(),
+        recording.wall_secs,
+        recording.not_green.len(),
+        entered.len(),
+        site_ids.len()
+    );
+    for (test, why) in recording.not_green.iter().take(8) {
+        warn!("  not green under the schema binary, selects nothing: {test}: {why}");
+    }
+    if !recording.sites_by_test.is_empty() && entered.is_empty() {
+        // Legitimate when no test calls this crate's mutated functions. A
+        // recorder that cannot open its file panics, which fails the test
+        // and lands it in not_green instead.
+        warn!(
+            "site recording: {} green tests entered none of {} sites; every mutant in this batch is NotCovered",
+            recording.sites_by_test.len(),
+            site_ids.len()
+        );
+    }
+    Ok(recording)
 }
 
 fn identity_gate(

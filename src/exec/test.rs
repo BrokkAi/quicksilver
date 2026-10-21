@@ -151,6 +151,105 @@ pub fn run_mutant_tests_observed(
     )
 }
 
+/// Which mutation sites each staged test entered, from one run of every test
+/// with no mutant active and `QS_RECORD_SITES` pointing at a per-test file.
+#[derive(Debug, Default)]
+pub struct SiteRecording {
+    /// Test id (name when the manifest has no id) -> site ids it entered.
+    pub sites_by_test: std::collections::HashMap<String, std::collections::BTreeSet<u32>>,
+    /// Tests that did not pass with no mutant active. They select nothing:
+    /// the schema binary cannot judge a mutant with a test that is not green.
+    pub not_green: Vec<(String, String)>,
+    pub wall_secs: f64,
+}
+
+impl SiteRecording {
+    pub fn entered(&self, test: &crate::types::TestInfo, site: u32) -> bool {
+        [test.id.as_str(), test.name.as_str()]
+            .iter()
+            .filter(|key| !key.is_empty())
+            .any(|key| {
+                self.sites_by_test
+                    .get(*key)
+                    .is_some_and(|sites| sites.contains(&site))
+            })
+    }
+}
+
+/// One test's recorded sites, or why it selects nothing.
+type RecordResult = (String, Result<std::collections::BTreeSet<u32>, String>);
+
+pub fn record_site_hits(
+    planned_union: &PlannedMutant,
+    run_dir: &Path,
+    baseline_root: &Path,
+    policy: &TestRunPolicy,
+    jobs: usize,
+) -> Result<SiteRecording> {
+    let tests = resolve_tests(planned_union, run_dir, baseline_root)?;
+    let dir = run_dir.join("site-hits");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir)?;
+    let started = Instant::now();
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Mutex<Vec<RecordResult>> = Mutex::new(Vec::with_capacity(tests.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1).min(tests.len().max(1)) {
+            scope.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(t) = tests.get(i) else { break };
+                let key = if t.id.is_empty() {
+                    t.name.clone()
+                } else {
+                    t.id.clone()
+                };
+                let result = record_one(t, i, &dir, policy);
+                results.lock().unwrap().push((key, result));
+            });
+        }
+    });
+    let mut recording = SiteRecording {
+        wall_secs: started.elapsed().as_secs_f64(),
+        ..SiteRecording::default()
+    };
+    for (key, result) in results.into_inner().unwrap() {
+        match result {
+            Ok(sites) => {
+                recording.sites_by_test.insert(key, sites);
+            }
+            Err(why) => recording.not_green.push((key, why)),
+        }
+    }
+    recording.not_green.sort();
+    Ok(recording)
+}
+
+fn record_one(
+    t: &ResolvedTest,
+    index: usize,
+    dir: &Path,
+    policy: &TestRunPolicy,
+) -> Result<std::collections::BTreeSet<u32>, String> {
+    let path = dir.join(format!("{index:06}.txt"));
+    fs::write(&path, b"").map_err(|err| format!("create {}: {err}", path.display()))?;
+    let timeout = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
+    let env = [(
+        "QS_RECORD_SITES".to_string(),
+        path.to_string_lossy().into_owned(),
+    )];
+    let status = run_exact_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
+        .map_err(|err| format!("{err:#}"))?;
+    match status {
+        RunStatus::Passed => {}
+        RunStatus::Failed => return Err("failed with no mutant active".into()),
+        RunStatus::Error { code } => return Err(format!("exited {code:?} with no mutant active")),
+        RunStatus::Timeout => return Err(format!("timed out after {timeout:?}")),
+    }
+    let text =
+        fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    Ok(text.lines().filter_map(|l| l.trim().parse().ok()).collect())
+}
+
 fn resolve_tests(
     planned: &PlannedMutant,
     run_dir: &Path,

@@ -1268,11 +1268,26 @@ fn normalize_source(path: &Path, ws_root: &Path) -> Option<String> {
 }
 
 pub fn list_tests(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
+    list_tests_in(cfg, paths, &paths.baseline_cov, true)
+}
+
+/// Tests of the ordinary (uninstrumented) baseline build. `--test-selection
+/// sites` needs no coverage build at all.
+pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
+    list_tests_in(cfg, paths, &paths.baseline.join("target"), false)
+}
+
+fn list_tests_in(
+    cfg: &Config,
+    paths: &Paths,
+    target_dir: &Path,
+    coverage: bool,
+) -> Result<Vec<TestInfo>> {
     let meta = load_metadata(&paths.baseline)?;
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
-    cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
-    apply_build_env(&mut cmd, cfg, true);
+    cmd.env("CARGO_TARGET_DIR", target_dir);
+    apply_build_env(&mut cmd, cfg, coverage);
     cmd.args(["nextest", "list", "--message-format", "json"]);
     cmd.args(["--cargo-profile", crate::cargo_cmd::PROFILE]);
     apply_package_select(&mut cmd, &package_select(cfg, &meta));
@@ -1283,7 +1298,7 @@ pub fn list_tests(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    parse_nextest_list(&out.stdout, &meta, &paths.baseline_cov)
+    parse_nextest_list(&out.stdout, &meta, target_dir)
 }
 
 pub fn parse_nextest_list(

@@ -38,8 +38,55 @@ pub mod __qs_rt {
         active.dedup_by_key(|entry| entry.0);
         active
     });
+    // QS_RECORD_SITES=<file>: append each site id the first time this
+    // process enters it. QS creates the file; children inherit the variable
+    // and append to the same file, one write per line.
+    struct Recorder {
+        seen: std::sync::Mutex<std::collections::HashSet<u32>>,
+        file: std::sync::Mutex<std::fs::File>,
+    }
+    static RECORD: LazyLock<Option<Recorder>> = LazyLock::new(|| {
+        let path = std::env::var_os("QS_RECORD_SITES")?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap_or_else(|err| panic!("QS_RECORD_SITES {path:?}: {err}"));
+        Some(Recorder {
+            seen: std::sync::Mutex::new(std::collections::HashSet::new()),
+            file: std::sync::Mutex::new(file),
+        })
+    });
+    thread_local! {
+        static LOCAL: std::cell::RefCell<std::collections::HashSet<u32>> =
+            std::cell::RefCell::new(std::collections::HashSet::new());
+    }
+    #[cold]
+    fn record(recorder: &Recorder, site: u32) {
+        let fresh = LOCAL
+            .try_with(|local| local.borrow_mut().insert(site))
+            .unwrap_or(true);
+        if !fresh {
+            return;
+        }
+        let first = match recorder.seen.lock() {
+            Ok(mut seen) => seen.insert(site),
+            Err(poisoned) => poisoned.into_inner().insert(site),
+        };
+        if first {
+            use std::io::Write;
+            let line = format!("{site}\n");
+            let mut file = match recorder.file.lock() {
+                Ok(file) => file,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
     #[inline(always)]
     pub fn active(site: u32) -> Option<u32> {
+        if let Some(recorder) = RECORD.as_ref() {
+            record(recorder, site);
+        }
         ACTIVE
             .binary_search_by_key(&site, |&(active, _)| active)
             .ok()

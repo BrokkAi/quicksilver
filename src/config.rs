@@ -27,6 +27,17 @@ impl CloneBackendKind {
     }
 }
 
+/// Where each mutant's tests come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum TestSelection {
+    /// LLVM coverage: Stage A (union) and Stage B (per test).
+    #[default]
+    Coverage,
+    /// One run of every candidate test under the schema binary, recording
+    /// which mutation sites it enters. No instrumented build, no LLVM.
+    Sites,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -55,6 +66,7 @@ pub struct FileConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub repo_root: PathBuf,
+    pub test_selection: TestSelection,
     pub scratch_root: PathBuf,
     pub clone_backend: CloneBackendKind,
     pub build_jobs: usize,
@@ -175,6 +187,7 @@ pub fn merge_config(
 
     Ok(Config {
         repo_root,
+        test_selection: cli.test_selection,
         scratch_root,
         clone_backend,
         build_jobs: build_jobs.max(1),

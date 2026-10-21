@@ -79,6 +79,7 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
     use std::collections::BTreeMap;
     Config {
         repo_root: repo.to_path_buf(),
+        test_selection: Default::default(),
         scratch_root: scratch.to_path_buf(),
         clone_backend: CloneBackendKind::Copy,
         build_jobs: 2,

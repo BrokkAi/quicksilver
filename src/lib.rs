@@ -215,6 +215,11 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
+    if cfg.test_selection != crate::config::TestSelection::Coverage {
+        anyhow::bail!(
+            "audit-selection audits coverage selection; run it with --test-selection coverage"
+        );
+    }
     let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
     if !args.skip_baseline {
         let _ = engine::maybe_preflight(&prepared)?;
@@ -293,24 +298,26 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         let _ = engine::maybe_preflight(&prepared)?;
     }
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
-    let covered_sample: Vec<_> = sample
-        .iter()
-        .filter(|m| {
-            prepared
-                .index
-                .union_covers(&m.path, m.start_line, m.end_line)
-        })
-        .cloned()
-        .collect();
-    crate::index::stage_b_for_mutants(
-        &prepared.cfg,
-        &prepared.paths,
-        &mut prepared.index,
-        &covered_sample,
-    )?;
-    // Stage B reloads coverage.json, which used to wipe attached durations
-    // back to the 0.001s index default and 5s-timeout every slow test.
-    let _ = crate::index::attach_timings(&mut prepared.index, &prepared.baseline.tests);
+    if prepared.cfg.test_selection == crate::config::TestSelection::Coverage {
+        let covered_sample: Vec<_> = sample
+            .iter()
+            .filter(|m| {
+                prepared
+                    .index
+                    .union_covers(&m.path, m.start_line, m.end_line)
+            })
+            .cloned()
+            .collect();
+        crate::index::stage_b_for_mutants(
+            &prepared.cfg,
+            &prepared.paths,
+            &mut prepared.index,
+            &covered_sample,
+        )?;
+        // Stage B reloads coverage.json, which used to wipe attached durations
+        // back to the 0.001s index default and 5s-timeout every slow test.
+        let _ = crate::index::attach_timings(&mut prepared.index, &prepared.baseline.tests);
+    }
     eprintln!(
         "running sample of {} mutants through the pipeline",
         sample.len()

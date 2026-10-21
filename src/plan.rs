@@ -1,6 +1,71 @@
 use crate::index::CoverageIndex;
-use crate::types::{BaselineReport, LocalityBatch, Mutant, PlannedMutant};
+use crate::types::{BaselineReport, LocalityBatch, Mutant, PlannedMutant, TestInfo};
 use std::collections::HashMap;
+
+/// Where the planner gets each mutant's tests.
+pub trait TestSelector {
+    /// False files the mutant as NotCovered at plan time.
+    fn covers(&self, m: &Mutant) -> bool;
+    fn tests_for(&self, m: &Mutant) -> Vec<TestInfo>;
+    /// Every test the selector knows about.
+    fn catalog(&self) -> &[TestInfo];
+}
+
+impl TestSelector for CoverageIndex {
+    fn covers(&self, m: &Mutant) -> bool {
+        self.union_covers(&m.path, m.start_line, m.end_line)
+    }
+    fn tests_for(&self, m: &Mutant) -> Vec<TestInfo> {
+        self.tests_covering(&m.path, m.start_line, m.end_line)
+    }
+    fn catalog(&self) -> &[TestInfo] {
+        &self.tests
+    }
+}
+
+/// `--test-selection sites`: every test in a package that depends on the
+/// mutant's package is a candidate. Nothing is NotCovered at plan time; the
+/// schema executor narrows each mutant to the tests that entered its site.
+pub struct PackageSelector {
+    tests: Vec<TestInfo>,
+    candidates: HashMap<String, Vec<usize>>,
+}
+
+impl PackageSelector {
+    pub fn new(meta: &cargo_metadata::Metadata, tests: &[TestInfo]) -> Self {
+        let mut candidates = HashMap::new();
+        for pkg in meta.workspace_packages() {
+            let name = pkg.name.to_string();
+            let allowed = crate::cargo_cmd::reverse_dependents(meta, std::slice::from_ref(&name));
+            let picked: Vec<usize> = tests
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| allowed.contains(&t.package))
+                .map(|(i, _)| i)
+                .collect();
+            candidates.insert(name, picked);
+        }
+        Self {
+            tests: tests.to_vec(),
+            candidates,
+        }
+    }
+}
+
+impl TestSelector for PackageSelector {
+    fn covers(&self, _m: &Mutant) -> bool {
+        true
+    }
+    fn tests_for(&self, m: &Mutant) -> Vec<TestInfo> {
+        self.candidates
+            .get(&m.package)
+            .map(|ix| ix.iter().map(|&i| self.tests[i].clone()).collect())
+            .unwrap_or_default()
+    }
+    fn catalog(&self) -> &[TestInfo] {
+        &self.tests
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
@@ -18,7 +83,7 @@ pub enum TestMode {
 
 pub fn plan(
     mutants: &[Mutant],
-    index: &CoverageIndex,
+    index: &dyn TestSelector,
     baseline: &BaselineReport,
     shard: Option<(u32, u32)>,
     build_jobs: usize,
@@ -36,7 +101,7 @@ pub fn plan(
 /// Same as `plan`, but every union-covered mutant runs the whole suite.
 pub fn plan_full_suite(
     mutants: &[Mutant],
-    index: &CoverageIndex,
+    index: &dyn TestSelector,
     baseline: &BaselineReport,
     shard: Option<(u32, u32)>,
     build_jobs: usize,
@@ -53,7 +118,7 @@ pub fn plan_full_suite(
 
 fn plan_with(
     mutants: &[Mutant],
-    index: &CoverageIndex,
+    index: &dyn TestSelector,
     baseline: &BaselineReport,
     shard: Option<(u32, u32)>,
     build_jobs: usize,
@@ -68,7 +133,7 @@ fn plan_with(
     let mut all_suite = if !baseline.tests.is_empty() {
         baseline.tests.clone()
     } else {
-        index.tests.clone()
+        index.catalog().to_vec()
     };
     all_suite.sort_by(|a, b| {
         a.duration_secs
@@ -80,12 +145,12 @@ fn plan_with(
     let mut not_covered = Vec::new();
     let mut covered = Vec::new();
     for m in mutants {
-        if !index.union_covers(&m.path, m.start_line, m.end_line) {
+        if !index.covers(m) {
             not_covered.push(m.clone());
             continue;
         }
         let mut tests = match mode {
-            TestMode::Impact => index.tests_covering(&m.path, m.start_line, m.end_line),
+            TestMode::Impact => index.tests_for(m),
             TestMode::FullSuite => all_suite.clone(),
         };
         tests.sort_by(|a, b| {

@@ -1,5 +1,6 @@
 use crate::baseline::{preflight_recompile_count, prepare_baseline};
-use crate::config::{merge_config, Config, ConfigExtras, FileConfig};
+use crate::cargo_cmd::load_metadata;
+use crate::config::{merge_config, Config, ConfigExtras, FileConfig, TestSelection};
 use crate::discover::{discover, DiscoverFilter};
 use crate::estimate::{self, EstimateReport};
 use crate::index::{self, CoverageIndex};
@@ -86,7 +87,18 @@ pub struct Prepared {
     pub baseline: BaselineReport,
     pub mutants: Vec<Mutant>,
     pub index: CoverageIndex,
+    /// Set under `--test-selection sites`; plans against package candidates.
+    pub packages: Option<plan::PackageSelector>,
     pub plan: Plan,
+}
+
+impl Prepared {
+    pub fn selector(&self) -> &dyn plan::TestSelector {
+        match &self.packages {
+            Some(p) => p,
+            None => &self.index,
+        }
+    }
 }
 
 pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
@@ -121,7 +133,24 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         );
     }
 
-    let mut index = index::build_or_load(&cfg, &paths, &baseline)?;
+    let sites = cfg.test_selection == TestSelection::Sites;
+    let mut index = if sites {
+        // No Stage A or B: the schema executor records which tests enter
+        // which mutation sites once it has built the schema binary.
+        let tests = index::list_tests_plain(&cfg, &paths)?;
+        eprintln!(
+            "test selection: sites ({} tests catalogued; no coverage build)",
+            tests.len()
+        );
+        index::CoverageIndex {
+            cache_key: index::source_cache_key(&paths.baseline)?,
+            scope: cfg.index_scope.clone(),
+            tests,
+            ..Default::default()
+        }
+    } else {
+        index::build_or_load(&cfg, &paths, &baseline)?
+    };
     let timing = index::attach_timings(&mut index, &baseline.tests);
     if !baseline.tests.is_empty() && !index.tests.is_empty() {
         if timing.matched == 0 {
@@ -138,7 +167,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
                 timing.total
             );
         }
-        if timing.matched > 0 {
+        if timing.matched > 0 && !sites {
             if let Err(err) = index.save(&paths) {
                 tracing::warn!("failed to persist attached timings: {err:#}");
             }
@@ -146,7 +175,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
     }
     // Estimate pays Stage B only for the sample (cmd_estimate). Run/index
     // attribute every in-scope mutant now.
-    if !for_estimate {
+    if !for_estimate && !sites {
         let covered: Vec<_> = mutants
             .iter()
             .filter(|m| index.union_covers(&m.path, m.start_line, m.end_line))
@@ -155,7 +184,15 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         index::stage_b_for_mutants(&cfg, &paths, &mut index, &covered)?;
         let _ = index::attach_timings(&mut index, &baseline.tests);
     }
-    let plan = plan::plan(&mutants, &index, &baseline, cfg.shard, cfg.build_jobs);
+    let packages = sites.then(|| {
+        load_metadata(&paths.baseline).map(|meta| plan::PackageSelector::new(&meta, &index.tests))
+    });
+    let packages = packages.transpose()?;
+    let selector: &dyn plan::TestSelector = match &packages {
+        Some(p) => p,
+        None => &index,
+    };
+    let plan = plan::plan(&mutants, selector, &baseline, cfg.shard, cfg.build_jobs);
     eprintln!(
         "plan: {} to build, {} not covered",
         plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>(),
@@ -170,6 +207,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         baseline,
         mutants,
         index,
+        packages,
         plan,
     })
 }
@@ -192,7 +230,7 @@ pub fn run_schema_detailed(
     let plan = if let Some(sample) = sample {
         plan::plan(
             sample,
-            &prepared.index,
+            prepared.selector(),
             &prepared.baseline,
             prepared.cfg.shard,
             prepared.cfg.build_jobs,
@@ -257,12 +295,12 @@ pub fn estimate_from(
         .unwrap_or_else(|| "workspace".into());
     let sample_plan = plan::plan(
         sample,
-        &prepared.index,
+        prepared.selector(),
         &prepared.baseline,
         prepared.cfg.shard,
         prepared.cfg.build_jobs,
     );
-    estimate::compute(
+    let mut report = estimate::compute(
         prepared.mutants.len(),
         &prepared.plan,
         &sample_plan,
@@ -273,7 +311,24 @@ pub fn estimate_from(
         prepared.cfg.cm_jobs,
         scope,
         sample.len(),
-    )
+    );
+    if prepared.cfg.test_selection == TestSelection::Sites {
+        // No Stage A census: NotCovered is decided per sampled mutant by the
+        // site recording, so f_nc is a sample proportion, not a census.
+        let nc = outcomes
+            .iter()
+            .filter(|o| o.kind == crate::types::VerdictKind::NotCovered)
+            .count();
+        let f_nc = nc as f64 / outcomes.len().max(1) as f64;
+        report.f_nc = f_nc;
+        report.f_nc_low = f_nc;
+        report.f_nc_high = f_nc;
+        report.assumptions.push(format!(
+            "--test-selection sites: f_nc = {f_nc:.3} is the NotCovered share of the executed sample ({nc}/{}), from recorded site hits, not a Stage A census; t_sel is over candidate tests before narrowing.",
+            outcomes.len()
+        ));
+    }
+    report
 }
 
 pub fn write_outputs(

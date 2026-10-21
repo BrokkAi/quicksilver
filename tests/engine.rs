@@ -310,3 +310,62 @@ fn scoped_index_does_not_file_other_crates_as_not_covered() {
         "scoped prepare should drop out-of-crate mutants"
     );
 }
+
+/// `--test-selection sites` replaces LLVM Stage A and B with one recording
+/// run under the schema binary. On the fixture it must reach the same verdict
+/// as coverage selection for every mutant, without an instrumented build.
+#[test]
+fn site_selection_matches_coverage_selection() {
+    if !tools_ok() {
+        eprintln!("skip: nextest or llvm-cov not available");
+        return;
+    }
+    let repo = support::setup_tiny();
+    let run = |selection: cargo_quicksilver::config::TestSelection| {
+        let scratch = tempfile::tempdir().unwrap();
+        let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+        cfg.timeout_floor = std::time::Duration::from_millis(800);
+        cfg.identity_sample = 0;
+        cfg.test_selection = selection;
+        let paths = cfg.paths();
+        let prepared = prepare(cfg, false, false).expect("prepare");
+        let (outcomes, _) = run_schema(&prepared, 0, None).expect("schema run");
+        let verdicts: std::collections::BTreeMap<String, (String, VerdictKind)> = outcomes
+            .iter()
+            .map(|o| {
+                (
+                    o.mutant.id.clone(),
+                    (
+                        format!("{} -> {}", o.mutant.fqn, o.mutant.replacement),
+                        o.kind,
+                    ),
+                )
+            })
+            .collect();
+        (verdicts, paths.baseline_cov.exists(), scratch)
+    };
+    let (coverage, _, _keep_a) = run(cargo_quicksilver::config::TestSelection::Coverage);
+    let (sites, instrumented, _keep_b) = run(cargo_quicksilver::config::TestSelection::Sites);
+    assert!(!instrumented, "sites selection must not build baseline-cov");
+    assert_eq!(coverage.len(), sites.len(), "same mutants in both runs");
+    let diffs: Vec<_> = coverage
+        .iter()
+        .filter(|(id, v)| sites.get(*id) != Some(v))
+        .map(|(id, v)| (v.0.clone(), v.1, sites.get(id).map(|s| s.1)))
+        .collect();
+    assert!(
+        diffs.is_empty(),
+        "coverage vs sites verdicts differ: {diffs:#?}"
+    );
+    let kinds: Vec<VerdictKind> = sites.values().map(|v| v.1).collect();
+    for k in [
+        VerdictKind::Caught,
+        VerdictKind::Missed,
+        VerdictKind::NotCovered,
+    ] {
+        assert!(
+            kinds.contains(&k),
+            "fixture should exercise {k:?}: {kinds:?}"
+        );
+    }
+}

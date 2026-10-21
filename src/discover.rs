@@ -256,7 +256,7 @@ fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<BTreeSet<String>> {
         &DiffAnalysisOptions::default(),
         &CancellationToken::default(),
     )
-        .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
     let mut set = BTreeSet::new();
     for e in result.patch_symbols.edited {
         set.insert(e.after.fqn);
