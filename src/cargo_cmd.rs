@@ -247,6 +247,68 @@ pub fn package_for_path(meta: &Metadata, rel: &str) -> Option<String> {
     best.map(|(_, n)| n)
 }
 
+/// Which files of a package the schema engine can mutate: those in the module
+/// tree of the target it instruments (the library, else the first binary).
+/// Other targets (examples, benches, tests, build scripts, extra binaries)
+/// are separate crates where `crate::__qs_rt` does not exist.
+#[derive(Debug, Clone)]
+pub struct MutableScope {
+    pub root_dir: PathBuf,
+    pub root_file: PathBuf,
+    /// Entry files and directories of the package's other targets.
+    pub other_targets: Vec<PathBuf>,
+    /// Proc-macro code runs inside rustc while dependents compile, so a
+    /// mutant switched on at test run time never takes effect.
+    pub proc_macro: bool,
+}
+
+impl MutableScope {
+    pub fn contains(&self, abs: &Path) -> bool {
+        if abs == self.root_file {
+            return true;
+        }
+        abs.starts_with(&self.root_dir)
+            && !self
+                .other_targets
+                .iter()
+                .any(|t| abs == t || (t.is_dir() && abs.starts_with(t)))
+    }
+}
+
+pub fn mutable_scope(meta: &Metadata, package: &str) -> Option<MutableScope> {
+    let pkg = meta
+        .workspace_packages()
+        .into_iter()
+        .find(|p| p.name.as_str() == package)?;
+    let root_file = crate_root_source(meta, package)?;
+    let root_dir = root_file.parent()?.to_path_buf();
+    let proc_macro = pkg
+        .targets
+        .iter()
+        .any(|t| t.kind.iter().any(|k| k.to_string() == "proc-macro"));
+    let mut other_targets = Vec::new();
+    for t in &pkg.targets {
+        let src = t.src_path.as_std_path().to_path_buf();
+        if src == root_file {
+            continue;
+        }
+        // `src/bin/tool/main.rs` owns its whole directory; `src/main.rs`
+        // next to `src/lib.rs` owns only itself.
+        match src.parent() {
+            Some(dir) if dir != root_dir && dir.starts_with(&root_dir) => {
+                other_targets.push(dir.to_path_buf())
+            }
+            _ => other_targets.push(src),
+        }
+    }
+    Some(MutableScope {
+        root_dir,
+        root_file,
+        other_targets,
+        proc_macro,
+    })
+}
+
 pub fn crate_root_source(meta: &Metadata, package: &str) -> Option<PathBuf> {
     let pkg = meta
         .workspace_packages()
@@ -257,10 +319,9 @@ pub fn crate_root_source(meta: &Metadata, package: &str) -> Option<PathBuf> {
     for t in &pkg.targets {
         let kinds: Vec<String> = t.kind.iter().map(|k| k.to_string()).collect();
         let path = t.src_path.as_std_path().to_path_buf();
-        if kinds
-            .iter()
-            .any(|k| k == "lib" || k == "rlib" || k == "dylib" || k == "cdylib")
-        {
+        if kinds.iter().any(|k| {
+            k == "lib" || k == "rlib" || k == "dylib" || k == "cdylib" || k == "proc-macro"
+        }) {
             lib = Some(path);
             break;
         }
@@ -335,7 +396,7 @@ pub fn build_tests(
 
 pub struct BuildResult {
     pub secs: f64,
-    pub executables: Vec<PathBuf>,
+    pub executables: Vec<BuiltExe>,
     pub stdout: Vec<u8>,
 }
 
@@ -346,7 +407,7 @@ pub struct CapturedBuild {
     pub secs: f64,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
-    pub executables: Vec<PathBuf>,
+    pub executables: Vec<BuiltExe>,
 }
 
 pub fn build_tests_captured(
@@ -393,7 +454,16 @@ pub fn build_tests_captured(
 /// produces plain `bin` artifacts (a CLI, a fuzzer); every caller here stages
 /// binaries to run with `--exact <test name>`, which a plain bin either
 /// rejects with a nonzero exit or, worse, ignores.
-pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
+/// A test harness cargo just built, with the directory of the manifest that
+/// owns it. Two packages can both have a test target named `builder`;
+/// the manifest directory tells them apart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuiltExe {
+    pub path: PathBuf,
+    pub manifest_dir: Option<PathBuf>,
+}
+
+pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
     let mut out = Vec::new();
     for line in stdout.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -414,8 +484,14 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<PathBuf> {
             continue;
         }
         if let Some(exe) = v.get("executable").and_then(|e| e.as_str()) {
-            let p = PathBuf::from(exe);
-            out.push(p);
+            let manifest_dir = v
+                .get("manifest_path")
+                .and_then(|m| m.as_str())
+                .and_then(|m| Path::new(m).parent().map(Path::to_path_buf));
+            out.push(BuiltExe {
+                path: PathBuf::from(exe),
+                manifest_dir,
+            });
         }
     }
     let _ = target_dir;
@@ -512,7 +588,10 @@ mod tests {
             r#"{"reason":"build-finished","success":true}"#,
             "\n",
         );
-        let exes = parse_executables(stdout.as_bytes(), Path::new("/t"));
+        let exes: Vec<PathBuf> = parse_executables(stdout.as_bytes(), Path::new("/t"))
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
         assert_eq!(
             exes,
             vec![PathBuf::from(

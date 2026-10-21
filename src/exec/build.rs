@@ -1,85 +1,91 @@
 use anyhow::Result;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Which file to stage for `test`. The executables this build just produced
+/// come first: a worker's `target/` is cloned from the baseline, so an exact
+/// `binary_rel` path can still exist there as a stale baseline binary when
+/// the schema build gave the target a new fingerprint (clap: a narrower
+/// package set unified features differently). Staging that file runs tests
+/// against code without the schema runtime.
 pub(crate) fn resolve_binary(
     target_dir: &Path,
     test: &crate::types::TestInfo,
-    built: &HashMap<String, PathBuf>,
+    built: &[crate::cargo_cmd::BuiltExe],
 ) -> Result<PathBuf> {
+    let want = WantBase::for_test(test);
+    let worker = target_dir.parent().unwrap_or(target_dir);
+    let same_package = |e: &crate::cargo_cmd::BuiltExe| match &e.manifest_dir {
+        Some(dir) => {
+            let rel = dir.strip_prefix(worker).unwrap_or(dir);
+            crate::util::rel_slash(rel) == test.cwd_rel
+        }
+        None => true,
+    };
+    let exact_name = Path::new(&test.binary_rel)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let mut fresh: Vec<&crate::cargo_cmd::BuiltExe> = built
+        .iter()
+        .filter(|e| {
+            e.path
+                .file_name()
+                .is_some_and(|n| strip_fingerprint(&n.to_string_lossy()) == want.base)
+        })
+        .filter(|e| same_package(e))
+        .collect();
+    fresh.sort_by(|a, b| a.path.cmp(&b.path));
+    if let Some(e) = fresh
+        .iter()
+        .find(|e| {
+            exact_name.as_deref() == e.path.file_name().map(|n| n.to_string_lossy()).as_deref()
+        })
+        .or_else(|| fresh.iter().max_by_key(|e| mtime_or_epoch(&e.path)))
+    {
+        if fresh.len() > 1 {
+            tracing::info!(
+                "resolve {}: {} fresh fingerprints of {}; using {}",
+                test.id,
+                fresh.len(),
+                want.base,
+                e.path.display()
+            );
+        }
+        return Ok(e.path.clone());
+    }
+    if !built.is_empty() {
+        tracing::warn!(
+            "resolve {}: no executable from this build matches base {} in {}; falling back to {}",
+            test.id,
+            want.base,
+            if test.cwd_rel.is_empty() {
+                "."
+            } else {
+                &test.cwd_rel
+            },
+            test.binary_rel
+        );
+    }
     let candidate = target_dir.join(&test.binary_rel);
     if candidate.is_file() {
-        tracing::info!("resolve {}: exact rel {}", test.id, candidate.display());
         return Ok(candidate);
     }
-    if let Some(name) = Path::new(&test.binary_rel).file_name() {
-        let key = name.to_string_lossy().into_owned();
-        if let Some(p) = built.get(&key) {
-            tracing::info!("resolve {}: name key {}", test.id, p.display());
-            return Ok(p.clone());
-        }
+    if let Some(key) = &exact_name {
         // cargo uses the profile dir name
         for dir in ["quicksilver", "debug", "dev"] {
-            let p = target_dir.join(dir).join("deps").join(&key);
+            let p = target_dir.join(dir).join("deps").join(key);
             if p.is_file() {
-                tracing::info!("resolve {}: {dir} deps probe {}", test.id, p.display());
                 return Ok(p);
             }
         }
     }
-    // The index records `binary_rel` from the instrumented Stage-A build, so
-    // its fingerprint never exists in a plain worker build: the strategies
-    // above miss on every real run. Match on the target base name instead.
-    // Substring matching used to live here and it staged the wrong target
-    // (a plain bin whose name contains the wanted one), which then either
-    // exits nonzero on `--exact` or passes vacuously.
-    let want = WantBase::for_test(test);
-    if want.from_package {
-        tracing::warn!(
-            "resolve {}: no binary_rel or binary_name in the index; falling back to package base {}",
-            test.id,
-            want.base
-        );
-    }
-    let mut entries: Vec<(String, SystemTime)> = built
-        .iter()
-        .map(|(name, path)| (name.clone(), mtime_or_epoch(path)))
-        .collect();
-    // `built` is a HashMap; sort so equal mtimes resolve the same way twice.
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-    match pick_by_base(&want.base, &entries) {
-        Some(m) => {
-            let path = built
-                .get(&entries[m.index].0)
-                .expect("entry key came from built")
-                .clone();
-            if m.total > 1 {
-                tracing::info!(
-                    "resolve {}: {} fingerprints matched base {}; using newest {}",
-                    test.id,
-                    m.total,
-                    want.base,
-                    path.display()
-                );
-            } else {
-                tracing::info!(
-                    "resolve {}: base {} -> {}",
-                    test.id,
-                    want.base,
-                    path.display()
-                );
-            }
-            Ok(path)
-        }
-        None => anyhow::bail!(
-            "could not locate test binary for {} (rel {}, base {})",
-            test.id,
-            test.binary_rel,
-            want.base
-        ),
-    }
+    anyhow::bail!(
+        "could not locate test binary for {} (rel {}, base {})",
+        test.id,
+        test.binary_rel,
+        want.base
+    )
 }
 
 /// The target base name a staged binary must match, and whether it had to be
@@ -136,32 +142,6 @@ pub(crate) fn strip_fingerprint(name: &str) -> &str {
     }
 }
 
-/// Which entry to stage, and how many were in the running.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct BaseMatch {
-    pub index: usize,
-    pub total: usize,
-}
-
-/// Entries whose hash-stripped file name equals `want_base` exactly. Several
-/// can match: they are feature fingerprints of one target, and the freshest
-/// belongs to the build that just finished. Ties keep the first entry, so a
-/// sorted input resolves deterministically.
-pub(crate) fn pick_by_base(want_base: &str, entries: &[(String, SystemTime)]) -> Option<BaseMatch> {
-    let mut best: Option<usize> = None;
-    let mut total = 0usize;
-    for (i, (name, mtime)) in entries.iter().enumerate() {
-        if strip_fingerprint(name) != want_base {
-            continue;
-        }
-        total += 1;
-        if best.is_none_or(|b| *mtime > entries[b].1) {
-            best = Some(i);
-        }
-    }
-    best.map(|index| BaseMatch { index, total })
-}
-
 fn mtime_or_epoch(path: &Path) -> SystemTime {
     fs::metadata(path)
         .and_then(|m| m.modified())
@@ -171,18 +151,6 @@ fn mtime_or_epoch(path: &Path) -> SystemTime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
-
-    fn at(secs: u64) -> SystemTime {
-        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
-    }
-
-    fn entries(names: &[(&str, u64)]) -> Vec<(String, SystemTime)> {
-        names
-            .iter()
-            .map(|(n, t)| ((*n).to_string(), at(*t)))
-            .collect()
-    }
 
     #[test]
     fn fingerprint_suffix_is_stripped_only_when_it_is_a_hash() {
@@ -223,47 +191,108 @@ mod tests {
         assert!(from_pkg.from_package, "package fallback is flagged");
     }
 
+    use crate::cargo_cmd::BuiltExe;
+    use crate::types::TestInfo;
+
+    struct Worker {
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+    }
+
+    impl Worker {
+        fn new() -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().to_path_buf();
+            fs::create_dir_all(root.join("target/quicksilver/deps")).unwrap();
+            Self { _tmp: tmp, root }
+        }
+        fn target(&self) -> std::path::PathBuf {
+            self.root.join("target")
+        }
+        /// Write a deps binary and report it as built by the package in `pkg_dir`.
+        fn exe(&self, name: &str, pkg_dir: &str) -> BuiltExe {
+            let path = self.target().join("quicksilver/deps").join(name);
+            fs::write(&path, name).unwrap();
+            BuiltExe {
+                path,
+                manifest_dir: Some(self.root.join(pkg_dir)),
+            }
+        }
+    }
+
+    fn test(binary_rel: &str, cwd_rel: &str) -> TestInfo {
+        TestInfo {
+            id: format!("{cwd_rel}::t"),
+            name: "t".into(),
+            package: cwd_rel.into(),
+            binary_id: cwd_rel.into(),
+            binary_name: String::new(),
+            binary_rel: binary_rel.into(),
+            cwd_rel: cwd_rel.into(),
+            duration_secs: 0.1,
+        }
+    }
+
+    #[test]
+    fn fresh_fingerprint_beats_a_stale_exact_path() {
+        // clap: the baseline's `builder-225d...` is still in the cloned
+        // target/, but the schema build produced `builder-9999...`.
+        let w = Worker::new();
+        let stale = w.exe("builder-225d7afc8b310acb", "clap");
+        let fresh = w.exe("builder-9999999999999999", "clap");
+        let got = resolve_binary(
+            &w.target(),
+            &test("quicksilver/deps/builder-225d7afc8b310acb", "clap"),
+            std::slice::from_ref(&fresh),
+        )
+        .unwrap();
+        assert_eq!(got, fresh.path);
+        assert_ne!(got, stale.path);
+    }
+
+    #[test]
+    fn same_target_name_in_two_packages_resolves_by_manifest_dir() {
+        let w = Worker::new();
+        let a = w.exe("testsuite-1111111111111111", "crate_a");
+        let b = w.exe("testsuite-2222222222222222", "crate_b");
+        let built = vec![a.clone(), b.clone()];
+        let rel = "quicksilver/deps/testsuite-0000000000000000";
+        assert_eq!(
+            resolve_binary(&w.target(), &test(rel, "crate_a"), &built).unwrap(),
+            a.path
+        );
+        assert_eq!(
+            resolve_binary(&w.target(), &test(rel, "crate_b"), &built).unwrap(),
+            b.path
+        );
+    }
+
     #[test]
     fn base_match_is_exact_and_never_a_substring() {
-        let built = entries(&[
-            ("bifrost_mcp_property_fuzzer-abcdef1234567890", 100),
-            ("bifrost-1111111111111111", 100),
-        ]);
         // The old substring scan matched the fuzzer for needle "bifrost".
-        let m = pick_by_base("bifrost", &built).expect("bifrost harness");
-        assert_eq!(built[m.index].0, "bifrost-1111111111111111");
-        assert_eq!(m.total, 1);
-        // And for needle "mcp_property_fuzzer" too; now neither matches.
-        assert_eq!(pick_by_base("mcp_property_fuzzer", &built), None);
+        let w = Worker::new();
+        let fuzzer = w.exe("bifrost_mcp_property_fuzzer-abcdef1234567890", "");
+        let harness = w.exe("bifrost-1111111111111111", "");
+        let built = vec![fuzzer, harness.clone()];
+        let rel = "quicksilver/deps/bifrost-0000000000000000";
+        assert_eq!(
+            resolve_binary(&w.target(), &test(rel, ""), &built).unwrap(),
+            harness.path
+        );
+        let rel = "quicksilver/deps/mcp_property_fuzzer-0000000000000000";
+        assert!(resolve_binary(&w.target(), &test(rel, ""), &built).is_err());
     }
 
     #[test]
-    fn multiple_fingerprints_of_one_target_resolve_to_the_newest() {
-        let built = entries(&[
-            ("brokk_bifrost_core-1111111111111111", 100),
-            ("brokk_bifrost_core-2222222222222222", 500),
-            ("brokk_bifrost_core-3333333333333333", 300),
-            ("unrelated-4444444444444444", 900),
-        ]);
-        let m = pick_by_base("brokk_bifrost_core", &built).expect("some fingerprint");
-        assert_eq!(m.total, 3, "all three fingerprints are candidates");
-        assert_eq!(built[m.index].0, "brokk_bifrost_core-2222222222222222");
-    }
-
-    #[test]
-    fn equal_mtimes_keep_the_first_entry() {
-        let built = entries(&[
-            ("core-1111111111111111", 100),
-            ("core-2222222222222222", 100),
-        ]);
-        let m = pick_by_base("core", &built).expect("tie");
-        assert_eq!(built[m.index].0, "core-1111111111111111");
-    }
-
-    #[test]
-    fn no_candidate_is_none_so_the_caller_bails() {
-        let built = entries(&[("some_other_crate-1111111111111111", 100)]);
-        assert_eq!(pick_by_base("brokk_bifrost_core", &built), None);
-        assert_eq!(pick_by_base("", &built), None);
+    fn exact_fresh_name_wins_over_other_fresh_fingerprints() {
+        let w = Worker::new();
+        let one = w.exe("core-1111111111111111", "");
+        let two = w.exe("core-2222222222222222", "");
+        let built = vec![one.clone(), two];
+        let rel = "quicksilver/deps/core-1111111111111111";
+        assert_eq!(
+            resolve_binary(&w.target(), &test(rel, ""), &built).unwrap(),
+            one.path
+        );
     }
 }

@@ -18,9 +18,16 @@ path = "src/lib.rs"
 name = "cargo-quicksilver"
 path = "src/main.rs"
 
+[features]
+# Static test selection from Bifrost's usage graph (BrokkAi/bifrost-dev#6229).
+# The published brokk-bifrost-tools 0.14.0 predates that API, so this needs
+# a newer Bifrost through a local [patch] until one is released.
+static-selection = []
+
 [dependencies]
 anyhow = "1"
-brokk-bifrost-analysis = "=0.13.0"
+brokk-bifrost-analysis = "=0.14.0"
+brokk-bifrost-tools = "=0.14.0"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"

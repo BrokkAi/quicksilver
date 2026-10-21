@@ -262,7 +262,10 @@ pub fn execute(
     } else {
         None
     };
-    let _ = fs::remove_dir_all(paths.runs.join("schema"));
+    // QS_KEEP_RUNS=1 keeps staged schema binaries for debugging.
+    if std::env::var_os("QS_KEEP_RUNS").is_none() {
+        let _ = fs::remove_dir_all(paths.runs.join("schema"));
+    }
 
     Ok(ExecResult {
         cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
@@ -557,6 +560,22 @@ fn run_crate(
             .unwrap_or(crate_root.as_path()),
     );
 
+    // A crate whose mutants have no candidate tests cannot be judged; build
+    // nothing and say so rather than fail the null-schema gate on 0 tests.
+    if planned.iter().all(|p| p.tests.is_empty()) {
+        let decided: BTreeSet<String> = unviable.iter().map(|o| o.mutant.id.clone()).collect();
+        for p in &planned {
+            if !decided.contains(&p.mutant.id) {
+                unviable.push(Outcome::not_covered(p.mutant.clone()));
+            }
+        }
+        return Ok(CrateDone {
+            unviable,
+            ready: Vec::new(),
+            keep: Vec::new(),
+        });
+    }
+
     let mut packages = vec![package.to_string()];
     for p in &planned {
         for t in &p.tests {
@@ -660,7 +679,7 @@ fn run_crate(
 struct Isolated {
     sites: Vec<Site>,
     unviable: Vec<(String, String)>,
-    executables: Vec<PathBuf>,
+    executables: Vec<crate::cargo_cmd::BuiltExe>,
 }
 
 fn cargo_build(
@@ -686,7 +705,7 @@ fn finalize_test_binaries(
     test_packages: &[String],
     crate_only: CapturedBuild,
     cargo_invocations: &AtomicU64,
-) -> Result<Vec<PathBuf>> {
+) -> Result<Vec<crate::cargo_cmd::BuiltExe>> {
     let only_mutated =
         test_packages.is_empty() || (test_packages.len() == 1 && test_packages[0] == mutated);
     if only_mutated {
@@ -696,7 +715,7 @@ fn finalize_test_binaries(
     if !full.success {
         bail!(
             "schema test packages failed to compile against a clean mutated crate:\n{}",
-            tail_utf8(&full.stderr)
+            compiler_errors(&full.stdout, &full.stderr)
         );
     }
     Ok(full.executables)
@@ -1162,7 +1181,7 @@ fn stage_binaries(
     run_dir: &Path,
     planned: &[PlannedMutant],
     sites: &[Site],
-    executables: &[PathBuf],
+    executables: &[crate::cargo_cmd::BuiltExe],
 ) -> Result<()> {
     if let Some(parent) = run_dir.parent() {
         fs::create_dir_all(parent)?;
@@ -1187,35 +1206,44 @@ fn stage_binaries(
             }
         }
     }
-    let mut name_to_exe: HashMap<String, PathBuf> = HashMap::new();
-    for exe in executables {
-        if let Some(name) = exe.file_name() {
-            name_to_exe.insert(name.to_string_lossy().into_owned(), exe.clone());
-        }
+    let mut built: Vec<crate::cargo_cmd::BuiltExe> = executables.to_vec();
+    if built.is_empty() {
+        built.extend(
+            scan_test_exes(target)
+                .into_values()
+                .map(|path| crate::cargo_cmd::BuiltExe {
+                    path,
+                    manifest_dir: None,
+                }),
+        );
     }
-    if name_to_exe.is_empty() {
-        name_to_exe.extend(scan_test_exes(target));
-    }
+    // One staged copy per distinct binary: tests share harnesses, and a copy
+    // per test staged 1,380 copies of clap's test binaries.
+    let mut staged: HashMap<PathBuf, String> = HashMap::new();
     let mut manifest_tests = Vec::new();
-    for (i, t) in tests.iter().enumerate() {
-        let dest_name = format!("bin{i}");
-        let src = resolve_binary(target, t, &name_to_exe)?;
-        if let Some(name) = src.file_name() {
-            name_to_exe.insert(name.to_string_lossy().into_owned(), src.clone());
-        }
-        let dest = run_dir.join(&dest_name);
-        backend.clone_file(&src, &dest).or_else(|_| {
-            fs::copy(&src, &dest)
-                .map(|_| ())
-                .context("copy test binary")
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = fs::metadata(&dest)?.permissions();
-            perm.set_mode(0o755);
-            fs::set_permissions(&dest, perm)?;
-        }
+    for t in tests.iter() {
+        let src = resolve_binary(target, t, &built)?;
+        let dest_name = match staged.get(&src) {
+            Some(name) => name.clone(),
+            None => {
+                let dest_name = format!("bin{}", staged.len());
+                let dest = run_dir.join(&dest_name);
+                backend.clone_file(&src, &dest).or_else(|_| {
+                    fs::copy(&src, &dest)
+                        .map(|_| ())
+                        .context("copy test binary")
+                })?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perm = fs::metadata(&dest)?.permissions();
+                    perm.set_mode(0o755);
+                    fs::set_permissions(&dest, perm)?;
+                }
+                staged.insert(src.clone(), dest_name.clone());
+                dest_name
+            }
+        };
         manifest_tests.push(ManifestTest {
             name: t.name.clone(),
             binary: dest_name,
@@ -1273,6 +1301,33 @@ fn rebase_to_worker(path: &Path, baseline: &Path, worker: &Path) -> PathBuf {
         return worker.join(rel);
     }
     path.to_path_buf()
+}
+
+/// The first rendered rustc errors from a `--message-format=json` build.
+/// With JSON output, diagnostics are on stdout and stderr only has cargo's
+/// "could not compile" summary, so a stderr tail hides the actual error.
+fn compiler_errors(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut out = String::new();
+    for line in stdout.split(|b| *b == b'\n') {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("reason").and_then(|r| r.as_str()) != Some("compiler-message") {
+            continue;
+        }
+        let msg = &v["message"];
+        if msg.get("level").and_then(|l| l.as_str()) != Some("error") {
+            continue;
+        }
+        if let Some(rendered) = msg.get("rendered").and_then(|r| r.as_str()) {
+            out.push_str(rendered);
+            if out.len() > 6000 {
+                break;
+            }
+        }
+    }
+    out.push_str(&tail_utf8(stderr));
+    out
 }
 
 fn tail_utf8(bytes: &[u8]) -> String {

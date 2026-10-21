@@ -12,6 +12,7 @@ pub mod higher_order;
 pub mod index;
 pub mod outcome;
 pub mod plan;
+#[cfg(feature = "static-selection")]
 pub mod reach;
 pub mod report;
 pub mod schema;
@@ -49,6 +50,12 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     }
 }
 
+#[cfg(not(feature = "static-selection"))]
+fn cmd_graph_probe(_common: &cli::CommonOpts, _args: cli::GraphProbeArgs) -> Result<i32> {
+    anyhow::bail!("graph-probe needs a build with --features static-selection")
+}
+
+#[cfg(feature = "static-selection")]
 fn cmd_graph_probe(common: &cli::CommonOpts, args: cli::GraphProbeArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let root = args.root.clone().unwrap_or_else(|| cfg.repo_root.clone());
@@ -104,6 +111,26 @@ fn cmd_graph_probe(common: &cli::CommonOpts, args: cli::GraphProbeArgs) -> Resul
         complete,
         total_tests
     );
+    if let Some(path) = &cfg.json {
+        let selections: Vec<serde_json::Value> = sample
+            .iter()
+            .map(|m| {
+                let sel = reach.select(m);
+                serde_json::json!({
+                    "id": m.id, "path": m.path, "fqn": m.fqn, "start_byte": m.start_byte,
+                    "complete": sel.complete, "fallback_reason": sel.fallback_reason,
+                    "reached_functions": sel.reached_functions,
+                    "tests": sel.tests.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        crate::util::write_atomic(
+            path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "stats": reach.stats, "selections": selections,
+            }))?,
+        )?;
+    }
     Ok(0)
 }
 

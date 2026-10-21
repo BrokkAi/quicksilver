@@ -3,10 +3,10 @@ use crate::types::Mutant;
 use crate::util::{hex, line_col_to_offset};
 use anyhow::{Context, Result};
 use brokk_bifrost_analysis::analyzer::test_paths;
-use brokk_bifrost_analysis::diff_analysis::{
+use brokk_bifrost_analysis::{CancellationToken, CodeUnitType, Language, WorkspaceAnalyzer};
+use brokk_bifrost_tools::diff_analysis::{
     analyze_diff_at_root, AnalyzeDiffParams, DiffAnalysisOptions, DiffCallEdges,
 };
-use brokk_bifrost_analysis::{CancellationToken, CodeUnitType, Language, WorkspaceAnalyzer};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use quote::ToTokens;
 use sha2::{Digest, Sha256};
@@ -105,6 +105,10 @@ pub fn discover_in(
     };
 
     let analyzer = workspace.analyzer();
+    let root_abs = std::path::PathBuf::from(meta.workspace_root.as_str());
+    let mut scopes: std::collections::HashMap<String, Option<crate::cargo_cmd::MutableScope>> =
+        std::collections::HashMap::new();
+    let mut skipped_proc_macro: BTreeSet<String> = BTreeSet::new();
 
     let mut mutants = Vec::new();
     for unit in analyzer.all_declarations() {
@@ -131,6 +135,19 @@ pub fn discover_in(
         let Some(package) = package_for_path(&meta, &rel) else {
             continue;
         };
+        let scope = scopes
+            .entry(package.clone())
+            .or_insert_with(|| crate::cargo_cmd::mutable_scope(&meta, &package));
+        let Some(scope) = scope.as_ref() else {
+            continue;
+        };
+        if scope.proc_macro {
+            skipped_proc_macro.insert(package.clone());
+            continue;
+        }
+        if !scope.contains(&root_abs.join(&rel)) {
+            continue;
+        }
         if !filter.packages.is_empty() && !filter.packages.iter().any(|p| p == &package) {
             continue;
         }
@@ -205,6 +222,12 @@ pub fn discover_in(
         ))
     });
     disambiguate_ids(&mut mutants);
+    if !skipped_proc_macro.is_empty() {
+        eprintln!(
+            "skipping proc-macro crates (their code runs inside rustc at build time, so run-time mutant switching cannot test it): {}",
+            skipped_proc_macro.into_iter().collect::<Vec<_>>().join(", ")
+        );
+    }
     Ok(mutants)
 }
 
