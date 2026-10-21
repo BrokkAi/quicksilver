@@ -95,8 +95,17 @@ pub fn fast_linker() -> Option<&'static str> {
     }
 }
 
-pub fn rustc_sysroot() -> Result<PathBuf> {
-    let out = Command::new("rustc")
+/// `rustc` as a cargo child in `cwd` would see it: that directory's
+/// `rust-toolchain.toml` or the rustup default, never QS's own pin.
+fn workspace_rustc(cwd: &Path) -> Command {
+    let mut cmd = Command::new("rustc");
+    cmd.current_dir(cwd);
+    cmd.env_remove("RUSTUP_TOOLCHAIN");
+    cmd
+}
+
+pub fn rustc_sysroot(cwd: &Path) -> Result<PathBuf> {
+    let out = workspace_rustc(cwd)
         .args(["--print", "sysroot"])
         .output()
         .context("rustc --print sysroot")?;
@@ -108,8 +117,8 @@ pub fn rustc_sysroot() -> Result<PathBuf> {
     ))
 }
 
-pub fn host_triple() -> Result<String> {
-    let out = Command::new("rustc")
+pub fn host_triple(cwd: &Path) -> Result<String> {
+    let out = workspace_rustc(cwd)
         .args(["-vV"])
         .output()
         .context("rustc -vV")?;
@@ -121,17 +130,20 @@ pub fn host_triple() -> Result<String> {
     bail!("no host: line in rustc -vV")
 }
 
-pub fn rustc_verbose_version() -> Result<String> {
-    let out = Command::new("rustc")
+pub fn rustc_verbose_version(cwd: &Path) -> Result<String> {
+    let out = workspace_rustc(cwd)
         .args(["-vV"])
         .output()
         .context("rustc -vV")?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-pub fn find_llvm_tool(name: &str) -> Result<PathBuf> {
-    let sysroot = rustc_sysroot()?;
-    let triple = host_triple()?;
+/// The LLVM tool that matches the toolchain building `workspace`. A tool
+/// from another LLVM major cannot read the profiles and reports every one as
+/// corrupt, so there is no PATH or distro fallback.
+pub fn find_llvm_tool(name: &str, workspace: &Path) -> Result<PathBuf> {
+    let sysroot = rustc_sysroot(workspace)?;
+    let triple = host_triple(workspace)?;
     let in_sysroot = sysroot
         .join("lib/rustlib")
         .join(&triple)
@@ -140,14 +152,14 @@ pub fn find_llvm_tool(name: &str) -> Result<PathBuf> {
     if in_sysroot.is_file() {
         return Ok(in_sysroot);
     }
-    if let Some(p) = which(name) {
-        return Ok(p);
-    }
-    let distro = PathBuf::from(format!("/usr/lib/llvm-21/bin/{name}"));
-    if distro.is_file() {
-        return Ok(distro);
-    }
-    bail!("could not find {name}; install the rustup llvm-tools component")
+    let toolchain = sysroot
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| sysroot.display().to_string());
+    bail!(
+        "{name} is missing from toolchain {toolchain}, which builds {}; run `rustup component add llvm-tools --toolchain {toolchain}`",
+        workspace.display()
+    )
 }
 
 pub fn format_duration(secs: f64) -> String {

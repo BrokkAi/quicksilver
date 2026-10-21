@@ -1,4 +1,5 @@
 pub mod baseline;
+pub mod bifrost;
 pub mod cargo_cmd;
 pub mod cli;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod higher_order;
 pub mod index;
 pub mod outcome;
 pub mod plan;
+pub mod reach;
 pub mod report;
 pub mod schema;
 pub mod scratch;
@@ -43,7 +45,66 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Run(args) => cmd_run(&cli.common, args),
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
+        cli::Command::GraphProbe(args) => cmd_graph_probe(&cli.common, args),
     }
+}
+
+fn cmd_graph_probe(common: &cli::CommonOpts, args: cli::GraphProbeArgs) -> Result<i32> {
+    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
+    let root = args.root.clone().unwrap_or_else(|| cfg.repo_root.clone());
+    let opened = crate::bifrost::open_workspace(&root)?;
+    eprintln!(
+        "bifrost open: {:.2}s (store {:?})",
+        opened.open_secs, opened.store_path
+    );
+    let start = std::time::Instant::now();
+    let mutants =
+        crate::discover::discover_in(&opened.workspace, &root, &engine::discover_filter(&cfg))?;
+    eprintln!(
+        "discovered {} mutants in {:.2}s",
+        mutants.len(),
+        start.elapsed().as_secs_f64()
+    );
+    let meta = crate::cargo_cmd::load_metadata(&root)?;
+    let tests = match &args.nextest_list {
+        Some(p) => {
+            let bytes = std::fs::read(p)?;
+            crate::index::parse_nextest_list(&bytes, &meta, &root.join("target"))?
+        }
+        None => Vec::new(),
+    };
+    let reach = crate::reach::ReachIndex::build(&opened.workspace, &meta, &tests)?;
+    println!("{}", serde_json::to_string_pretty(&reach.stats)?);
+    let start = std::time::Instant::now();
+    let sample = sample_mutants(&mutants, args.sample, args.sample_seed);
+    let mut complete = 0usize;
+    let mut total_tests = 0usize;
+    for m in &sample {
+        let sel = reach.select(m);
+        complete += usize::from(sel.complete);
+        total_tests += sel.tests.len();
+        println!(
+            "{:<70} complete={} reached_fns={} tests={}{}",
+            format!("{}:{}", m.path, m.fqn),
+            sel.complete,
+            sel.reached_functions,
+            sel.tests.len(),
+            sel.fallback_reason
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default()
+        );
+        for t in sel.tests.iter().take(5) {
+            println!("    {}", t.id);
+        }
+    }
+    eprintln!(
+        "selected for {} mutants in {:.2}s: {} complete, {} tests total",
+        sample.len(),
+        start.elapsed().as_secs_f64(),
+        complete,
+        total_tests
+    );
+    Ok(0)
 }
 
 fn cmd_probe(common: &cli::CommonOpts, args: cli::ProbeArgs) -> Result<i32> {

@@ -113,7 +113,7 @@ impl CoverageIndex {
 pub fn source_cache_key(root: &Path) -> Result<String> {
     let mut h = sha2::Sha256::new();
     use sha2::Digest;
-    h.update(rustc_verbose_version()?.as_bytes());
+    h.update(rustc_verbose_version(root)?.as_bytes());
     let lock = root.join("Cargo.lock");
     if lock.is_file() {
         h.update(sha256_file(&lock)?.as_bytes());
@@ -452,8 +452,8 @@ fn run_union_coverage(
     let prof_root = paths.index.join("union-profraw");
     fs::create_dir_all(&prof_root)?;
     let meta = load_metadata(&paths.baseline)?;
-    let llvm_profdata = find_llvm_tool("llvm-profdata")?;
-    let llvm_cov = find_llvm_tool("llvm-cov")?;
+    let llvm_profdata = find_llvm_tool("llvm-profdata", &paths.baseline)?;
+    let llvm_cov = find_llvm_tool("llvm-cov", &paths.baseline)?;
     let merged = paths.index.join("union.profdata");
     let progress_path = paths.index.join("stage-a-progress.json");
 
@@ -1036,8 +1036,8 @@ fn invert_tests(
     if jobs.is_empty() {
         return Ok(HashMap::new());
     }
-    let llvm_profdata = find_llvm_tool("llvm-profdata")?;
-    let llvm_cov = find_llvm_tool("llvm-cov")?;
+    let llvm_profdata = find_llvm_tool("llvm-profdata", &paths.baseline)?;
+    let llvm_cov = find_llvm_tool("llvm-cov", &paths.baseline)?;
     let prof_root = paths.index.join("profraw");
     let _ = fs::remove_dir_all(&prof_root);
     fs::create_dir_all(&prof_root)?;

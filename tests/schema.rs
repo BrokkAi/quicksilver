@@ -7,8 +7,8 @@ use cargo_quicksilver::types::VerdictKind;
 
 fn tools_ok() -> bool {
     cargo_quicksilver::cargo_cmd::nextest_available()
-        && cargo_quicksilver::util::find_llvm_tool("llvm-cov").is_ok()
-        && cargo_quicksilver::util::find_llvm_tool("llvm-profdata").is_ok()
+        && cargo_quicksilver::util::find_llvm_tool("llvm-cov", &support::fixture_src()).is_ok()
+        && cargo_quicksilver::util::find_llvm_tool("llvm-profdata", &support::fixture_src()).is_ok()
 }
 
 fn schema_cfg(

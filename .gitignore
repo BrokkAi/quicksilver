@@ -2,3 +2,4 @@
 **/*.profraw
 **/*.profdata
 .quicksilver
+.bifrost/

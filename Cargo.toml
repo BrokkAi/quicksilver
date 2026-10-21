@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-brokk-bifrost-analysis = "=0.10.6"
+brokk-bifrost-analysis = "=0.13.0"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"

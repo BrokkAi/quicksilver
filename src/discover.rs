@@ -4,17 +4,14 @@ use crate::util::{hex, line_col_to_offset};
 use anyhow::{Context, Result};
 use brokk_bifrost_analysis::analyzer::test_paths;
 use brokk_bifrost_analysis::diff_analysis::{
-    analyze_diff_at_root, AnalyzeDiffParams, DiffAnalysisOptions,
+    analyze_diff_at_root, AnalyzeDiffParams, DiffAnalysisOptions, DiffCallEdges,
 };
-use brokk_bifrost_analysis::{
-    AnalyzerConfig, CodeUnitType, FilesystemProject, Language, WorkspaceAnalyzer,
-};
+use brokk_bifrost_analysis::{CancellationToken, CodeUnitType, Language, WorkspaceAnalyzer};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use quote::ToTokens;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::Arc;
 use syn::spanned::Spanned;
 use syn::{Block, ImplItemFn, ItemFn, ReturnType, Type};
 
@@ -90,6 +87,15 @@ pub struct DiscoverFilter {
 }
 
 pub fn discover(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
+    let opened = crate::bifrost::open_workspace(root)?;
+    discover_in(&opened.workspace, root, filter)
+}
+
+pub fn discover_in(
+    workspace: &WorkspaceAnalyzer,
+    root: &Path,
+    filter: &DiscoverFilter,
+) -> Result<Vec<Mutant>> {
     let meta = load_metadata(root)?;
     let globset = file_globset(&filter.files)?;
     let diff_fqns = if let Some(spec) = &filter.in_diff {
@@ -98,12 +104,6 @@ pub fn discover(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
         None
     };
 
-    let project = Arc::new(
-        FilesystemProject::new(root)
-            .with_context(|| format!("FilesystemProject {}", root.display()))?,
-    );
-    let workspace = WorkspaceAnalyzer::build_ephemeral(project, AnalyzerConfig::default())
-        .map_err(|e| anyhow::anyhow!("WorkspaceAnalyzer::build_ephemeral: {e}"))?;
     let analyzer = workspace.analyzer();
 
     let mut mutants = Vec::new();
@@ -240,15 +240,22 @@ fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<BTreeSet<String>> {
             base: Some(base.to_string()),
             target: Some(target.to_string()),
             include_tests: false,
+            call_edges: DiffCallEdges::Omit,
         }
     } else {
         AnalyzeDiffParams {
             base: Some(spec.to_string()),
             target: None,
             include_tests: false,
+            call_edges: DiffCallEdges::Omit,
         }
     };
-    let result = analyze_diff_at_root(root, params, &DiffAnalysisOptions::default())
+    let result = analyze_diff_at_root(
+        root,
+        params,
+        &DiffAnalysisOptions::default(),
+        &CancellationToken::default(),
+    )
         .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
     let mut set = BTreeSet::new();
     for e in result.patch_symbols.edited {

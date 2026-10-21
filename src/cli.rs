@@ -122,6 +122,25 @@ pub enum Command {
     Probe(ProbeArgs),
     /// Compare impact-selected verdicts to full-suite verdicts.
     AuditSelection(AuditSelectionArgs),
+    /// Build Bifrost's usage graph and print static test selections.
+    #[command(hide = true)]
+    GraphProbe(GraphProbeArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GraphProbeArgs {
+    /// Workspace to analyze. Defaults to the repository root.
+    #[arg(long)]
+    pub root: Option<std::path::PathBuf>,
+    /// nextest test list JSON (`cargo nextest list --message-format json`).
+    /// Without it, selections report reached functions only.
+    #[arg(long)]
+    pub nextest_list: Option<std::path::PathBuf>,
+    /// Mutants to print selections for (0 = none).
+    #[arg(long, default_value_t = 20)]
+    pub sample: usize,
+    #[arg(long, default_value_t = 1)]
+    pub sample_seed: u64,
 }
 
 #[derive(Args, Debug)]
