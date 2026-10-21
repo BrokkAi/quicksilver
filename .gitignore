@@ -3,3 +3,4 @@
 **/*.profdata
 .quicksilver
 .bifrost/
+__pycache__/
