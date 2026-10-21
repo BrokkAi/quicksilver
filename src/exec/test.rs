@@ -258,20 +258,31 @@ fn resolve_tests(
     let manifest_path = run_dir.join("manifest.json");
     let text = fs::read_to_string(&manifest_path)?;
     let manifest: BinariesManifest = serde_json::from_str(&text)?;
+    // Exact id first. Two test binaries in one package often share a test
+    // name (`test_parse` in tests/test_version.rs and tests/test_identifier.rs);
+    // a name match must never shadow a later exact id match.
+    let find = |want: &crate::types::TestInfo| -> Option<&ManifestTest> {
+        (!want.id.is_empty())
+            .then(|| manifest.tests.iter().find(|t| t.id == want.id))
+            .flatten()
+            .or_else(|| {
+                manifest
+                    .tests
+                    .iter()
+                    .find(|t| t.name == want.name && t.cwd_rel == want.cwd_rel)
+            })
+            .or_else(|| manifest.tests.iter().find(|t| t.name == want.name))
+    };
     let tests: Vec<&ManifestTest> = if planned.tests.is_empty() {
         manifest.tests.iter().collect()
     } else {
-        planned
-            .tests
-            .iter()
-            .filter_map(|want| {
-                manifest.tests.iter().find(|t| {
-                    (!want.id.is_empty() && (t.id == want.id || t.name == want.name))
-                        || (t.name == want.name && t.cwd_rel == want.cwd_rel)
-                        || t.name == want.name
-                })
-            })
-            .collect()
+        let mut picked: Vec<&ManifestTest> = Vec::new();
+        for t in planned.tests.iter().filter_map(find) {
+            if !picked.iter().any(|p| std::ptr::eq(*p, t)) {
+                picked.push(t);
+            }
+        }
+        picked
     };
     let tests = if tests.is_empty() {
         manifest.tests.iter().collect::<Vec<_>>()
@@ -293,9 +304,8 @@ fn resolve_tests(
             duration_secs: planned
                 .tests
                 .iter()
-                .find(|p| {
-                    (!p.id.is_empty() && (p.id == t.id || p.name == t.name)) || p.name == t.name
-                })
+                .find(|p| !p.id.is_empty() && p.id == t.id)
+                .or_else(|| planned.tests.iter().find(|p| p.name == t.name))
                 .map(|p| p.duration_secs)
                 .unwrap_or(0.001),
         })
@@ -745,6 +755,79 @@ mod tests {
         assert_eq!(
             test_timeout_scaled(17.0, Duration::from_secs(5), 1.0),
             test_timeout(17.0, Duration::from_secs(5))
+        );
+    }
+
+    /// Two test binaries of one package each have `test_parse`. Each planned
+    /// test must resolve to its own binary, not to the first name match.
+    #[test]
+    fn same_name_in_two_binaries_resolves_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = BinariesManifest {
+            mutant_id: "schema".into(),
+            tests: vec![
+                ManifestTest {
+                    name: "test_parse".into(),
+                    binary: "test_identifier-aaaa".into(),
+                    cwd_rel: "".into(),
+                    id: "semver::test_identifier::test_parse".into(),
+                },
+                ManifestTest {
+                    name: "test_parse".into(),
+                    binary: "test_version-bbbb".into(),
+                    cwd_rel: "".into(),
+                    id: "semver::test_version::test_parse".into(),
+                },
+            ],
+        };
+        fs::write(
+            dir.path().join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let want = |id: &str, secs: f64| crate::types::TestInfo {
+            id: id.into(),
+            name: "test_parse".into(),
+            package: "semver".into(),
+            binary_id: id.rsplit_once("::").unwrap().0.into(),
+            binary_name: String::new(),
+            binary_rel: String::new(),
+            cwd_rel: "".into(),
+            duration_secs: secs,
+        };
+        let planned = PlannedMutant {
+            mutant: fake_mutant(),
+            tests: vec![
+                want("semver::test_version::test_parse", 0.5),
+                want("semver::test_identifier::test_parse", 0.25),
+            ],
+            estimated_cost_secs: 0.0,
+        };
+        let resolved = resolve_tests(&planned, dir.path(), dir.path()).unwrap();
+        let got: Vec<(String, String, f64)> = resolved
+            .iter()
+            .map(|t| {
+                (
+                    t.id.clone(),
+                    t.binary.file_name().unwrap().to_string_lossy().into_owned(),
+                    t.duration_secs,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "semver::test_version::test_parse".into(),
+                    "test_version-bbbb".into(),
+                    0.5
+                ),
+                (
+                    "semver::test_identifier::test_parse".into(),
+                    "test_identifier-aaaa".into(),
+                    0.25
+                ),
+            ]
         );
     }
 

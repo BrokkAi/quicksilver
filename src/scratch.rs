@@ -2,6 +2,7 @@ use crate::config::{CloneBackendKind, Config};
 use crate::types::Paths;
 use anyhow::{bail, Context, Result};
 use ignore::WalkBuilder;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::symlink;
@@ -504,6 +505,9 @@ fn copy_file_range_path(src: &Path, dst: &Path) -> io::Result<()> {
     if left != 0 {
         return Err(io::Error::other("copy_file_range short write"));
     }
+    // A new file gets the umask's mode, not the source's: executables such
+    // as build-script-build in a cloned target/ would lose their x bit.
+    dst_f.set_permissions(meta.permissions())?;
     Ok(())
 }
 
@@ -625,6 +629,105 @@ pub fn materialize_baseline(repo: &Path, baseline: &Path) -> Result<()> {
     copy_git(repo, baseline)?;
     write_quicksilver_cargo_config(baseline)?;
     Ok(())
+}
+
+/// What [`sync_baseline`] changed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SyncReport {
+    pub copied: usize,
+    pub removed: usize,
+    pub git_refreshed: bool,
+}
+
+/// Bring an existing baseline copy up to date with `repo` in place. Only
+/// files whose content differs are rewritten, so cargo's incremental state
+/// stays valid for the rest. `target/` and Bifrost's `.bifrost/cache/` are
+/// never touched; replacing the baseline would throw both away on every
+/// commit.
+pub fn sync_baseline(repo: &Path, baseline: &Path) -> Result<SyncReport> {
+    let mut report = SyncReport::default();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let walker = WalkBuilder::new(repo)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .filter_entry(|e| {
+            let name = e.file_name();
+            name != "target" && name != ".git"
+        })
+        .build();
+    for entry in walker {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = match path.strip_prefix(repo) {
+            Ok(r) if !r.as_os_str().is_empty() => r.to_path_buf(),
+            _ => continue,
+        };
+        let dest = baseline.join(&rel);
+        let ft = entry.file_type();
+        seen.insert(rel);
+        if ft.map(|t| t.is_dir()).unwrap_or(false) {
+            fs::create_dir_all(&dest)?;
+        } else if ft.map(|t| t.is_symlink()).unwrap_or(false) {
+            let target = fs::read_link(path)?;
+            if fs::read_link(&dest).ok().as_ref() != Some(&target) {
+                if let Some(p) = dest.parent() {
+                    fs::create_dir_all(p)?;
+                }
+                let _ = fs::remove_file(&dest);
+                symlink(target, &dest)?;
+                report.copied += 1;
+            }
+        } else if ft.map(|t| t.is_file()).unwrap_or(false) && !same_file_content(path, &dest)? {
+            if let Some(p) = dest.parent() {
+                fs::create_dir_all(p)?;
+            }
+            if fs::symlink_metadata(&dest).is_ok_and(|m| !m.is_file()) {
+                let _ = fs::remove_file(&dest);
+            }
+            fs::copy(path, &dest)?;
+            report.copied += 1;
+        }
+    }
+    let quicksilver_config = PathBuf::from(".cargo/config.toml");
+    let stale: Vec<PathBuf> = WalkBuilder::new(baseline)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .filter_entry(|e| {
+            let name = e.file_name();
+            name != "target" && name != ".git" && !e.path().ends_with(".bifrost/cache")
+        })
+        .build()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_some_and(|t| !t.is_dir()))
+        .filter_map(|e| {
+            let rel = e.path().strip_prefix(baseline).ok()?.to_path_buf();
+            (!seen.contains(&rel) && rel != quicksilver_config).then_some(rel)
+        })
+        .collect();
+    for rel in stale {
+        fs::remove_file(baseline.join(&rel))?;
+        report.removed += 1;
+    }
+    let head = |dir: &Path| git_output(dir, &["rev-parse", "HEAD"]).ok();
+    if !baseline.join(".git").exists() || head(repo) != head(baseline) {
+        let _ = fs::remove_dir_all(baseline.join(".git"));
+        copy_git(repo, baseline)?;
+        report.git_refreshed = true;
+    }
+    write_quicksilver_cargo_config(baseline)?;
+    Ok(report)
+}
+
+fn same_file_content(a: &Path, b: &Path) -> Result<bool> {
+    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::symlink_metadata(b)) else {
+        return Ok(false);
+    };
+    if !mb.is_file() || ma.len() != mb.len() {
+        return Ok(false);
+    }
+    Ok(fs::read(a)? == fs::read(b)?)
 }
 
 /// Profile lives in the materialized baseline, not in the user's repo.
@@ -874,6 +977,76 @@ pub fn format_probe(report: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sync_baseline_updates_in_place_and_keeps_build_state() {
+        let repo = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let w = |root: &Path, rel: &str, body: &str| {
+            let p = root.join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        };
+        w(repo.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
+        w(repo.path(), "src/lib.rs", "pub fn a() {}\n");
+        w(repo.path(), "src/gone.rs", "// removed later\n");
+        w(repo.path(), ".gitignore", "/target\n");
+        materialize_baseline(repo.path(), base.path()).unwrap();
+        w(base.path(), "target/debug/keep", "build state");
+        w(
+            base.path(),
+            ".bifrost/cache/bifrost_cache.db",
+            "analysis state",
+        );
+        let untouched = fs::metadata(base.path().join("Cargo.toml"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        w(repo.path(), "src/lib.rs", "pub fn a() { let _ = 1; }\n");
+        w(repo.path(), "src/new.rs", "pub fn b() {}\n");
+        fs::remove_file(repo.path().join("src/gone.rs")).unwrap();
+        let report = sync_baseline(repo.path(), base.path()).unwrap();
+
+        assert_eq!((report.copied, report.removed), (2, 1));
+        assert_eq!(
+            fs::read_to_string(base.path().join("src/lib.rs")).unwrap(),
+            "pub fn a() { let _ = 1; }\n"
+        );
+        assert!(base.path().join("src/new.rs").is_file());
+        assert!(!base.path().join("src/gone.rs").exists());
+        assert!(base.path().join("target/debug/keep").is_file());
+        assert!(base
+            .path()
+            .join(".bifrost/cache/bifrost_cache.db")
+            .is_file());
+        assert!(base.path().join(".cargo/config.toml").is_file());
+        assert_eq!(
+            fs::metadata(base.path().join("Cargo.toml"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            untouched,
+            "unchanged files are not rewritten"
+        );
+        let again = sync_baseline(repo.path(), base.path()).unwrap();
+        assert_eq!((again.copied, again.removed), (0, 0));
+    }
+
+    #[test]
+    fn copy_file_range_keeps_the_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("build-script-build");
+        fs::write(&src, b"#!/bin/sh\n").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+        let dst = dir.path().join("copy");
+        copy_file_range_path(&src, &dst).unwrap();
+        assert_eq!(
+            fs::metadata(&dst).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
 
     #[test]
     fn hint_true_is_shared_even_if_delta_is_large() {

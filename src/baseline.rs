@@ -17,6 +17,21 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
     if !paths.baseline.join("Cargo.toml").is_file() {
         info!("materializing baseline from {}", cfg.repo_root.display());
         crate::scratch::materialize_baseline(&cfg.repo_root, &paths.baseline)?;
+    } else {
+        let sync = crate::scratch::sync_baseline(&cfg.repo_root, &paths.baseline)?;
+        if sync.copied + sync.removed > 0 || sync.git_refreshed {
+            info!(
+                "synced baseline from {}: {} files copied, {} removed{}",
+                cfg.repo_root.display(),
+                sync.copied,
+                sync.removed,
+                if sync.git_refreshed {
+                    ", .git refreshed"
+                } else {
+                    ""
+                }
+            );
+        }
     }
     crate::scratch::write_quicksilver_cargo_config(&paths.baseline)?;
     let meta = load_metadata(&paths.baseline)?;

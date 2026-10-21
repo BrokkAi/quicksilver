@@ -204,7 +204,30 @@ pub fn discover_in(
             &b.replacement,
         ))
     });
+    disambiguate_ids(&mut mutants);
     Ok(mutants)
+}
+
+/// Two functions in one file can share an fqn (`impl Display for Version`
+/// and `impl Debug for Version` both give `semver.Version.fmt`). Their
+/// mutants then hash to one id, and the executor, which finds a mutant's
+/// schema site by id, gives one mutant the other's verdict. The first in
+/// source order keeps the plain id, so existing state stays valid; later
+/// ones hash in their ordinal, which is stable when lines shift.
+pub fn disambiguate_ids(mutants: &mut [Mutant]) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for m in mutants.iter_mut() {
+        let n = seen.entry(m.id.clone()).or_insert(0);
+        if *n > 0 {
+            m.id = mutant_id(
+                &m.package,
+                &m.path,
+                &m.fqn,
+                &format!("{}\0#{}", m.replacement, n),
+            );
+        }
+        *n += 1;
+    }
 }
 
 pub fn mutant_id(package: &str, path: &str, fqn: &str, replacement: &str) -> String {
@@ -470,6 +493,34 @@ pub fn restore_file(root: &Path, mutant: &Mutant, original: &[u8]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn same_fqn_twice_in_a_file_gets_distinct_ids() {
+        let m = |start: usize| crate::types::Mutant {
+            id: mutant_id(
+                "semver",
+                "src/display.rs",
+                "semver.Version.fmt",
+                "{ Ok(Default::default()) }",
+            ),
+            package: "semver".into(),
+            path: "src/display.rs".into(),
+            fqn: "semver.Version.fmt".into(),
+            start_byte: start,
+            end_byte: start + 10,
+            start_line: 1,
+            end_line: 2,
+            body_start_byte: start,
+            body_end_byte: start + 10,
+            replacement: "{ Ok(Default::default()) }".into(),
+            return_kind: "result".into(),
+        };
+        let mut ms = vec![m(100), m(900)];
+        let first = ms[0].id.clone();
+        disambiguate_ids(&mut ms);
+        assert_eq!(ms[0].id, first, "first keeps its id");
+        assert_ne!(ms[0].id, ms[1].id);
+    }
+
     use super::*;
 
     #[test]
