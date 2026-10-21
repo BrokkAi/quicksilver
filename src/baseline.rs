@@ -323,7 +323,14 @@ pub fn load_baseline_report(paths: &Paths) -> Result<Option<BaselineReport>> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
-pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<BaselineReport> {
+/// `measure_costs` times one incremental rebuild per package. Only `estimate`
+/// uses those costs; `run` skips them.
+pub fn prepare_baseline(
+    cfg: &Config,
+    paths: &Paths,
+    skip: bool,
+    measure_costs: bool,
+) -> Result<BaselineReport> {
     let _meta = materialize_and_metadata(cfg, paths)?;
     if skip {
         if let Some(existing) = load_baseline_report(paths)? {
@@ -339,7 +346,11 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     }
     build_baseline(cfg, paths)?;
     let (suite_secs, tests, failed_test_ids) = run_green_suite(cfg, paths)?;
-    let package_costs = measure_package_costs(cfg, paths)?;
+    let package_costs = if measure_costs {
+        measure_package_costs(cfg, paths)?
+    } else {
+        Vec::new()
+    };
     let report = BaselineReport {
         suite_secs,
         tests,

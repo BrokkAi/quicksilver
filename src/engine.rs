@@ -108,7 +108,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
     eprintln!("{}", scratch::format_probe(&probe));
     scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
 
-    let baseline = prepare_baseline(&cfg, &paths, skip_baseline)?;
+    let baseline = prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?;
 
     let mut mutants = discover(&paths.baseline, &discover_filter(&cfg))?;
     eprintln!("discovered {} mutants", mutants.len());

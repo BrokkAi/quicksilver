@@ -67,9 +67,12 @@ pub struct ObservedRun {
     pub complete: bool,
 }
 
-/// Confirmations are serialized process-wide. A confirmation costs up to a
+/// Timeout confirmations are serialized process-wide. One costs up to a
 /// 120s calibration run; letting all test-pool threads do that at once would
-/// both swamp the box and make every measured duration useless.
+/// both swamp the box and make every measured duration useless. Failure
+/// confirmations re-run a test that just failed fast, so they run in
+/// parallel: serializing them made every caught mutant queue behind every
+/// other (itertools: 90 s of a 147 s run at 3 of 64 cores busy).
 static CONFIRM_LOCK: Mutex<()> = Mutex::new(());
 
 fn confirm_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -502,7 +505,6 @@ fn confirm_failure<R>(
 where
     R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
 {
-    let _guard = confirm_lock();
     let (retry, retry_secs, retry_err) = run(&spec_for(t, budget, extra_env, true))?;
     tracing::info!(
         "confirm {}: retry with mutant {:?} in {:.2}s; stderr: {}",
