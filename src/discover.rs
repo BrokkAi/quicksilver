@@ -10,7 +10,7 @@ use brokk_bifrost_tools::diff_analysis::{
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use quote::ToTokens;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use syn::spanned::Spanned;
 use syn::{Block, ImplItemFn, ItemFn, ReturnType, Type};
@@ -96,15 +96,57 @@ pub fn discover_in(
     root: &Path,
     filter: &DiscoverFilter,
 ) -> Result<Vec<Mutant>> {
-    let meta = load_metadata(root)?;
-    let globset = file_globset(&filter.files)?;
     let diff_started = std::time::Instant::now();
-    let diff_fqns = if let Some(spec) = &filter.in_diff {
-        Some(diff_symbol_fqns(root, spec)?)
-    } else {
-        None
+    let diff = match &filter.in_diff {
+        Some(spec) => Some(diff_symbol_fqns(root, spec)?),
+        None => None,
+    };
+    discover_with(
+        workspace,
+        root,
+        filter,
+        diff,
+        diff_started.elapsed().as_secs_f64(),
+    )
+}
+
+/// `--in-diff` discovery that analyzes only the files the diff touches,
+/// through a scoped analyzer over the shared store, instead of opening the
+/// whole workspace.
+pub fn discover_in_diff(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
+    let spec = filter
+        .in_diff
+        .as_deref()
+        .context("discover_in_diff needs --in-diff")?;
+    let diff_started = std::time::Instant::now();
+    let diff = match git_diff_lines(root, spec)? {
+        Some(lines) => DiffSelection::Lines(lines),
+        None => diff_symbol_fqns(root, spec)?,
     };
     let diff_secs = diff_started.elapsed().as_secs_f64();
+    let files: Vec<std::path::PathBuf> = diff
+        .paths()
+        .into_iter()
+        .filter(|p| p.ends_with(".rs"))
+        .map(std::path::PathBuf::from)
+        .collect();
+    if files.is_empty() {
+        tracing::info!("discovery: {diff_secs:.2}s diff analysis, no changed functions");
+        return Ok(Vec::new());
+    }
+    let opened = crate::bifrost::open_files(root, &files)?;
+    discover_with(&opened.workspace, root, filter, Some(diff), diff_secs)
+}
+
+fn discover_with(
+    workspace: &WorkspaceAnalyzer,
+    root: &Path,
+    filter: &DiscoverFilter,
+    diff_fqns: Option<DiffSelection>,
+    diff_secs: f64,
+) -> Result<Vec<Mutant>> {
+    let meta = load_metadata(root)?;
+    let globset = file_globset(&filter.files)?;
     let scan_started = std::time::Instant::now();
 
     let analyzer = workspace.analyzer();
@@ -130,7 +172,7 @@ pub fn discover_in(
         // module scope) off every other function in the workspace: on
         // itertools in a debug build they took 8 s per commit.
         if let Some(diff) = &diff_fqns {
-            if !diff.paths.contains(rel.trim_start_matches("./")) {
+            if !diff.touches_file(&rel) {
                 continue;
             }
         }
@@ -169,14 +211,14 @@ pub fn discover_in(
             }
         }
         let fqn = unit.fq_name();
-        if let Some(diff) = &diff_fqns {
-            if !diff.fqns.contains(&fqn) {
-                continue;
-            }
-        }
         let Some(range) = analyzer.ranges_of(&unit).into_iter().next() else {
             continue;
         };
+        if let Some(diff) = &diff_fqns {
+            if !diff.selects(&rel, &fqn, range.start_line, range.end_line) {
+                continue;
+            }
+        }
         let source = match unit.source().read_to_string() {
             Ok(s) => s,
             Err(_) => continue,
@@ -298,13 +340,148 @@ fn file_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
     Ok(Some(b.build()?))
 }
 
-/// The functions a diff edits or introduces, and the files they are in.
-struct DiffSymbols {
-    fqns: BTreeSet<String>,
-    paths: BTreeSet<String>,
+/// Which functions a diff selects.
+enum DiffSelection {
+    /// Bifrost's diff analysis: the edited and introduced symbols, by name,
+    /// and the files they are in.
+    Symbols {
+        fqns: BTreeSet<String>,
+        paths: BTreeSet<String>,
+    },
+    /// `git diff -U0`: per changed file, the lines of the checked-out version
+    /// that the diff touches. A function is selected when its line range
+    /// overlaps one of them, as cargo-mutants does for `--in-diff`.
+    Lines(BTreeMap<String, Vec<Hunk>>),
 }
 
-fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSymbols> {
+/// One hunk of a `-U0` diff on the new side, in 1-based lines.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Hunk {
+    /// Lines `first..=last` were added or changed.
+    Lines(usize, usize),
+    /// Lines were only removed, between line `after` and the next one.
+    RemovedAfter(usize),
+}
+
+impl Hunk {
+    fn overlaps(self, start_line: usize, end_line: usize) -> bool {
+        match self {
+            Hunk::Lines(first, last) => first <= end_line && start_line <= last,
+            Hunk::RemovedAfter(after) => start_line <= after && after < end_line,
+        }
+    }
+}
+
+impl DiffSelection {
+    fn paths(&self) -> BTreeSet<String> {
+        match self {
+            DiffSelection::Symbols { paths, .. } => paths.clone(),
+            DiffSelection::Lines(files) => files.keys().cloned().collect(),
+        }
+    }
+
+    fn touches_file(&self, rel: &str) -> bool {
+        let rel = rel.trim_start_matches("./");
+        match self {
+            DiffSelection::Symbols { paths, .. } => paths.contains(rel),
+            DiffSelection::Lines(files) => files.contains_key(rel),
+        }
+    }
+
+    fn selects(&self, rel: &str, fqn: &str, start_line: usize, end_line: usize) -> bool {
+        match self {
+            DiffSelection::Symbols { fqns, .. } => fqns.contains(fqn),
+            DiffSelection::Lines(files) => files
+                .get(rel.trim_start_matches("./"))
+                .is_some_and(|hunks| hunks.iter().any(|h| h.overlaps(start_line, end_line))),
+        }
+    }
+}
+
+/// The lines a diff touches in the checked-out files, or `None` when the
+/// diff's target is not what is checked out (its line numbers would then
+/// describe other text) or git cannot produce the diff.
+fn git_diff_lines(root: &Path, spec: &str) -> Result<Option<BTreeMap<String, Vec<Hunk>>>> {
+    let target = spec.split_once("...").map(|(_, target)| target);
+    let out = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            "--relative",
+            spec,
+        ])
+        .current_dir(root)
+        .output()
+        .context("git diff")?;
+    if !out.status.success() {
+        tracing::warn!(
+            "git diff {spec} failed ({}); using Bifrost's diff analysis",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return Ok(None);
+    }
+    let files = parse_unified_zero(&String::from_utf8_lossy(&out.stdout));
+    if let Some(target) = target {
+        if !files.is_empty() {
+            let same = std::process::Command::new("git")
+                .args(["diff", "--quiet", target, "--"])
+                .args(files.keys())
+                .current_dir(root)
+                .status()
+                .context("git diff --quiet")?;
+            if !same.success() {
+                tracing::info!(
+                    "--in-diff target {target} is not what is checked out; using Bifrost's diff analysis"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(files))
+}
+
+/// Parse `git diff -U0` output into new-side hunks per file. Deleted files
+/// are left out: nothing in them can be mutated.
+fn parse_unified_zero(diff: &str) -> BTreeMap<String, Vec<Hunk>> {
+    let mut files: BTreeMap<String, Vec<Hunk>> = BTreeMap::new();
+    let mut current: Option<String> = None;
+    for line in diff.lines() {
+        if let Some(path) = line.strip_prefix("+++ ") {
+            let path = path.trim_end_matches('\t');
+            current = path.strip_prefix("b/").map(str::to_string);
+            continue;
+        }
+        let Some(header) = line.strip_prefix("@@ ") else {
+            continue;
+        };
+        let Some(file) = &current else { continue };
+        let Some(new_side) = header.split_whitespace().find(|w| w.starts_with('+')) else {
+            continue;
+        };
+        let mut parts = new_side[1..].splitn(2, ',');
+        let Some(start) = parts.next().and_then(|n| n.parse::<usize>().ok()) else {
+            continue;
+        };
+        let count = parts
+            .next()
+            .map_or(Some(1), |n| n.parse::<usize>().ok())
+            .unwrap_or(1);
+        let hunk = if count == 0 {
+            Hunk::RemovedAfter(start)
+        } else {
+            Hunk::Lines(start, start + count - 1)
+        };
+        files.entry(file.clone()).or_default().push(hunk);
+    }
+    files
+}
+
+fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSelection> {
     let params = if let Some((base, target)) = spec.split_once("...") {
         AnalyzeDiffParams {
             base: Some(base.to_string()),
@@ -327,10 +504,8 @@ fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSymbols> {
         &CancellationToken::default(),
     )
     .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
-    let mut symbols = DiffSymbols {
-        fqns: BTreeSet::new(),
-        paths: BTreeSet::new(),
-    };
+    let mut fqns = BTreeSet::new();
+    let mut paths = BTreeSet::new();
     let after = result
         .patch_symbols
         .edited
@@ -338,12 +513,10 @@ fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSymbols> {
         .map(|e| e.after)
         .chain(result.patch_symbols.introduced.into_iter().map(|i| i.after));
     for symbol in after {
-        symbols
-            .paths
-            .insert(symbol.path.trim_start_matches("./").replace('\\', "/"));
-        symbols.fqns.insert(symbol.fqn);
+        paths.insert(symbol.path.trim_start_matches("./").replace('\\', "/"));
+        fqns.insert(symbol.fqn);
     }
-    Ok(symbols)
+    Ok(DiffSelection::Symbols { fqns, paths })
 }
 
 struct ParsedFn {
@@ -549,6 +722,63 @@ pub fn restore_file(root: &Path, mutant: &Mutant, original: &[u8]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unified_zero_diff_gives_new_side_hunks_per_file() {
+        let diff = "diff --git a/src/a.rs b/src/a.rs\n\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -3 +3 @@ fn a() {\n\
+-    1\n\
++    2\n\
+@@ -10,2 +11,0 @@\n\
+-gone\n\
+-gone\n\
+@@ -20,0 +20,3 @@\n\
++new\n\
+diff --git a/src/b.rs b/src/b.rs\n\
+new file mode 100644\n\
+--- /dev/null\n\
++++ b/src/b.rs\n\
+@@ -0,0 +1,4 @@\n\
++fn b() {}\n\
+diff --git a/src/c.rs b/src/c.rs\n\
+deleted file mode 100644\n\
+--- a/src/c.rs\n\
++++ /dev/null\n\
+@@ -1,2 +0,0 @@\n\
+-fn c() {}\n";
+        let files = parse_unified_zero(diff);
+        assert_eq!(
+            files.get("src/a.rs").unwrap(),
+            &vec![
+                Hunk::Lines(3, 3),
+                Hunk::RemovedAfter(11),
+                Hunk::Lines(20, 22)
+            ]
+        );
+        assert_eq!(files.get("src/b.rs").unwrap(), &vec![Hunk::Lines(1, 4)]);
+        assert!(
+            !files.contains_key("src/c.rs"),
+            "deleted files have nothing to mutate"
+        );
+    }
+
+    #[test]
+    fn a_function_is_selected_when_a_hunk_touches_its_lines() {
+        // A function on lines 10..=20.
+        assert!(Hunk::Lines(10, 10).overlaps(10, 20));
+        assert!(Hunk::Lines(20, 25).overlaps(10, 20));
+        assert!(Hunk::Lines(5, 30).overlaps(10, 20));
+        assert!(!Hunk::Lines(21, 22).overlaps(10, 20));
+        assert!(!Hunk::Lines(1, 9).overlaps(10, 20));
+        // Lines removed from inside the body.
+        assert!(Hunk::RemovedAfter(10).overlaps(10, 20));
+        assert!(Hunk::RemovedAfter(19).overlaps(10, 20));
+        // Lines removed just before or just after it.
+        assert!(!Hunk::RemovedAfter(9).overlaps(10, 20));
+        assert!(!Hunk::RemovedAfter(20).overlaps(10, 20));
+    }
+
     #[test]
     fn same_fqn_twice_in_a_file_gets_distinct_ids() {
         let m = |start: usize| crate::types::Mutant {

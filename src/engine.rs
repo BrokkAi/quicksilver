@@ -7,7 +7,7 @@ use crate::index::{self, CoverageIndex};
 use crate::plan::{self, Plan};
 use crate::scratch::{self, CloneBackend};
 use crate::types::{BaselineReport, Mutant, Outcome, Paths};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -128,9 +128,22 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         let (cfg, paths) = (cfg.clone(), paths.clone());
         std::thread::spawn(move || index::list_tests_plain(&cfg, &paths))
     });
-    let opened = crate::bifrost::open_workspace(&paths.baseline)?;
-    let mut mutants =
-        crate::discover::discover_in(&opened.workspace, &paths.baseline, &discover_filter(&cfg))?;
+    // Under --in-diff only the changed files need analysis. Static selection
+    // walks the whole workspace's usage graph, so it still opens everything.
+    let (opened, mut mutants) = if cfg.in_diff.is_some()
+        && cfg.test_selection != TestSelection::Static
+    {
+        let mutants = crate::discover::discover_in_diff(&paths.baseline, &discover_filter(&cfg))?;
+        (None, mutants)
+    } else {
+        let opened = crate::bifrost::open_workspace(&paths.baseline)?;
+        let mutants = crate::discover::discover_in(
+            &opened.workspace,
+            &paths.baseline,
+            &discover_filter(&cfg),
+        )?;
+        (Some(opened), mutants)
+    };
     eprintln!("discovered {} mutants", mutants.len());
 
     if for_estimate && cfg.index_scope.is_none() {
@@ -214,7 +227,14 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
             let meta = load_metadata(&paths.baseline)?;
             Some(Box::new(plan::PackageSelector::new(&meta, &index.tests)))
         }
-        TestSelection::Static => Some(static_selector(&opened, &paths, &mutants, &index)?),
+        TestSelection::Static => Some(static_selector(
+            opened
+                .as_ref()
+                .context("static selection opens the whole workspace")?,
+            &paths,
+            &mutants,
+            &index,
+        )?),
     };
     drop(opened);
     let selector: &dyn plan::TestSelector = match &packages {

@@ -539,4 +539,87 @@ fn in_diff_discovery_matches_full_discovery_for_changed_functions() {
     full.sort();
     got.sort();
     assert_eq!(got, full);
+
+    // The scoped analyzer over only the changed files gives the same mutants.
+    let scoped = cargo_quicksilver::discover::discover_in_diff(
+        root,
+        &DiscoverFilter {
+            in_diff: Some("HEAD^...HEAD".into()),
+            ..filter()
+        },
+    )
+    .expect("scoped diff discovery");
+    let mut scoped: Vec<_> = scoped.iter().map(key).collect();
+    scoped.sort();
+    assert_eq!(scoped, full, "scoped analyzer must match full discovery");
+}
+
+/// Manual check of scoped `--in-diff` discovery on a real repository. For
+/// each commit it checks the commit out and compares the scoped analyzer's
+/// mutants with full discovery's, and prints both times:
+///
+///     QS_DIFF_CHECK_ROOT=<git checkout> QS_DIFF_CHECK_COMMITS="<sha> <sha>" \
+///       cargo test --test engine scoped_diff_discovery_on_a_real_repo -- --ignored --nocapture
+#[test]
+#[ignore]
+fn scoped_diff_discovery_on_a_real_repo() {
+    let root = std::path::PathBuf::from(std::env::var("QS_DIFF_CHECK_ROOT").unwrap());
+    let commits = std::env::var("QS_DIFF_CHECK_COMMITS").unwrap();
+    let key = |m: &cargo_quicksilver::types::Mutant| {
+        (
+            m.id.clone(),
+            m.fqn.clone(),
+            m.start_byte,
+            m.end_byte,
+            m.body_start_byte,
+            m.body_end_byte,
+            m.replacement.clone(),
+        )
+    };
+    let mut failures = Vec::new();
+    for sha in commits.split_whitespace() {
+        assert!(std::process::Command::new("git")
+            .args(["checkout", "-q", "--detach", sha])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        let f = DiscoverFilter {
+            in_diff: Some(format!("{sha}^...{sha}")),
+            ..filter()
+        };
+        let t = std::time::Instant::now();
+        let mut full: Vec<_> = discover(&root, &f).unwrap().iter().map(key).collect();
+        let full_secs = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let mut scoped: Vec<_> = cargo_quicksilver::discover::discover_in_diff(&root, &f)
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect();
+        let scoped_secs = t.elapsed().as_secs_f64();
+        full.sort();
+        scoped.sort();
+        println!(
+            "{sha}: full {} mutants in {full_secs:.2}s, scoped {} in {scoped_secs:.2}s, {}",
+            full.len(),
+            scoped.len(),
+            if full == scoped { "same" } else { "DIFFERENT" }
+        );
+        if full != scoped {
+            let only_full: Vec<_> = full
+                .iter()
+                .filter(|k| !scoped.contains(k))
+                .take(3)
+                .collect();
+            let only_scoped: Vec<_> = scoped
+                .iter()
+                .filter(|k| !full.contains(k))
+                .take(3)
+                .collect();
+            println!("  only full: {only_full:?}\n  only scoped: {only_scoped:?}");
+            failures.push(sha.to_string());
+        }
+    }
+    assert!(failures.is_empty(), "differences on {failures:?}");
 }

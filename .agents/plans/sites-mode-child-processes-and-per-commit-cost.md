@@ -31,6 +31,7 @@ The second half of the plan reduces what QS pays per commit before it runs any m
 - [x] (2026-10-22 04:20Z) Milestone 3, step 3 (commit `3f34cb9`): clone backends keep modification times, so a fresh worker's target directory stays fresh (36 of 61 itertools units rebuilt without this).
 - [x] (2026-10-22 04:25Z) Milestone 3, step 4: in `run` with sites or static selection, `cargo nextest list` runs on a thread while Bifrost opens and discovery runs. On itertools (debug), listing used to end 2.0 s after discovery and now ends with it; per-commit totals 7.8 to 8.9 s on a host with load average 14 to 21 from other work, so differences under about 2 s are noise.
 - [x] (2026-10-22 04:30Z) Recording runs retry a timed-out test once with 4x the budget. Since tests start in the worker, the first run of a test that runs `cargo` itself (clap's `example_tests`) compiles programs there, and with a symlinked target the worker's `target` now starts empty; a timeout used to drop the test from every selection without notice. Test: `a_recording_timeout_gets_one_longer_retry`.
+- [x] (2026-10-22 05:45Z) Milestone 3, step 5: under `--in-diff` (coverage and sites selection), discovery no longer opens the whole workspace. It takes the changed files and lines from `git diff -U0`, builds `WorkspaceAnalyzer::build_scoped_persisted` over a `FileSetProject` of only the changed `.rs` files (the owner confirmed this is Bifrost's intended way), and selects functions whose line range overlaps a changed line. Bifrost's diff analysis remains the fallback when the diff's target is not what is checked out. Static selection still opens everything. On 10 real itertools commits the mutants are identical to full discovery (`scoped_diff_discovery_on_a_real_repo`, ignored test run by hand). On six commits whose content the store had never seen, a per-commit run took 5.8 to 13.6 s (debug), against 24 to 51 s with Bifrost's diff analysis and 25 to 45 s with the full open.
 - [ ] Re-measure per-commit cost on EC2 (no mbx there) and compare with cargo-mutants; requires the owner's go-ahead for EC2 spending.
 
 ## Surprises & Discoveries
@@ -56,6 +57,10 @@ The second half of the plan reduces what QS pays per commit before it runs any m
   Evidence: `/mnt/optane/quicksilver/local/replay-{cuts1,disc2,mtime1}/`. This host's mbx cache had seen these commits in earlier replays, so compile times are lower than on a host without it.
 - Observation: discovery from the diff result alone (skipping the workspace open under `--in-diff`) is not safe with today's Bifrost API. Its per-commit symbol snapshot is a map keyed by fully qualified name (`symbol_snapshot_map` in `bifrost-tools/src/diff_analysis.rs`), so two functions with the same name, such as `fmt` in `impl Display` and `impl Debug`, collapse into one entry, and a diff that edits one can report the other's lines. A Bifrost call that returns the declarations of a few files, with byte ranges, from the shared cache would remove the workspace open from per-commit runs.
 
+- Observation: for a commit the store has not seen, the whole-workspace open spent 11.9 s of SQL rebuilding crate-wide resolution tables (`cr_authority_blockers` alone 4.3 s) and rewrote 57,747 rows of the crate's resolution summary. Bifrost's design makes the crate the unit of name resolution, and its per-unit summary work for Rust (its plan's Milestone 5) is open. A scoped build over one changed file ran 3.4 s of SQL, most of it a 1.1 s statistics refresh (`ANALYZE`, run whenever the stored file count changes) and per-file fact inserts; the rest of its time is parsing and fact extraction of the changed file, which grows with file size (9.4 s for itertools' 4,800-line `src/lib.rs` in a debug build).
+  Evidence: `/mnt/optane/quicksilver/local/probe-sql.json` (full open), `probe-sql2.json` (scoped).
+- Observation: Bifrost's diff analysis cost 3 to 35 s per store-new commit in a debug build, because it builds analyzers for both commits. Selecting changed functions by `git diff -U0` line overlap costs 0.02 s and gave identical mutants on the 10 real itertools replay commits.
+
 ## Decision Log
 
 - Decision: stop using Bifrost's usage graph for test selection; keep it behind the `static-selection` cargo feature.
@@ -69,6 +74,10 @@ The second half of the plan reduces what QS pays per commit before it runs any m
   Rationale: a child `cargo build` must use the target directory the schema build used, not one named in the caller's environment or in the subject's `.cargo/config.toml`. For a tree with neither, this is the directory cargo would pick anyway.
   Date/Author: 2026-10-22, agent.
 - Decision: triage and second-order runs (`--triage`, `--second-order-pairs`) still start tests in the baseline after all crates finish, because the workers have moved on by then. Their child processes see the original source. These modes are off by default; the limitation is recorded here and not fixed.
+  Date/Author: 2026-10-22, agent.
+
+- Decision: select `--in-diff` functions by line overlap with `git diff -U0`, as cargo-mutants does, instead of Bifrost's edited and introduced symbols.
+  Rationale: it removes a second Bifrost analysis per commit. Two cases now select more than before: a function whose only change is a comment or whitespace, and a function moved to another file. Both are cheap to test and match cargo-mutants. The line numbers must describe the analyzed files, so when an explicit diff target differs from what is checked out (`git diff --quiet <target> -- <files>` fails), QS falls back to Bifrost's diff analysis.
   Date/Author: 2026-10-22, agent.
 
 ## Outcomes & Retrospective
