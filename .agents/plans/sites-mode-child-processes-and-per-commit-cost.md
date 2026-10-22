@@ -30,6 +30,7 @@ The second half of the plan reduces what QS pays per commit before it runs any m
 - [x] (2026-10-22 04:14Z) Milestone 3, step 2 (commit `abd1c63`): `--in-diff` discovery skips declarations outside the changed files before any per-function query (8.2 s to 1.4 s on itertools, debug).
 - [x] (2026-10-22 04:20Z) Milestone 3, step 3 (commit `3f34cb9`): clone backends keep modification times, so a fresh worker's target directory stays fresh (36 of 61 itertools units rebuilt without this).
 - [x] (2026-10-22 04:25Z) Milestone 3, step 4: in `run` with sites or static selection, `cargo nextest list` runs on a thread while Bifrost opens and discovery runs. On itertools (debug), listing used to end 2.0 s after discovery and now ends with it; per-commit totals 7.8 to 8.9 s on a host with load average 14 to 21 from other work, so differences under about 2 s are noise.
+- [x] (2026-10-22 04:30Z) Recording runs retry a timed-out test once with 4x the budget. Since tests start in the worker, the first run of a test that runs `cargo` itself (clap's `example_tests`) compiles programs there, and with a symlinked target the worker's `target` now starts empty; a timeout used to drop the test from every selection without notice. Test: `a_recording_timeout_gets_one_longer_retry`.
 - [ ] Re-measure per-commit cost on EC2 (no mbx there) and compare with cargo-mutants; requires the owner's go-ahead for EC2 spending.
 
 ## Surprises & Discoveries

@@ -204,12 +204,6 @@ impl SiteRecording {
     }
 }
 
-/// One test's recorded sites, or why it selects nothing.
-type RecordResult = (
-    String,
-    Result<(std::collections::BTreeSet<u32>, f64), String>,
-);
-
 pub fn record_site_hits(
     planned_union: &PlannedMutant,
     run_dir: &Path,
@@ -221,50 +215,117 @@ pub fn record_site_hits(
     let dir = run_dir.join("site-hits");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
+    Ok(record_all(&tests, &dir, policy, jobs))
+}
+
+/// A recording run that times out gets one more run with this many times
+/// the budget. The first run of a test that runs `cargo` itself (trycmd
+/// building clap's examples) compiles those programs in the worker; the
+/// retry finds them built. A test still timing out is not green.
+const RECORD_RETRY_FACTOR: u32 = 4;
+
+fn record_all(
+    tests: &[ResolvedTest],
+    dir: &Path,
+    policy: &TestRunPolicy,
+    jobs: usize,
+) -> SiteRecording {
     let started = Instant::now();
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let results: Mutex<Vec<RecordResult>> = Mutex::new(Vec::with_capacity(tests.len()));
-    std::thread::scope(|scope| {
-        for _ in 0..jobs.max(1).min(tests.len().max(1)) {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                let Some(t) = tests.get(i) else { break };
-                let key = if t.id.is_empty() {
-                    t.name.clone()
-                } else {
-                    t.id.clone()
-                };
-                let result = record_one(t, i, &dir, policy);
-                results.lock().unwrap().push((key, result));
-            });
+    let budget =
+        |t: &ResolvedTest| test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
+    let all: Vec<(usize, Duration)> = tests
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (i, budget(t)))
+        .collect();
+    let mut results = record_pass(tests, &all, dir, jobs);
+    let retry: Vec<(usize, Duration)> = results
+        .iter()
+        .filter(|(_, r)| matches!(r, Err(RecordFailure::TimedOut(_))))
+        .map(|(i, _)| (*i, budget(&tests[*i]) * RECORD_RETRY_FACTOR))
+        .collect();
+    if !retry.is_empty() {
+        tracing::info!(
+            "site recording: {} tests timed out; running them once more with {}x the budget",
+            retry.len(),
+            RECORD_RETRY_FACTOR
+        );
+        for (i, again) in record_pass(tests, &retry, dir, jobs) {
+            if let Some(slot) = results.iter_mut().find(|(j, _)| *j == i) {
+                slot.1 = again;
+            }
         }
-    });
+    }
     let mut recording = SiteRecording {
         wall_secs: started.elapsed().as_secs_f64(),
         ..SiteRecording::default()
     };
-    for (key, result) in results.into_inner().unwrap() {
+    for (i, result) in results {
+        let t = &tests[i];
+        let key = if t.id.is_empty() {
+            t.name.clone()
+        } else {
+            t.id.clone()
+        };
         match result {
             Ok((sites, secs)) => {
                 recording.secs_by_test.insert(key.clone(), secs);
                 recording.sites_by_test.insert(key, sites);
             }
-            Err(why) => recording.not_green.push((key, why)),
+            Err(why) => recording.not_green.push((key, why.to_string())),
         }
     }
     recording.not_green.sort();
-    Ok(recording)
+    recording
 }
 
-fn record_one(
-    t: &ResolvedTest,
-    index: usize,
+/// Run `(test index, timeout)` pairs on `jobs` threads.
+fn record_pass(
+    tests: &[ResolvedTest],
+    runs: &[(usize, Duration)],
     dir: &Path,
-    policy: &TestRunPolicy,
-) -> Result<(std::collections::BTreeSet<u32>, f64), String> {
+    jobs: usize,
+) -> Vec<(usize, RecordResult)> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Mutex<Vec<(usize, RecordResult)>> = Mutex::new(Vec::with_capacity(runs.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.max(1).min(runs.len().max(1)) {
+            scope.spawn(|| loop {
+                let k = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let Some(&(i, timeout)) = runs.get(k) else {
+                    break;
+                };
+                let result = record_one(&tests[i], i, dir, timeout);
+                results.lock().unwrap().push((i, result));
+            });
+        }
+    });
+    results.into_inner().unwrap()
+}
+
+/// Why a test selects nothing.
+#[derive(Debug)]
+enum RecordFailure {
+    TimedOut(Duration),
+    Other(String),
+}
+
+impl std::fmt::Display for RecordFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RecordFailure::TimedOut(after) => write!(f, "timed out after {after:?}"),
+            RecordFailure::Other(why) => f.write_str(why),
+        }
+    }
+}
+
+/// One test's recorded sites and wall seconds, or why it selects nothing.
+type RecordResult = Result<(std::collections::BTreeSet<u32>, f64), RecordFailure>;
+
+fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> RecordResult {
+    let other = RecordFailure::Other;
     let path = dir.join(format!("{index:06}.txt"));
-    fs::write(&path, b"").map_err(|err| format!("create {}: {err}", path.display()))?;
-    let timeout = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
+    fs::write(&path, b"").map_err(|err| other(format!("create {}: {err}", path.display())))?;
     let env = test_env(
         t,
         &[(
@@ -274,16 +335,18 @@ fn record_one(
     );
     let started = Instant::now();
     let status = run_exact_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
-        .map_err(|err| format!("{err:#}"))?;
+        .map_err(|err| other(format!("{err:#}")))?;
     let secs = started.elapsed().as_secs_f64();
     match status {
         RunStatus::Passed => {}
-        RunStatus::Failed => return Err("failed with no mutant active".into()),
-        RunStatus::Error { code } => return Err(format!("exited {code:?} with no mutant active")),
-        RunStatus::Timeout => return Err(format!("timed out after {timeout:?}")),
+        RunStatus::Failed => return Err(other("failed with no mutant active".into())),
+        RunStatus::Error { code } => {
+            return Err(other(format!("exited {code:?} with no mutant active")))
+        }
+        RunStatus::Timeout => return Err(RecordFailure::TimedOut(timeout)),
     }
-    let text =
-        fs::read_to_string(&path).map_err(|err| format!("read {}: {err}", path.display()))?;
+    let text = fs::read_to_string(&path)
+        .map_err(|err| other(format!("read {}: {err}", path.display())))?;
     Ok((
         text.lines().filter_map(|l| l.trim().parse().ok()).collect(),
         secs,
@@ -901,6 +964,50 @@ mod tests {
             replacement: "{}".into(),
             return_kind: "unit".into(),
         }
+    }
+
+    /// A test whose first run builds programs (trycmd compiling clap's
+    /// examples in a fresh worker) can outlast its budget once. Dropping it
+    /// as not green would silently remove it from every selection.
+    #[test]
+    fn a_recording_timeout_gets_one_longer_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+            ResolvedTest {
+                id: format!("bin::{name}"),
+                name: name.into(),
+                binary: path,
+                cwd: dir.path().to_path_buf(),
+                target_dir: dir.path().join("target"),
+                duration_secs: 0.01,
+            }
+        };
+        let tests = vec![
+            script(
+                "slow_once",
+                "if [ -e \"$0.ran\" ]; then exit 0; fi\ntouch \"$0.ran\"\nsleep 5",
+            ),
+            script("always_hangs", "sleep 30"),
+        ];
+        let hits = dir.path().join("hits");
+        fs::create_dir_all(&hits).unwrap();
+        let policy = TestRunPolicy {
+            floor: Duration::from_millis(500),
+            slowdown: 1.0,
+            confirm: false,
+        };
+        let recording = record_all(&tests, &hits, &policy, 2);
+        assert!(
+            recording.sites_by_test.contains_key("bin::slow_once"),
+            "{recording:?}"
+        );
+        assert_eq!(recording.not_green.len(), 1, "{recording:?}");
+        assert_eq!(recording.not_green[0].0, "bin::always_hangs");
+        assert!(recording.not_green[0].1.contains("timed out"));
     }
 
     fn has_mutant(spec: &RunSpec) -> bool {
