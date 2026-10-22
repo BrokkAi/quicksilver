@@ -98,11 +98,14 @@ pub fn discover_in(
 ) -> Result<Vec<Mutant>> {
     let meta = load_metadata(root)?;
     let globset = file_globset(&filter.files)?;
+    let diff_started = std::time::Instant::now();
     let diff_fqns = if let Some(spec) = &filter.in_diff {
         Some(diff_symbol_fqns(root, spec)?)
     } else {
         None
     };
+    let diff_secs = diff_started.elapsed().as_secs_f64();
+    let scan_started = std::time::Instant::now();
 
     let analyzer = workspace.analyzer();
     let root_abs = std::path::PathBuf::from(meta.workspace_root.as_str());
@@ -121,6 +124,15 @@ pub fn discover_in(
         let rel = crate::util::rel_slash(unit.source().rel_path());
         if !rel.ends_with(".rs") {
             continue;
+        }
+        // Under --in-diff only the changed files matter. Checking that first
+        // keeps the per-declaration queries below (test region, package,
+        // module scope) off every other function in the workspace: on
+        // itertools in a debug build they took 8 s per commit.
+        if let Some(diff) = &diff_fqns {
+            if !diff.paths.contains(rel.trim_start_matches("./")) {
+                continue;
+            }
         }
         let lang = unit
             .source()
@@ -157,8 +169,8 @@ pub fn discover_in(
             }
         }
         let fqn = unit.fq_name();
-        if let Some(allowed) = &diff_fqns {
-            if !allowed.contains(&fqn) {
+        if let Some(diff) = &diff_fqns {
+            if !diff.fqns.contains(&fqn) {
                 continue;
             }
         }
@@ -222,6 +234,12 @@ pub fn discover_in(
         ))
     });
     disambiguate_ids(&mut mutants);
+    tracing::info!(
+        "discovery: {:.2}s diff analysis, {:.2}s declaration scan, {} mutants",
+        diff_secs,
+        scan_started.elapsed().as_secs_f64(),
+        mutants.len()
+    );
     if !skipped_proc_macro.is_empty() {
         eprintln!(
             "skipping proc-macro crates (their code runs inside rustc at build time, so run-time mutant switching cannot test it): {}",
@@ -280,7 +298,13 @@ fn file_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
     Ok(Some(b.build()?))
 }
 
-fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<BTreeSet<String>> {
+/// The functions a diff edits or introduces, and the files they are in.
+struct DiffSymbols {
+    fqns: BTreeSet<String>,
+    paths: BTreeSet<String>,
+}
+
+fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSymbols> {
     let params = if let Some((base, target)) = spec.split_once("...") {
         AnalyzeDiffParams {
             base: Some(base.to_string()),
@@ -303,14 +327,23 @@ fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<BTreeSet<String>> {
         &CancellationToken::default(),
     )
     .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
-    let mut set = BTreeSet::new();
-    for e in result.patch_symbols.edited {
-        set.insert(e.after.fqn);
+    let mut symbols = DiffSymbols {
+        fqns: BTreeSet::new(),
+        paths: BTreeSet::new(),
+    };
+    let after = result
+        .patch_symbols
+        .edited
+        .into_iter()
+        .map(|e| e.after)
+        .chain(result.patch_symbols.introduced.into_iter().map(|i| i.after));
+    for symbol in after {
+        symbols
+            .paths
+            .insert(symbol.path.trim_start_matches("./").replace('\\', "/"));
+        symbols.fqns.insert(symbol.fqn);
     }
-    for i in result.patch_symbols.introduced {
-        set.insert(i.after.fqn);
-    }
-    Ok(set)
+    Ok(symbols)
 }
 
 struct ParsedFn {

@@ -471,3 +471,72 @@ fn sites_mode_reuses_baseline_timings_within_a_session() {
         "tests are still listed and planned"
     );
 }
+
+/// `--in-diff` discovery returns exactly the mutants of the functions a
+/// commit edits or introduces, identical (ids, byte ranges, replacements) to
+/// what full discovery gives for those functions.
+#[test]
+fn in_diff_discovery_matches_full_discovery_for_changed_functions() {
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    let lib = root.join("crate_a/src/lib.rs");
+    let text = fs::read_to_string(&lib).unwrap();
+    let text = text.replace(
+        "pub fn flag() -> bool {\n    true\n}",
+        "pub fn flag() -> bool {\n    !false\n}",
+    );
+    let text = text.replacen(
+        "#[cfg(test)]",
+        "pub fn introduced() -> u32 {\n    41 + 1\n}\n\n#[cfg(test)]",
+        1,
+    );
+    fs::write(&lib, text).unwrap();
+    for args in [
+        vec!["add", "-A"],
+        vec!["-c", "commit.gpgsign=false", "commit", "-q", "-m", "edit"],
+    ] {
+        assert!(std::process::Command::new("git")
+            .args(&args)
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let diff = discover(
+        root,
+        &DiscoverFilter {
+            in_diff: Some("HEAD^...HEAD".into()),
+            ..filter()
+        },
+    )
+    .expect("diff discovery");
+    let fqns: std::collections::BTreeSet<&str> = diff.iter().map(|m| m.fqn.as_str()).collect();
+    assert!(
+        fqns.iter()
+            .all(|f| f.ends_with(".flag") || f.ends_with(".introduced")),
+        "only the changed functions: {fqns:?}"
+    );
+    assert!(fqns.iter().any(|f| f.ends_with(".flag")), "{fqns:?}");
+    assert!(fqns.iter().any(|f| f.ends_with(".introduced")), "{fqns:?}");
+    let key = |m: &cargo_quicksilver::types::Mutant| {
+        (
+            m.id.clone(),
+            m.path.clone(),
+            m.start_byte,
+            m.end_byte,
+            m.body_start_byte,
+            m.body_end_byte,
+            m.replacement.clone(),
+        )
+    };
+    let mut full: Vec<_> = discover(root, &filter())
+        .expect("full discovery")
+        .iter()
+        .filter(|m| fqns.contains(m.fqn.as_str()))
+        .map(key)
+        .collect();
+    let mut got: Vec<_> = diff.iter().map(key).collect();
+    full.sort();
+    got.sort();
+    assert_eq!(got, full);
+}
