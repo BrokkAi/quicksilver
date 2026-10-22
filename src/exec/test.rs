@@ -55,8 +55,25 @@ struct ResolvedTest {
     id: String,
     name: String,
     binary: PathBuf,
+    /// The package directory under the tree root: the directory nextest
+    /// would start the test in.
     cwd: PathBuf,
+    /// `<tree root>/target`. A test that runs `cargo` itself (trycmd
+    /// building clap's examples) then builds into the tree's own target
+    /// directory, even when the caller's environment names another one.
+    target_dir: PathBuf,
     duration_secs: f64,
+}
+
+/// The environment every test process gets on top of the caller's: the tree's
+/// target directory, then `extra` (the mutant switch or the site recorder).
+fn test_env(t: &ResolvedTest, extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut env = vec![(
+        "CARGO_TARGET_DIR".to_string(),
+        t.target_dir.to_string_lossy().into_owned(),
+    )];
+    env.extend(extra.iter().cloned());
+    env
 }
 
 #[derive(Debug, Clone)]
@@ -86,7 +103,7 @@ const MESSAGE_TAIL: usize = 2000;
 pub fn run_mutant_tests_with_env(
     planned: &PlannedMutant,
     run_dir: &Path,
-    baseline_root: &Path,
+    tree_root: &Path,
     timeout_floor: Duration,
     extra_env: &[(String, String)],
 ) -> Result<Outcome> {
@@ -95,20 +112,17 @@ pub fn run_mutant_tests_with_env(
         slowdown: 1.0,
         confirm: false,
     };
-    run_mutant_tests_policy(planned, run_dir, baseline_root, &policy, extra_env)
+    run_mutant_tests_policy(planned, run_dir, tree_root, &policy, extra_env)
 }
 
 pub fn run_mutant_tests_policy(
     planned: &PlannedMutant,
     run_dir: &Path,
-    baseline_root: &Path,
+    tree_root: &Path,
     policy: &TestRunPolicy,
     extra_env: &[(String, String)],
 ) -> Result<Outcome> {
-    Ok(
-        run_mutant_tests_observed(planned, run_dir, baseline_root, policy, extra_env, false)?
-            .outcome,
-    )
+    Ok(run_mutant_tests_observed(planned, run_dir, tree_root, policy, extra_env, false)?.outcome)
 }
 
 /// Run selected tests and retain their canonical results. `complete_vector`
@@ -117,12 +131,12 @@ pub fn run_mutant_tests_policy(
 pub fn run_mutant_tests_observed(
     planned: &PlannedMutant,
     run_dir: &Path,
-    baseline_root: &Path,
+    tree_root: &Path,
     policy: &TestRunPolicy,
     extra_env: &[(String, String)],
     complete_vector: bool,
 ) -> Result<ObservedRun> {
-    let tests = resolve_tests(planned, run_dir, baseline_root)?;
+    let tests = resolve_tests(planned, run_dir, tree_root)?;
     let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, String)> {
         if spec.capture {
             run_exact_capture_with_env(
@@ -199,11 +213,11 @@ type RecordResult = (
 pub fn record_site_hits(
     planned_union: &PlannedMutant,
     run_dir: &Path,
-    baseline_root: &Path,
+    tree_root: &Path,
     policy: &TestRunPolicy,
     jobs: usize,
 ) -> Result<SiteRecording> {
-    let tests = resolve_tests(planned_union, run_dir, baseline_root)?;
+    let tests = resolve_tests(planned_union, run_dir, tree_root)?;
     let dir = run_dir.join("site-hits");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
@@ -251,10 +265,13 @@ fn record_one(
     let path = dir.join(format!("{index:06}.txt"));
     fs::write(&path, b"").map_err(|err| format!("create {}: {err}", path.display()))?;
     let timeout = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
-    let env = [(
-        "QS_RECORD_SITES".to_string(),
-        path.to_string_lossy().into_owned(),
-    )];
+    let env = test_env(
+        t,
+        &[(
+            "QS_RECORD_SITES".to_string(),
+            path.to_string_lossy().into_owned(),
+        )],
+    );
     let started = Instant::now();
     let status = run_exact_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
         .map_err(|err| format!("{err:#}"))?;
@@ -276,7 +293,7 @@ fn record_one(
 fn resolve_tests(
     planned: &PlannedMutant,
     run_dir: &Path,
-    baseline_root: &Path,
+    tree_root: &Path,
 ) -> Result<Vec<ResolvedTest>> {
     let manifest_path = run_dir.join("manifest.json");
     let text = fs::read_to_string(&manifest_path)?;
@@ -320,10 +337,11 @@ fn resolve_tests(
             name: t.name.clone(),
             binary: run_dir.join(&t.binary),
             cwd: if t.cwd_rel.is_empty() {
-                baseline_root.to_path_buf()
+                tree_root.to_path_buf()
             } else {
-                baseline_root.join(&t.cwd_rel)
+                tree_root.join(&t.cwd_rel)
             },
+            target_dir: tree_root.join("target"),
             duration_secs: planned
                 .tests
                 .iter()
@@ -706,7 +724,7 @@ fn spec_for(
         test_name: t.name.clone(),
         cwd: t.cwd.clone(),
         timeout,
-        env: env.to_vec(),
+        env: test_env(t, env),
         capture,
     }
 }
@@ -885,6 +903,20 @@ mod tests {
         }
     }
 
+    fn has_mutant(spec: &RunSpec) -> bool {
+        spec.env.iter().any(|(k, _)| k == "QS_MUTANT")
+    }
+
+    #[test]
+    fn every_run_builds_into_the_tree_target_dir() {
+        let t = &fake_tests(&["t1"])[0];
+        let spec = spec_for(t, Duration::from_secs(1), &[], false);
+        assert_eq!(
+            spec.env,
+            vec![("CARGO_TARGET_DIR".to_string(), "/target".to_string())]
+        );
+    }
+
     fn fake_tests(names: &[&str]) -> Vec<ResolvedTest> {
         names
             .iter()
@@ -893,6 +925,7 @@ mod tests {
                 name: (*n).into(),
                 binary: PathBuf::from("/bin/true"),
                 cwd: PathBuf::from("/"),
+                target_dir: PathBuf::from("/target"),
                 duration_secs: 0.41,
             })
             .collect()
@@ -941,7 +974,7 @@ mod tests {
         );
         assert_eq!(outcome.kind, VerdictKind::Missed);
         assert_eq!(seen.len(), 2, "no null run after a passing retry");
-        assert!(!seen[1].env.is_empty(), "retry keeps the mutant env");
+        assert!(has_mutant(&seen[1]), "retry keeps the mutant env");
         assert!(seen[1].capture, "retry captures stderr");
     }
 
@@ -959,7 +992,7 @@ mod tests {
         assert_eq!(outcome.kind, VerdictKind::Caught);
         assert_eq!(outcome.test.as_deref(), Some("t1"));
         assert_eq!(seen.len(), 3);
-        assert!(seen[2].env.is_empty(), "null run drops the mutant env");
+        assert!(!has_mutant(&seen[2]), "null run drops the mutant env");
     }
 
     #[test]
@@ -995,10 +1028,10 @@ mod tests {
         assert_eq!(outcome.kind, VerdictKind::Timeout);
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[1].timeout, Duration::from_secs(120), "calibration");
-        assert!(seen[1].env.is_empty());
+        assert!(!has_mutant(&seen[1]));
         // 3 × the 12s null run beats the 30s floor.
         assert_eq!(seen[2].timeout, Duration::from_secs(36));
-        assert!(!seen[2].env.is_empty());
+        assert!(has_mutant(&seen[2]));
     }
 
     #[test]

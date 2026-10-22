@@ -369,3 +369,34 @@ fn site_selection_matches_coverage_selection() {
         );
     }
 }
+
+/// A test that builds and runs a workspace program in a child process, the
+/// way trycmd runs clap's examples, must see the schema source and the
+/// active mutant. When tests started in the baseline copy, the child
+/// compiled the original source, recorded no site, and the mutant was
+/// NotCovered although the test checks its output.
+#[test]
+fn a_child_process_built_from_the_workspace_sees_the_mutant() {
+    if !tools_ok() {
+        eprintln!("skip: nextest or llvm-cov not available");
+        return;
+    }
+    let repo = support::setup_fixture("child");
+    let scratch = tempfile::tempdir().unwrap();
+    let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+    // The first run in a tree compiles the example; later runs only start it.
+    cfg.timeout_floor = std::time::Duration::from_secs(60);
+    cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
+    let prepared = prepare(cfg, false, false).expect("prepare");
+    let (outcomes, _) = run_schema(&prepared, 0, None).expect("schema run");
+    let greeting: Vec<_> = outcomes
+        .iter()
+        .filter(|o| o.mutant.fqn.ends_with("greeting"))
+        .map(|o| (o.mutant.replacement.trim().to_string(), o.kind))
+        .collect();
+    assert!(!greeting.is_empty(), "no greeting mutants: {outcomes:#?}");
+    assert!(
+        greeting.iter().all(|(_, k)| *k == VerdictKind::Caught),
+        "every greeting mutant changes the example's output: {greeting:?}"
+    );
+}

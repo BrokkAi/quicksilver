@@ -37,9 +37,17 @@ use tracing::{info, warn};
 struct SchemaReady {
     planned: PlannedMutant,
     run_dir: PathBuf,
+    /// The worker tree that built this schema binary. Tests start in their
+    /// package directory under it, so a test that runs `cargo build` (as
+    /// trycmd does for clap's examples) compiles the schema source, and the
+    /// child programs it starts can see the active mutant.
+    tree: PathBuf,
     env: Vec<(String, String)>,
     site_id: u32,
     variant: u32,
+    /// Dropped once this mutant has a verdict. The build thread waits for
+    /// every token of a batch before it restores the original source.
+    _batch: Sender<()>,
 }
 
 pub fn execute(
@@ -142,6 +150,15 @@ pub fn execute(
                         },
                     };
                     let planned_for_err = planned.clone();
+                    let dispatch = |r: SchemaReady| -> bool {
+                        runnable.lock().unwrap().push(RunnableMutant {
+                            planned: r.planned.clone(),
+                            run_dir: r.run_dir.clone(),
+                            site_id: r.site_id,
+                            variant: r.variant,
+                        });
+                        ready_tx.send(r).is_ok()
+                    };
                     match run_crate(
                         &cfg,
                         &paths,
@@ -151,25 +168,11 @@ pub fn execute(
                         planned,
                         &cargo_invocations,
                         &cancel,
+                        &dispatch,
                     ) {
-                        Ok(CrateDone {
-                            unviable,
-                            ready,
-                            keep,
-                        }) => {
+                        Ok(CrateDone { unviable, keep }) => {
                             for o in unviable {
                                 if out_tx.send(o).is_err() {
-                                    return;
-                                }
-                            }
-                            for r in ready {
-                                runnable.lock().unwrap().push(RunnableMutant {
-                                    planned: r.planned.clone(),
-                                    run_dir: r.run_dir.clone(),
-                                    site_id: r.site_id,
-                                    variant: r.variant,
-                                });
-                                if ready_tx.send(r).is_err() {
                                     return;
                                 }
                             }
@@ -192,7 +195,6 @@ pub fn execute(
         for _ in 0..cfg.test_jobs.max(1) {
             let ready_rx: Receiver<SchemaReady> = ready_rx.clone();
             let out_tx: Sender<Outcome> = out_tx.clone();
-            let paths = Arc::clone(&paths);
             let cfg = Arc::clone(&cfg);
             let cancel = Arc::clone(&cancel);
             let coupling_rows = Arc::clone(&coupling_rows);
@@ -205,7 +207,7 @@ pub fn execute(
                     let observed = run_mutant_tests_observed(
                         &ready.planned,
                         &ready.run_dir,
-                        &paths.baseline,
+                        &ready.tree,
                         &policy,
                         &ready.env,
                         false,
@@ -279,7 +281,6 @@ pub fn execute(
 
 struct CrateDone {
     unviable: Vec<Outcome>,
-    ready: Vec<SchemaReady>,
     keep: Vec<PathBuf>,
 }
 
@@ -516,6 +517,7 @@ fn run_crate(
     planned: Vec<PlannedMutant>,
     cargo_invocations: &AtomicU64,
     cancel: &AtomicBool,
+    dispatch: &dyn Fn(SchemaReady) -> bool,
 ) -> Result<CrateDone> {
     let mutants: Vec<Mutant> = planned.iter().map(|p| p.mutant.clone()).collect();
     let (sites, prefiltered) = build_sites(&mutants)?;
@@ -536,7 +538,6 @@ fn run_crate(
     if sites.is_empty() {
         return Ok(CrateDone {
             unviable,
-            ready: Vec::new(),
             keep: Vec::new(),
         });
     }
@@ -544,7 +545,6 @@ fn run_crate(
     if cancel.load(Ordering::Relaxed) {
         return Ok(CrateDone {
             unviable,
-            ready: Vec::new(),
             keep: Vec::new(),
         });
     }
@@ -571,7 +571,6 @@ fn run_crate(
         }
         return Ok(CrateDone {
             unviable,
-            ready: Vec::new(),
             keep: Vec::new(),
         });
     }
@@ -586,7 +585,6 @@ fn run_crate(
     }
 
     let batches = chunk_sites(sites, cfg.schema_batch_size);
-    let mut ready = Vec::new();
     let mut keep = Vec::new();
 
     for (bi, batch) in batches.into_iter().enumerate() {
@@ -624,19 +622,24 @@ fn run_crate(
             &isolated.sites,
             &isolated.executables,
         )?;
-        null_schema_gate(cfg, &run_dir, &paths.baseline, &planned)?;
-        identity_gate(cfg, &run_dir, &paths.baseline, &isolated.sites, &by_id)?;
+        // Gates, recording and mutant runs all start tests under the worker,
+        // which holds this batch's schema source until every mutant of the
+        // batch has a verdict.
+        null_schema_gate(cfg, &run_dir, worker, &planned)?;
+        identity_gate(cfg, &run_dir, worker, &isolated.sites, &by_id)?;
         let recording = if cfg.test_selection == TestSelection::Sites {
             Some(record_sites(
                 cfg,
                 &run_dir,
-                &paths.baseline,
+                worker,
                 &planned,
                 &isolated.sites,
             )?)
         } else {
             None
         };
+        let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<()>();
+        let mut batch_ready = Vec::new();
         for p in &planned {
             if let Some((site, variant)) = lookup_variant(&isolated.sites, &p.mutant.id) {
                 let mut selected = p.clone();
@@ -656,24 +659,44 @@ fn run_crate(
                     selected.estimated_cost_secs =
                         selected.tests.iter().map(|t| t.duration_secs).sum();
                 }
-                ready.push(SchemaReady {
+                batch_ready.push(SchemaReady {
                     planned: selected,
                     run_dir: run_dir.clone(),
+                    tree: worker.to_path_buf(),
                     env: vec![qs_mutant_env(site.site_id, variant)],
                     site_id: site.site_id,
                     variant,
+                    _batch: batch_tx.clone(),
                 });
             }
         }
+        drop(batch_tx);
+        for r in batch_ready {
+            if !dispatch(r) {
+                break;
+            }
+        }
+        wait_for_batch(&batch_rx, cancel);
         keep.push(run_dir);
         restore_files(worker, &snap)?;
     }
 
-    Ok(CrateDone {
-        unviable,
-        ready,
-        keep,
-    })
+    Ok(CrateDone { unviable, keep })
+}
+
+/// Block until every mutant of a batch has a verdict, which is when the last
+/// `SchemaReady::_batch` sender is dropped. A cancelled run stops waiting:
+/// test threads stop taking work, so queued mutants would never finish.
+fn wait_for_batch(batch: &Receiver<()>, cancel: &AtomicBool) {
+    loop {
+        match batch.recv_timeout(Duration::from_millis(100)) {
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) if cancel.load(Ordering::Relaxed) => {
+                return
+            }
+            _ => {}
+        }
+    }
 }
 
 struct Isolated {

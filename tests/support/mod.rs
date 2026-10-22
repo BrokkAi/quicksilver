@@ -2,7 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub fn fixture_src() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny")
+    fixture_named("tiny")
+}
+
+pub fn fixture_named(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name)
 }
 
 pub fn copy_tree(src: &Path, dst: &Path) {
@@ -42,8 +48,13 @@ fn walkdir_lite(root: &Path) -> Vec<PathBuf> {
 }
 
 pub fn setup_tiny() -> tempfile::TempDir {
+    setup_fixture("tiny")
+}
+
+/// Copy `tests/fixtures/<name>` into a fresh git repository.
+pub fn setup_fixture(name: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
-    copy_tree(&fixture_src(), tmp.path());
+    copy_tree(&fixture_named(name), tmp.path());
     assert!(Command::new("git")
         .args(["init"])
         .current_dir(tmp.path())
