@@ -62,6 +62,7 @@ impl CloneBackend for ReflinkBackend {
                 FICLONE_CHAIN
             )
         })?;
+        keep_times(src, dst)?;
         Ok(())
     }
     fn clone_tree(&self, src: &Path, dst: &Path) -> Result<()> {
@@ -86,6 +87,7 @@ impl CloneBackend for CopyBackend {
         }
         fs::copy(src, dst)
             .with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+        keep_times(src, dst)?;
         Ok(())
     }
     fn clone_tree(&self, src: &Path, dst: &Path) -> Result<()> {
@@ -99,12 +101,11 @@ impl CloneBackend for ZfsCloneBackend {
     }
     fn clone_file(&self, src: &Path, dst: &Path) -> Result<()> {
         // File-level fallback inside a cloned dataset still uses reflink when possible.
-        if reflink_copy::reflink(src, dst).is_ok() {
-            return Ok(());
+        if reflink_copy::reflink(src, dst).is_err() {
+            fs::copy(src, dst).context("zfs-clone file copy")?;
         }
-        fs::copy(src, dst)
-            .map(|_| ())
-            .context("zfs-clone file copy")
+        keep_times(src, dst)?;
+        Ok(())
     }
     fn clone_tree(&self, src: &Path, dst: &Path) -> Result<()> {
         zfs_clone_tree(self, src, dst)
@@ -508,7 +509,25 @@ fn copy_file_range_path(src: &Path, dst: &Path) -> io::Result<()> {
     // A new file gets the umask's mode, not the source's: executables such
     // as build-script-build in a cloned target/ would lose their x bit.
     dst_f.set_permissions(meta.permissions())?;
+    dst_f.set_times(times_of(&meta)?)?;
     Ok(())
+}
+
+fn times_of(meta: &fs::Metadata) -> io::Result<fs::FileTimes> {
+    Ok(fs::FileTimes::new()
+        .set_accessed(meta.accessed()?)
+        .set_modified(meta.modified()?))
+}
+
+/// Give `dst` the access and modification times of `src`. Cargo decides
+/// whether a workspace unit is fresh by comparing source and output
+/// modification times. A copy that stamps every file with the copy time, in
+/// whatever order the copy threads ran, made cargo rebuild 36 of itertools'
+/// 61 units (build scripts of registry crates included) in every fresh
+/// worker, with no source change; with the times kept, all 61 are fresh.
+pub fn keep_times(src: &Path, dst: &Path) -> io::Result<()> {
+    let times = times_of(&fs::metadata(src)?)?;
+    fs::File::open(dst)?.set_times(times)
 }
 
 fn clone_tree_with(backend: &dyn CloneBackend, src: &Path, dst: &Path) -> Result<()> {
@@ -1004,6 +1023,39 @@ pub fn format_probe(report: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cargo's freshness check compares modification times. A worker copy
+    /// that restamps every file made cargo rebuild most of the workspace.
+    #[test]
+    fn cloned_files_keep_their_modification_times() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{Duration, SystemTime};
+        let dir = tempfile::tempdir().unwrap();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        for (name, mode) in [("plain", 0o644), ("read_only", 0o444)] {
+            let src = dir.path().join(name);
+            fs::write(&src, b"contents").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&src)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
+            for (label, backend) in [
+                ("copy_file_range", CopyBackend { server_side: true }),
+                ("copy", CopyBackend { server_side: false }),
+            ] {
+                let dst = dir.path().join(format!("{name}-{label}"));
+                backend.clone_file(&src, &dst).unwrap();
+                assert_eq!(
+                    fs::metadata(&dst).unwrap().modified().unwrap(),
+                    old,
+                    "{name} via {label}"
+                );
+            }
+        }
+    }
 
     /// mbx makes `target` a symlink to a managed directory. A worker cloned
     /// with that symlink built into the same directory as the baseline and
