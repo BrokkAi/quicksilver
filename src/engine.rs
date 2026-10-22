@@ -116,6 +116,18 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
     };
 
+    let sites = matches!(
+        cfg.test_selection,
+        TestSelection::Sites | TestSelection::Static
+    );
+    // Listing tests runs cargo (building the tests when the baseline build
+    // was skipped); opening Bifrost and discovery are analysis. Neither needs
+    // the other, so in `run` they overlap. `estimate` may narrow the index
+    // scope after discovery, which changes what is listed, so it lists after.
+    let listing = (sites && !for_estimate).then(|| {
+        let (cfg, paths) = (cfg.clone(), paths.clone());
+        std::thread::spawn(move || index::list_tests_plain(&cfg, &paths))
+    });
     let opened = crate::bifrost::open_workspace(&paths.baseline)?;
     let mut mutants =
         crate::discover::discover_in(&opened.workspace, &paths.baseline, &discover_filter(&cfg))?;
@@ -141,14 +153,15 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         );
     }
 
-    let sites = matches!(
-        cfg.test_selection,
-        TestSelection::Sites | TestSelection::Static
-    );
     let mut index = if sites {
         // No Stage A or B: the schema executor records which tests enter
         // which mutation sites once it has built the schema binary.
-        let tests = index::list_tests_plain(&cfg, &paths)?;
+        let tests = match listing {
+            Some(handle) => handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("the test listing thread panicked"))??,
+            None => index::list_tests_plain(&cfg, &paths)?,
+        };
         eprintln!(
             "test selection: sites ({} tests catalogued; no coverage build)",
             tests.len()

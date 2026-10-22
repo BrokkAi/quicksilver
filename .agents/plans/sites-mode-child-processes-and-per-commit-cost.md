@@ -29,7 +29,7 @@ The second half of the plan reduces what QS pays per commit before it runs any m
 - [x] (2026-10-22 04:00Z) Milestone 3, step 1 (commit `85ef3f9`): preflight measured once per scratch session, keyed on manifests, build scripts, Cargo.lock and the cargo config; sites mode reuses earlier test durations and skips the baseline build and suite.
 - [x] (2026-10-22 04:14Z) Milestone 3, step 2 (commit `abd1c63`): `--in-diff` discovery skips declarations outside the changed files before any per-function query (8.2 s to 1.4 s on itertools, debug).
 - [x] (2026-10-22 04:20Z) Milestone 3, step 3 (commit `3f34cb9`): clone backends keep modification times, so a fresh worker's target directory stays fresh (36 of 61 itertools units rebuilt without this).
-- [ ] Milestone 3, step 4: list tests and open Bifrost concurrently.
+- [x] (2026-10-22 04:25Z) Milestone 3, step 4: in `run` with sites or static selection, `cargo nextest list` runs on a thread while Bifrost opens and discovery runs. On itertools (debug), listing used to end 2.0 s after discovery and now ends with it; per-commit totals 7.8 to 8.9 s on a host with load average 14 to 21 from other work, so differences under about 2 s are noise.
 - [ ] Re-measure per-commit cost on EC2 (no mbx there) and compare with cargo-mutants; requires the owner's go-ahead for EC2 spending.
 
 ## Surprises & Discoveries
