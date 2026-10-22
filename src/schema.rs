@@ -270,13 +270,98 @@ pub struct AppliedSite {
     pub variants: Vec<AppliedVariant>,
 }
 
+/// Where a prologue goes in the body that opens at `open_brace`: after the
+/// `{` and after any inner attributes (`#![allow(...)]`) that start the
+/// body, because Rust accepts inner attributes only before the first
+/// statement. Comments and whitespace between them are skipped too.
+pub fn prologue_insert_at(src: &str, open_brace: usize) -> usize {
+    let b = src.as_bytes();
+    let mut at = open_brace + 1;
+    let mut i = at;
+    loop {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if b[i..].starts_with(b"/*") {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if b[i..].starts_with(b"#!") {
+            let mut j = i + 2;
+            while j < b.len() && b[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            match skip_bracketed(b, j) {
+                Some(end) => {
+                    i = end;
+                    at = end;
+                }
+                None => return at,
+            }
+        } else {
+            return at;
+        }
+    }
+}
+
+/// The index after the `]` that closes the `[` at `open`, skipping string and
+/// character literals. `None` when `open` is not `[` or nothing closes it.
+fn skip_bracketed(b: &[u8], open: usize) -> Option<usize> {
+    if b.get(open) != Some(&b'[') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < b.len() {
+        match b[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    if b[i] == b'\\' {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Insert prologues after each function's opening `{`, highest offset first
 /// so original insert positions stay valid. Applied ranges are computed on
 /// the *final* file: earlier inserts shift later sites forward.
 pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<AppliedSite>)> {
     let mut ordered: Vec<&Site> = sites.to_vec();
     ordered.sort_by_key(|s| std::cmp::Reverse(s.body_start_byte));
-    let mut prepared: Vec<(&Site, String, Vec<(u32, String, usize, usize)>)> = Vec::new();
+    // (site, insert offset, prologue text, variant ranges inside the prologue)
+    type Prepared<'a> = (&'a Site, usize, String, Vec<(u32, String, usize, usize)>);
+    let mut prepared: Vec<Prepared> = Vec::new();
     for site in &ordered {
         if site.body_start_byte >= src.len() {
             bail!("site {} body_start out of range", site.fqn);
@@ -293,17 +378,18 @@ pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<Applie
             );
         }
         let (prologue, rel) = render_prologue_with_ranges(site);
-        prepared.push((*site, prologue, rel));
+        let at = prologue_insert_at(src, site.body_start_byte);
+        prepared.push((*site, at, prologue, rel));
     }
     let mut text = src.to_string();
-    for (site, prologue, _) in &prepared {
-        text.insert_str(site.body_start_byte + 1, prologue);
+    for (_, at, prologue, _) in &prepared {
+        text.insert_str(*at, prologue);
     }
-    prepared.sort_by_key(|(s, _, _)| s.body_start_byte);
+    prepared.sort_by_key(|(s, _, _, _)| s.body_start_byte);
     let mut applied = Vec::new();
     let mut shift = 0usize;
-    for (site, prologue, rel) in &prepared {
-        let insert_at = site.body_start_byte + 1 + shift;
+    for (site, at, prologue, rel) in &prepared {
+        let insert_at = at + shift;
         applied.push(AppliedSite {
             site_id: site.site_id,
             path: site.path.clone(),
@@ -721,6 +807,27 @@ mod tests {
         assert!(out[applied[0].prologue_start..applied[0].prologue_end].contains("active"));
         let body = &out[brace..];
         assert!(body.contains("a + b"));
+    }
+
+    #[test]
+    fn prologue_goes_after_inner_attributes() {
+        // clap's Parser::is_new_arg starts its body with an inner attribute;
+        // a prologue before it does not compile.
+        let src = "fn f(x: bool) -> bool {\n    #![allow(clippy::needless_bool)] // why\n    /* c */ #![doc = \"]\"]\n\n    if x { true } else { false }\n}\n";
+        let brace = src.find('{').unwrap();
+        let end = src.rfind('}').unwrap() + 1;
+        let m = number_mutant("p::f", brace, end, "{ false }");
+        let (sites, _) = build_sites(&[m]).unwrap();
+        let refs: Vec<&Site> = sites.iter().collect();
+        let (out, applied) = apply_to_source(src, &refs).unwrap();
+        let prologue = applied[0].prologue_start;
+        assert!(
+            out[..prologue].ends_with("#![doc = \"]\"]"),
+            "prologue must follow the last inner attribute: {out}"
+        );
+        assert!(out[prologue..].contains("if x { true }"), "{out}");
+        assert_eq!(prologue_insert_at("fn g() { 1 }", 7), 8);
+        assert_eq!(prologue_insert_at("fn g() { // note\n 1 }", 7), 8);
     }
 
     #[test]
