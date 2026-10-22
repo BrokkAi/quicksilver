@@ -307,6 +307,56 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
     Ok(count_compiling_units(&stderr))
 }
 
+/// What decides the preflight count: the lock file, every workspace
+/// manifest, every build script and the workspace cargo config. A build
+/// script that hashes sources is what preflight looks for, so an edit to any
+/// of these measures again; an edit to ordinary source does not.
+pub fn preflight_key(root: &Path) -> Result<String> {
+    use sha2::Digest;
+    let meta = crate::cargo_cmd::load_metadata(root)?;
+    let mut files: Vec<std::path::PathBuf> = vec![
+        root.join("Cargo.lock"),
+        root.join(".cargo").join("config.toml"),
+    ];
+    for pkg in meta.workspace_packages() {
+        files.push(pkg.manifest_path.clone().into_std_path_buf());
+        for t in &pkg.targets {
+            if t.kind.iter().any(|k| k.to_string() == "custom-build") {
+                files.push(t.src_path.clone().into_std_path_buf());
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
+    let mut h = sha2::Sha256::new();
+    for f in files {
+        let rel = f.strip_prefix(root).unwrap_or(&f);
+        h.update(crate::util::rel_slash(rel).as_bytes());
+        match fs::read(&f) {
+            Ok(bytes) => h.update(sha2::Sha256::digest(&bytes)),
+            Err(_) => h.update(b"absent"),
+        }
+    }
+    Ok(crate::util::hex(&h.finalize()))
+}
+
+/// A preflight count measured earlier in this scratch session for the same
+/// [`preflight_key`].
+pub fn cached_preflight(paths: &Paths, key: &str) -> Option<u64> {
+    let text = fs::read_to_string(paths.index.join("preflight.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (v.get("key")?.as_str()? == key)
+        .then(|| v.get("recompiled")?.as_u64())
+        .flatten()
+}
+
+pub fn save_preflight(paths: &Paths, key: &str, recompiled: u64) -> Result<()> {
+    crate::util::write_atomic(
+        &paths.index.join("preflight.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "key": key, "recompiled": recompiled }))?,
+    )
+}
+
 pub fn write_baseline_report(paths: &Paths, report: &BaselineReport) -> Result<()> {
     crate::util::write_atomic(
         &paths.index.join("baseline.json"),
@@ -321,6 +371,29 @@ pub fn load_baseline_report(paths: &Paths) -> Result<Option<BaselineReport>> {
     }
     let text = fs::read_to_string(p)?;
     Ok(Some(serde_json::from_str(&text)?))
+}
+
+/// Sites selection runs every candidate test under the schema binary with no
+/// mutant active, so it learns which tests are green for this commit there.
+/// From the baseline it needs only test durations, which size the recording
+/// timeouts and change little between commits. When an earlier run in this
+/// scratch session saved them, sync the baseline and reuse them: no baseline
+/// build and no suite run (`cargo nextest list` builds the tests anyway).
+/// The earlier failures are dropped, because they describe another commit.
+pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<BaselineReport> {
+    if let Some(mut earlier) = load_baseline_report(paths)? {
+        if !earlier.tests.is_empty() {
+            let _meta = materialize_and_metadata(cfg, paths)?;
+            info!(
+                "sites selection: reusing {} test durations from an earlier run; no baseline build or suite run",
+                earlier.tests.len()
+            );
+            earlier.failed_test_ids.clear();
+            earlier.preflight_recompiled = None;
+            return Ok(earlier);
+        }
+    }
+    prepare_baseline(cfg, paths, false, false)
 }
 
 /// `measure_costs` times one incremental rebuild per package. Only `estimate`

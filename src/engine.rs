@@ -109,7 +109,12 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
     eprintln!("{}", scratch::format_probe(&probe));
     scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
 
-    let baseline = prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?;
+    let baseline = if cfg.test_selection == TestSelection::Sites && !skip_baseline && !for_estimate
+    {
+        crate::baseline::prepare_baseline_reusing_timings(&cfg, &paths)?
+    } else {
+        prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
+    };
 
     let opened = crate::bifrost::open_workspace(&paths.baseline)?;
     let mut mutants =
@@ -309,8 +314,30 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
     else {
         return Ok(None);
     };
+    // Preflight costs a whole workspace rebuild, and its answer depends only
+    // on manifests and build scripts. Measure once per scratch session and
+    // again when one of those changes, not on every per-commit run.
+    let key = match crate::baseline::preflight_key(&prepared.paths.baseline) {
+        Ok(key) => Some(key),
+        Err(err) => {
+            tracing::warn!("preflight key: {err:#}");
+            None
+        }
+    };
+    if let Some(n) = key
+        .as_deref()
+        .and_then(|k| crate::baseline::cached_preflight(&prepared.paths, k))
+    {
+        eprintln!("preflight recompile count after one mutant: {n} units (measured earlier in this scratch session)");
+        return Ok(Some(n));
+    }
     match preflight_recompile_count(&prepared.cfg, &prepared.paths, m) {
         Ok(n) => {
+            if let Some(k) = &key {
+                if let Err(err) = crate::baseline::save_preflight(&prepared.paths, k, n) {
+                    tracing::warn!("saving the preflight count: {err:#}");
+                }
+            }
             eprintln!("preflight recompile count after one mutant: {n} units");
             if n > 8 {
                 eprintln!(

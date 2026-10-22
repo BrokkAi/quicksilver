@@ -400,3 +400,74 @@ fn a_child_process_built_from_the_workspace_sees_the_mutant() {
         "every greeting mutant changes the example's output: {greeting:?}"
     );
 }
+
+/// Preflight rebuilds the whole workspace to look for build scripts that hash
+/// sources. Its answer depends on manifests and build scripts, not on
+/// ordinary source, so a per-commit run reuses the count until one of those
+/// changes.
+#[test]
+fn preflight_count_is_reused_until_a_build_script_or_manifest_changes() {
+    use cargo_quicksilver::baseline::{cached_preflight, preflight_key, save_preflight};
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    let scratch = tempfile::tempdir().unwrap();
+    let paths = support::scratch_cfg(root, scratch.path()).paths();
+    paths.ensure().unwrap();
+
+    let before = preflight_key(root).unwrap();
+    assert_eq!(before, preflight_key(root).unwrap(), "key must be stable");
+    save_preflight(&paths, &before, 3).unwrap();
+    assert_eq!(cached_preflight(&paths, &before), Some(3));
+
+    let lib = root.join("crate_a/src/lib.rs");
+    let mut text = fs::read_to_string(&lib).unwrap();
+    text.push_str("\npub fn added_by_the_test() -> u8 { 1 }\n");
+    fs::write(&lib, text).unwrap();
+    assert_eq!(
+        preflight_key(root).unwrap(),
+        before,
+        "ordinary source edits keep the key"
+    );
+
+    fs::write(root.join("crate_a/build.rs"), "fn main() {}\n").unwrap();
+    let after = preflight_key(root).unwrap();
+    assert_ne!(after, before, "a new build script must measure again");
+    assert_eq!(cached_preflight(&paths, &after), None);
+}
+
+/// In sites mode a second run in the same scratch session reuses the test
+/// durations saved by the first and does not build or run the baseline suite
+/// again; the recording run decides which tests are green for this commit.
+#[test]
+fn sites_mode_reuses_baseline_timings_within_a_session() {
+    if !tools_ok() {
+        eprintln!("skip: nextest or llvm-cov not available");
+        return;
+    }
+    let repo = support::setup_tiny();
+    let scratch = tempfile::tempdir().unwrap();
+    let cfg = || {
+        let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+        cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
+        cfg
+    };
+    let first = prepare(cfg(), false, false).expect("first prepare");
+    let report = first.paths.index.join("baseline.json");
+    let saved = fs::metadata(&report).unwrap().modified().unwrap();
+    let first_tests = first.baseline.tests.len();
+    assert!(first_tests > 0, "the first run times the suite");
+    drop(first);
+
+    let second = prepare(cfg(), false, false).expect("second prepare");
+    assert_eq!(
+        fs::metadata(&report).unwrap().modified().unwrap(),
+        saved,
+        "the second run must not run the baseline suite again"
+    );
+    assert_eq!(second.baseline.tests.len(), first_tests);
+    assert!(second.baseline.failed_test_ids.is_empty());
+    assert!(
+        !second.plan.batches.is_empty(),
+        "tests are still listed and planned"
+    );
+}
