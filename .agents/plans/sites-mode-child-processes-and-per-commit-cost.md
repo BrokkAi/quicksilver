@@ -73,7 +73,13 @@ The second half of the plan reduces what QS pays per commit before it runs any m
 
 ## Outcomes & Retrospective
 
-None yet.
+2026-10-22. Sites selection now agrees with cargo-mutants on clap: with the final build (commit `56a55ef`, debug, local), 792 mutants are caught by both, none is caught by cargo-mutants and missed or left uncovered by QS (11 on EC2), and the remaining differences are 397 NotCovered against Missed (both say no test detects the mutant) and 7 cargo-mutants timeouts that came from load on the VM. A warm whole-workspace clap run took 132 s on this shared host.
+
+The clap misses had one cause: tests that build and run workspace programs as child processes (trycmd) saw the original source. The fix runs each batch's tests in the worker that holds its schema source. Checking it on the full workspace exposed two older bugs that EC2 could not show: worker copies shared one target directory through a copied symlink, and copies reset modification times so cargo rebuilt most of the workspace in every fresh worker.
+
+Per-commit cost on itertools (debug QS) went from 35.7 s to about 8 s for a commit the Bifrost store already holds. What remains, largest first: opening Bifrost on a commit it has not seen (10 to 25 s in a debug build, 1.3 to 1.5 s in release), which Bifrost would have to make incremental per file or replace with a per-file declaration query; discovery (about 1.8 s); worker copy (1.4 s here, real bytes on ZFS without block cloning; 0.07 s on EC2); gates and recording (about 1.2 s); and the schema build itself.
+
+Not done: a fresh EC2 measurement against cargo-mutants with these changes. The owner stopped EC2 spending on 2026-10-21, so it waits for a go-ahead. Lesson: run the whole workspace, not only the files that showed the bug, before accepting a fix; the single-crate checks passed while the multi-crate run was broken.
 
 ## Context and Orientation
 
