@@ -948,7 +948,34 @@ pub fn ensure_worker(backend: &dyn CloneBackend, paths: &Paths, slot: usize) -> 
         start.elapsed().as_secs_f64(),
         backend.name()
     );
+    private_target_dir(&dest)?;
     Ok(dest)
+}
+
+/// Give a copied tree its own `target` directory when the copy brought a
+/// symlink. A build cache such as mbx makes `target` a symlink to a managed
+/// directory; copied as a symlink, it makes the baseline and every worker
+/// build into one directory, so concurrent schema builds of different crates
+/// overwrite each other's artifacts and a crate's tests run against a library
+/// without its sites. The new directory starts empty: its first build is a
+/// full one, which a build cache serves from its store.
+pub fn private_target_dir(tree: &Path) -> Result<()> {
+    let target = tree.join("target");
+    let is_link = fs::symlink_metadata(&target)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if is_link {
+        let shared = fs::read_link(&target).unwrap_or_default();
+        fs::remove_file(&target)
+            .with_context(|| format!("remove copied target symlink {}", target.display()))?;
+        fs::create_dir_all(&target)?;
+        info!(
+            "{} was a symlink to {}; replaced it with an empty private directory",
+            target.display(),
+            shared.display()
+        );
+    }
+    Ok(())
 }
 
 pub fn check_free_space(path: &Path, min: Option<u64>) -> Result<()> {
@@ -977,6 +1004,41 @@ pub fn format_probe(report: &ProbeReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// mbx makes `target` a symlink to a managed directory. A worker cloned
+    /// with that symlink built into the same directory as the baseline and
+    /// every other worker; on clap, concurrent schema builds overwrote each
+    /// other and clap_builder's tests recorded none of its 911 sites.
+    #[test]
+    fn a_worker_gets_a_private_target_when_the_baseline_target_is_a_symlink() {
+        let scratch = tempfile::tempdir().unwrap();
+        let shared = tempfile::tempdir().unwrap();
+        let paths = Paths::for_session(scratch.path(), Path::new("/repo"));
+        paths.ensure().unwrap();
+        fs::create_dir_all(paths.baseline.join("src")).unwrap();
+        fs::write(paths.baseline.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        fs::write(shared.path().join("artifact"), "shared build output").unwrap();
+        std::os::unix::fs::symlink(shared.path(), paths.baseline.join("target")).unwrap();
+
+        let backend = CopyBackend { server_side: false };
+        let worker = ensure_worker(&backend, &paths, 0).unwrap();
+        let target = fs::symlink_metadata(worker.join("target")).unwrap();
+        assert!(
+            target.is_dir() && !target.file_type().is_symlink(),
+            "the worker's target must be its own directory"
+        );
+        assert!(!worker.join("target/artifact").exists());
+        assert!(worker.join("src/lib.rs").is_file());
+        assert!(
+            shared.path().join("artifact").is_file(),
+            "the shared directory itself is left alone"
+        );
+
+        // A real target directory is a private copy already and is kept.
+        fs::write(worker.join("target/keep"), "own build output").unwrap();
+        private_target_dir(&worker).unwrap();
+        assert!(worker.join("target/keep").is_file());
+    }
 
     #[test]
     fn sync_baseline_updates_in_place_and_keeps_build_state() {
