@@ -147,7 +147,7 @@ fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
     let files = crate::discover::file_globset(&cfg.files)?;
     let in_scope = |s: &sitemap::MapSite| {
-        (cfg.packages.is_empty() || cfg.packages.iter().any(|p| *p == s.package))
+        (cfg.packages.is_empty() || cfg.packages.contains(&s.package))
             && files.as_ref().is_none_or(|g| g.is_match(&s.path))
     };
     let total = map.sites.iter().filter(|s| in_scope(s)).count();
