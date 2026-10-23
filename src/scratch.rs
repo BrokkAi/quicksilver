@@ -197,11 +197,9 @@ pub fn probe(
                 // Classify sharing before verify_independent. Writing the source
                 // unshares its first CoW extent, so filefrag/FIEMAP after that
                 // look like a full copy on a working XFS reflink.
-                let sharing = classify_sharing(
-                    space_delta,
-                    PROBE_BYTES as u64,
-                    filefrag_shared(&src, &dst).or_else(|| fiemap_shared(&src, &dst)),
-                );
+                let hint = filefrag_shared(&src, &dst).or_else(|| fiemap_shared(&src, &dst));
+                let local = !crate::util::on_nfs(scratch_root);
+                let sharing = classify_sharing(space_delta, PROBE_BYTES as u64, hint, local);
                 verify_independent(&src, &dst)?;
                 match sharing {
                     Sharing::SharedBlocks => {
@@ -209,9 +207,15 @@ pub fn probe(
                         return Ok(ProbeReport {
                             backend: CloneBackendKind::Reflink,
                             sharing,
-                            message: format!(
-                                "reflink clone ok in {clone_secs:.3}s; shared blocks confirmed (free-space delta {space_delta} bytes)"
-                            ),
+                            message: if hint == Some(true) {
+                                format!(
+                                    "reflink clone ok in {clone_secs:.3}s; shared blocks confirmed (free-space delta {space_delta} bytes)"
+                                )
+                            } else {
+                                format!(
+                                    "reflink clone ok in {clone_secs:.3}s; this local filesystem does not report block sharing (ZFS has no FIEMAP), and a FICLONE that succeeds on a local filesystem is a clone, never a copy"
+                                )
+                            },
                             clone_secs,
                             space_delta,
                         });
@@ -314,7 +318,15 @@ pub fn probe(
     })
 }
 
-pub(crate) fn classify_sharing(space_delta: i64, file_size: u64, hint: Option<bool>) -> Sharing {
+/// `local` is false on NFS, where a FICLONE that succeeds has been seen to
+/// end in a server-side byte copy. On a local Linux filesystem FICLONE
+/// shares blocks or fails; it never falls back to copying.
+pub(crate) fn classify_sharing(
+    space_delta: i64,
+    file_size: u64,
+    hint: Option<bool>,
+    local: bool,
+) -> Sharing {
     if hint == Some(true) {
         return Sharing::SharedBlocks;
     }
@@ -326,9 +338,14 @@ pub(crate) fn classify_sharing(space_delta: i64, file_size: u64, hint: Option<bo
         }
         return Sharing::FullCopy;
     }
-    // No FIEMAP/filefrag (typical over NFS). Async free-space accounting on a
-    // large pool reads ~0 whether or not blocks were shared — do not treat a
-    // small delta as confirmation.
+    // No FIEMAP/filefrag: ZFS, and NFS. On a local filesystem the clone call
+    // succeeding is the confirmation; ZFS's free space is updated when the
+    // transaction group commits, so the delta is noise either way.
+    if local {
+        return Sharing::SharedBlocks;
+    }
+    // Over NFS, async free-space accounting on a large pool reads ~0 whether
+    // or not blocks were shared; do not treat a small delta as confirmation.
     if space_delta > (file_size as i64) / 2 {
         return Sharing::ServerSideCopy;
     }
@@ -1155,7 +1172,7 @@ mod tests {
     #[test]
     fn hint_true_is_shared_even_if_delta_is_large() {
         assert_eq!(
-            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, Some(true)),
+            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, Some(true), false),
             Sharing::SharedBlocks
         );
     }
@@ -1163,24 +1180,34 @@ mod tests {
     #[test]
     fn hint_false_is_not_overridden_by_small_delta() {
         assert_eq!(
-            classify_sharing(0, 32 * 1024 * 1024, Some(false)),
+            classify_sharing(0, 32 * 1024 * 1024, Some(false), true),
             Sharing::FullCopy
         );
     }
 
     #[test]
     fn no_hint_small_delta_is_unknown_not_shared() {
-        // NFS/ZFS async accounting: 32 MB is noise on a 6.8 T pool.
+        // NFS async accounting: 32 MB is noise on a 6.8 T pool.
         assert_eq!(
-            classify_sharing(0, 32 * 1024 * 1024, None),
+            classify_sharing(0, 32 * 1024 * 1024, None, false),
             Sharing::Unknown
+        );
+    }
+
+    #[test]
+    fn a_successful_clone_on_a_local_filesystem_without_fiemap_is_shared() {
+        // Local ZFS: no FIEMAP, and free space moves only when the
+        // transaction group commits (the probe once read -14 MB).
+        assert_eq!(
+            classify_sharing(-14_417_920, 32 * 1024 * 1024, None, true),
+            Sharing::SharedBlocks
         );
     }
 
     #[test]
     fn no_hint_large_delta_is_a_copy() {
         assert_eq!(
-            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, None),
+            classify_sharing(32 * 1024 * 1024, 32 * 1024 * 1024, None, false),
             Sharing::ServerSideCopy
         );
     }

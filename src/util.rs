@@ -229,6 +229,21 @@ pub fn statvfs_avail(path: &Path) -> Result<u64> {
     }
 }
 
+/// Whether `path` is on an NFS mount (`statfs` magic 0x6969).
+pub fn on_nfs(path: &Path) -> bool {
+    const NFS_SUPER_MAGIC: i64 = 0x6969;
+    let Ok(c) = std::ffi::CString::new(path.to_string_lossy().as_bytes()) else {
+        return false;
+    };
+    unsafe {
+        let mut s: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut s) != 0 {
+            return false;
+        }
+        s.f_type as i64 == NFS_SUPER_MAGIC
+    }
+}
+
 pub fn fill_incompressible(len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     let mut x: u64 = 0xC0FFEE_u64.wrapping_mul(0x9E37_79B9_7F4A_7C15);
