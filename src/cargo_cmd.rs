@@ -33,18 +33,9 @@ pub enum PackageSelect {
     Packages(Vec<String>),
 }
 
+/// The packages whose code is mutated: `--package`, or none for all.
 pub fn covering_seeds(cfg: &Config) -> Vec<String> {
-    covering_seeds_from(&cfg.packages, cfg.index_scope.as_deref())
-}
-
-pub fn covering_seeds_from(packages: &[String], index_scope: Option<&str>) -> Vec<String> {
-    let mut pkgs = packages.to_vec();
-    if let Some(scope) = index_scope {
-        if !pkgs.iter().any(|p| p == scope) {
-            pkgs.push(scope.to_string());
-        }
-    }
-    pkgs
+    cfg.packages.clone()
 }
 
 /// Packages whose incremental `cargo build --tests -p` we time for t_build.
@@ -52,12 +43,8 @@ pub fn covering_seeds_from(packages: &[String], index_scope: Option<&str>) -> Ve
 /// A scoped estimate rebuilds the mutant's crate, not the whole workspace.
 /// Timing every member serializes a rustc on a shared box and then averages
 /// in unrelated crates, which both wastes cores and biases t_build.
-pub fn packages_for_rebuild_timing(
-    packages: &[String],
-    index_scope: Option<&str>,
-    meta: &Metadata,
-) -> Vec<String> {
-    let seeds = covering_seeds_from(packages, index_scope);
+pub fn packages_for_rebuild_timing(packages: &[String], meta: &Metadata) -> Vec<String> {
+    let seeds = packages.to_vec();
     if seeds.is_empty() {
         meta.workspace_packages()
             .iter()
@@ -69,15 +56,11 @@ pub fn packages_for_rebuild_timing(
 }
 
 pub fn package_select(cfg: &Config, meta: &Metadata) -> PackageSelect {
-    package_select_from(&cfg.packages, cfg.index_scope.as_deref(), meta)
+    package_select_from(&cfg.packages, meta)
 }
 
-pub fn package_select_from(
-    packages: &[String],
-    index_scope: Option<&str>,
-    meta: &Metadata,
-) -> PackageSelect {
-    let seeds = covering_seeds_from(packages, index_scope);
+pub fn package_select_from(packages: &[String], meta: &Metadata) -> PackageSelect {
+    let seeds = packages.to_vec();
     if seeds.is_empty() {
         PackageSelect::Workspace
     } else {
@@ -164,51 +147,17 @@ pub fn package_specs(root: Option<&Path>, packages: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// The caller's `RUSTFLAGS` plus LLVM coverage instrumentation, with the
-/// workspace root remapped away so coverage names files by their
-/// workspace-relative path. Without the remap, a crate mbx restores from a
-/// build in another checkout reports that checkout's absolute paths.
-pub fn coverage_rustflags(ws_root: Option<&Path>) -> String {
-    let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
-    let mut push = |flag: String| {
-        if !flags.is_empty() {
-            flags.push(' ');
-        }
-        flags.push_str(&flag);
-    };
-    push("-C instrument-coverage".into());
-    if let Some(root) = ws_root {
-        let mut roots = vec![root.to_path_buf()];
-        if let Ok(canon) = root.canonicalize() {
-            if canon != root {
-                roots.push(canon);
-            }
-        }
-        for r in roots {
-            push(format!("--remap-path-prefix={}/=", r.display()));
-        }
-    }
-    flags
-}
-
-/// The environment of every QS build. Ordinary builds keep the caller's
-/// flags and let mbx manage the tree's `target/`: identical invocations share
-/// mbx's cache with the user's own builds, and mbx gives the crates QS edits
-/// private incremental state. QS no longer forces `CARGO_INCREMENTAL`, which
-/// made mbx bypass its cache. The LLVM coverage build keeps its own flags and
-/// the target directory its caller set.
-pub fn apply_build_env(cmd: &mut Command, cfg: &Config, coverage: bool) {
+/// The environment of every QS build. Builds keep the caller's flags and let
+/// mbx manage the tree's `target/`: identical invocations share mbx's cache
+/// with the user's own builds, and mbx gives the crates QS edits private
+/// incremental state.
+pub fn apply_build_env(cmd: &mut Command, cfg: &Config) {
     cmd.env_remove("RUSTC_WRAPPER");
     cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env_remove("SCCACHE");
     // Honour the target repo's rust-toolchain.toml, not the caller's pin.
     cmd.env_remove("RUSTUP_TOOLCHAIN");
-    if coverage {
-        let root = cmd.get_current_dir().map(Path::to_path_buf);
-        cmd.env("RUSTFLAGS", coverage_rustflags(root.as_deref()));
-    } else {
-        cmd.env_remove("CARGO_TARGET_DIR");
-    }
+    cmd.env_remove("CARGO_TARGET_DIR");
     for (k, v) in &cfg.build_env {
         cmd.env(k, v);
     }
@@ -353,15 +302,11 @@ pub fn build_tests(
     target_dir: &Path,
     cfg: &Config,
     packages: &[String],
-    coverage: bool,
     json: bool,
 ) -> Result<BuildResult> {
     let mut cmd = cargo_command();
     cmd.current_dir(root);
-    if coverage {
-        cmd.env("CARGO_TARGET_DIR", target_dir);
-    }
-    apply_build_env(&mut cmd, cfg, coverage);
+    apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
     // package pays startup + lock + fingerprint 2–4× on the compile-bound path.
@@ -422,14 +367,10 @@ pub fn build_tests_captured(
     target_dir: &Path,
     cfg: &Config,
     packages: &[String],
-    coverage: bool,
 ) -> Result<CapturedBuild> {
     let mut cmd = cargo_command();
     cmd.current_dir(root);
-    if coverage {
-        cmd.env("CARGO_TARGET_DIR", target_dir);
-    }
-    apply_build_env(&mut cmd, cfg, coverage);
+    apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
     if packages.is_empty() {
         cmd.arg("--workspace");
@@ -613,10 +554,7 @@ mod tests {
     fn package_select_unscoped_is_workspace() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
         let meta = load_metadata(&root).expect("tiny metadata");
-        assert_eq!(
-            package_select_from(&[], None, &meta),
-            PackageSelect::Workspace
-        );
+        assert_eq!(package_select_from(&[], &meta), PackageSelect::Workspace);
     }
 
     #[test]
@@ -640,9 +578,9 @@ mod tests {
     fn rebuild_timing_uses_seeds_not_the_whole_workspace() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
         let meta = load_metadata(&root).expect("tiny metadata");
-        let scoped = packages_for_rebuild_timing(&["tiny_a".into()], None, &meta);
+        let scoped = packages_for_rebuild_timing(&["tiny_a".into()], &meta);
         assert_eq!(scoped, vec!["tiny_a".to_string()]);
-        let unscoped = packages_for_rebuild_timing(&[], None, &meta);
+        let unscoped = packages_for_rebuild_timing(&[], &meta);
         assert!(unscoped.len() >= 3, "{unscoped:?}");
         assert!(unscoped.iter().any(|p| p == "tiny_a"));
         assert!(unscoped.iter().any(|p| p == "tiny_b"));

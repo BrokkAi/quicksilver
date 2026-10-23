@@ -1,9 +1,8 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -76,73 +75,6 @@ pub fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-/// `rustc` as a cargo child in `cwd` would see it: that directory's
-/// `rust-toolchain.toml` or the rustup default, never QS's own pin.
-fn workspace_rustc(cwd: &Path) -> Command {
-    let mut cmd = Command::new("rustc");
-    cmd.current_dir(cwd);
-    cmd.env_remove("RUSTUP_TOOLCHAIN");
-    cmd
-}
-
-pub fn rustc_sysroot(cwd: &Path) -> Result<PathBuf> {
-    let out = workspace_rustc(cwd)
-        .args(["--print", "sysroot"])
-        .output()
-        .context("rustc --print sysroot")?;
-    if !out.status.success() {
-        bail!("rustc --print sysroot failed");
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&out.stdout).trim().to_string(),
-    ))
-}
-
-pub fn host_triple(cwd: &Path) -> Result<String> {
-    let out = workspace_rustc(cwd)
-        .args(["-vV"])
-        .output()
-        .context("rustc -vV")?;
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if let Some(rest) = line.strip_prefix("host: ") {
-            return Ok(rest.trim().to_string());
-        }
-    }
-    bail!("no host: line in rustc -vV")
-}
-
-pub fn rustc_verbose_version(cwd: &Path) -> Result<String> {
-    let out = workspace_rustc(cwd)
-        .args(["-vV"])
-        .output()
-        .context("rustc -vV")?;
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// The LLVM tool that matches the toolchain building `workspace`. A tool
-/// from another LLVM major cannot read the profiles and reports every one as
-/// corrupt, so there is no PATH or distro fallback.
-pub fn find_llvm_tool(name: &str, workspace: &Path) -> Result<PathBuf> {
-    let sysroot = rustc_sysroot(workspace)?;
-    let triple = host_triple(workspace)?;
-    let in_sysroot = sysroot
-        .join("lib/rustlib")
-        .join(&triple)
-        .join("bin")
-        .join(name);
-    if in_sysroot.is_file() {
-        return Ok(in_sysroot);
-    }
-    let toolchain = sysroot
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| sysroot.display().to_string());
-    bail!(
-        "{name} is missing from toolchain {toolchain}, which builds {}; run `rustup component add llvm-tools --toolchain {toolchain}`",
-        workspace.display()
-    )
 }
 
 pub fn format_duration(secs: f64) -> String {
@@ -256,15 +188,6 @@ pub fn line_col_to_offset(src: &str, line: usize, column: usize) -> usize {
         off += part.len();
     }
     src.len()
-}
-
-pub fn sanitize_filename(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
-            _ => '_',
-        })
-        .collect()
 }
 
 pub fn parse_memory_spec(s: &str) -> Result<f64> {

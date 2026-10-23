@@ -39,7 +39,7 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
 pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     let target = paths.baseline.join("target");
     info!("baseline cargo build --tests (profile quicksilver)");
-    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &[], false, false)
+    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &[], false)
 }
 
 pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>, Vec<String>)> {
@@ -59,7 +59,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         );
         let mut cmd = crate::cargo_cmd::cargo_command();
         cmd.current_dir(&paths.baseline);
-        apply_build_env(&mut cmd, cfg, false);
+        apply_build_env(&mut cmd, cfg);
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
@@ -237,11 +237,7 @@ fn attr(tag: &str, key: &str) -> Option<String> {
 pub fn measure_package_costs(cfg: &Config, paths: &Paths) -> Result<Vec<PackageCost>> {
     let meta = load_metadata(&paths.baseline)?;
     let target = paths.baseline.join("target");
-    let names = crate::cargo_cmd::packages_for_rebuild_timing(
-        &cfg.packages,
-        cfg.index_scope.as_deref(),
-        &meta,
-    );
+    let names = crate::cargo_cmd::packages_for_rebuild_timing(&cfg.packages, &meta);
     let mut costs = Vec::new();
     for name in names {
         let Some(src) = crate_root_source(&meta, &name) else {
@@ -258,7 +254,6 @@ pub fn measure_package_costs(cfg: &Config, paths: &Paths) -> Result<Vec<PackageC
             &target,
             cfg,
             std::slice::from_ref(&name),
-            false,
             false,
         ) {
             Ok(_) => {
@@ -286,7 +281,7 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
     let original = apply_mutant(&paths.baseline, mutant)?;
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
-    apply_build_env(&mut cmd, cfg, false);
+    apply_build_env(&mut cmd, cfg);
     // Workspace `cargo build --tests`, not `-p mutant.package`. A source-hashing
     // build script (BIFROST_BUILD_IDENTITY) relinks a *different* crate; scoping
     // to the mutant package misses the cascade this preflight exists to catch.

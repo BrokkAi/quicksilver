@@ -119,6 +119,58 @@ impl SiteMap {
     }
 }
 
+/// Plans built-in mutants against a map: a mutant's tests are the ones that
+/// entered its function when the map was recorded. Mutants are matched to
+/// sites by the site seed (package, path, name, body start), not by site id,
+/// which depends on the order ids were assigned in.
+pub struct MapSelector<'a> {
+    map: &'a SiteMap,
+    by_seed: std::collections::HashMap<String, u32>,
+}
+
+impl<'a> MapSelector<'a> {
+    pub fn new(map: &'a SiteMap) -> Self {
+        let by_seed = map
+            .sites
+            .iter()
+            .map(|s| {
+                (
+                    site_seed(&s.package, &s.path, &s.fqn, s.body_start_byte),
+                    s.site_id,
+                )
+            })
+            .collect();
+        Self { map, by_seed }
+    }
+
+    fn site_of(&self, m: &crate::types::Mutant) -> Option<u32> {
+        self.by_seed
+            .get(&site_seed(&m.package, &m.path, &m.fqn, m.body_start_byte))
+            .copied()
+    }
+}
+
+impl crate::plan::TestSelector for MapSelector<'_> {
+    /// A mutant whose function has no site in the map (the map is from
+    /// another commit, or the function was dropped) counts as covered: that
+    /// is the cautious answer for a census of what needs no run.
+    fn covers(&self, m: &crate::types::Mutant) -> bool {
+        match self.site_of(m) {
+            Some(site) => self.map.hits.values().any(|h| h.contains(&site)),
+            None => true,
+        }
+    }
+    fn tests_for(&self, m: &crate::types::Mutant) -> Vec<TestInfo> {
+        match self.site_of(m) {
+            Some(site) => self.map.tests_entering(&[site]),
+            None => self.map.tests.clone(),
+        }
+    }
+    fn catalog(&self) -> &[TestInfo] {
+        &self.map.tests
+    }
+}
+
 /// Which scanned functions get a site, and why the others do not. A nested
 /// function (its range inside another kept function's body) is part of the
 /// outer body and not its own site.
@@ -285,6 +337,70 @@ mod tests {
             ]
         );
         assert_ne!(sites[0].site_id, sites[1].site_id);
+    }
+
+    #[test]
+    fn the_map_selector_matches_mutants_to_sites_by_seed() {
+        use crate::plan::TestSelector;
+        let site = |id: u32, fqn: &str, body: usize| MapSite {
+            site_id: id,
+            salt: 0,
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: fqn.into(),
+            fn_start_byte: body - 5,
+            body_start_byte: body,
+            body_end_byte: body + 5,
+            start_line: 1,
+            end_line: 1,
+        };
+        let t = |id: &str| TestInfo {
+            id: id.into(),
+            name: id.into(),
+            package: "p".into(),
+            binary_id: "p".into(),
+            binary_name: String::new(),
+            binary_rel: String::new(),
+            cwd_rel: String::new(),
+            duration_secs: 0.1,
+        };
+        let map = SiteMap {
+            version: MAP_VERSION,
+            map_id: "x".into(),
+            commit: String::new(),
+            prefix: String::new(),
+            repo_root: PathBuf::new(),
+            files: BTreeMap::new(),
+            sites: vec![site(7, "p.entered", 10), site(8, "p.untouched", 40)],
+            dropped: Vec::new(),
+            crate_roots: BTreeMap::new(),
+            tests: vec![t("p::t1")],
+            hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
+            not_green: Vec::new(),
+            worker: PathBuf::new(),
+            run_dir: PathBuf::new(),
+            map_secs: 0.0,
+        };
+        let mutant = |fqn: &str, body: usize| crate::types::Mutant {
+            id: fqn.into(),
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: fqn.into(),
+            start_byte: body - 5,
+            end_byte: body + 5,
+            start_line: 1,
+            end_line: 1,
+            body_start_byte: body,
+            body_end_byte: body + 5,
+            replacement: "{ 0 }".into(),
+            return_kind: "number".into(),
+        };
+        let sel = MapSelector::new(&map);
+        assert!(sel.covers(&mutant("p.entered", 10)));
+        assert_eq!(sel.tests_for(&mutant("p.entered", 10)).len(), 1);
+        assert!(!sel.covers(&mutant("p.untouched", 40)));
+        // A function the map does not know (moved since) counts as covered.
+        assert!(sel.covers(&mutant("p.entered", 11)));
     }
 
     #[test]

@@ -63,7 +63,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     };
     let reset = || fs::write(&lib, &original).unwrap();
     let run_build =
-        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path()), false).expect("build");
+        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path())).expect("build");
 
     // One mutant, two bodies: caught by add_works or greeting_works.
     edit("    a + b\n", "    a - b\n");

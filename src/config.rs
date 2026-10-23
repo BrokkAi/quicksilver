@@ -6,17 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Where each mutant's tests come from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum TestSelection {
-    /// LLVM coverage: Stage A (union) and Stage B (per test).
-    #[default]
-    Coverage,
-    /// One run of every candidate test under the schema binary, recording
-    /// which mutation sites it enters. No instrumented build, no LLVM.
-    Sites,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
@@ -24,8 +13,6 @@ pub struct FileConfig {
     pub build_jobs: Option<usize>,
     #[serde(rename = "test-jobs")]
     pub test_jobs: Option<usize>,
-    #[serde(rename = "index-jobs")]
-    pub index_jobs: Option<usize>,
     #[serde(rename = "cm-jobs")]
     pub cm_jobs: Option<usize>,
     #[serde(rename = "build-env", default)]
@@ -35,7 +22,6 @@ pub struct FileConfig {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub repo_root: PathBuf,
-    pub test_selection: TestSelection,
     /// `<git common dir>/quicksilver`: where QS's worktrees live.
     pub worktree_root: PathBuf,
     /// The workspace's path below the repository top level (`git rev-parse
@@ -43,7 +29,6 @@ pub struct Config {
     pub prefix: String,
     pub build_jobs: usize,
     pub test_jobs: usize,
-    pub index_jobs: usize,
     /// Comparison baseline width for cargo-mutants (J_cm). Not the QS build pool.
     pub cm_jobs: usize,
     pub max_build_memory_frac: f64,
@@ -51,8 +36,6 @@ pub struct Config {
     pub packages: Vec<String>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
-    pub index_scope: Option<String>,
-    pub reindex: bool,
     pub json: Option<PathBuf>,
     pub resume: bool,
     pub shard: Option<(u32, u32)>,
@@ -120,7 +103,6 @@ pub fn merge_config(
         .or(file.build_jobs)
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
-    let index_jobs = cli.index_jobs.or(file.index_jobs).unwrap_or_else(nproc);
     // cargo-mutants workers are RAM-bound the same way the QS build pool is.
     // Defaulting to nproc (120 here) would overstate the competitor.
     let cm_jobs = cli
@@ -137,20 +119,16 @@ pub fn merge_config(
 
     Ok(Config {
         repo_root,
-        test_selection: cli.test_selection,
         worktree_root: crate::worktree::root(&repo),
         prefix: repo.prefix,
         build_jobs: build_jobs.max(1),
         test_jobs: test_jobs.max(1),
-        index_jobs: index_jobs.max(1),
         cm_jobs: cm_jobs.max(1),
         max_build_memory_frac,
         max_scratch: cli.max_scratch,
         packages: extras.packages,
         files: extras.files,
         in_diff: extras.in_diff,
-        index_scope: extras.index_scope,
-        reindex: extras.reindex,
         json: extras.json,
         resume: extras.resume,
         shard: extras.shard,
@@ -180,8 +158,6 @@ pub struct ConfigExtras {
     pub packages: Vec<String>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
-    pub index_scope: Option<String>,
-    pub reindex: bool,
     pub json: Option<PathBuf>,
     pub resume: bool,
     pub shard: Option<(u32, u32)>,

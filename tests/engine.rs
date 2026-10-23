@@ -81,14 +81,12 @@ fn mutant_ids_stable_across_line_shift() {
 
 fn tools_ok() -> bool {
     cargo_quicksilver::cargo_cmd::nextest_available()
-        && cargo_quicksilver::util::find_llvm_tool("llvm-cov", &support::fixture_src()).is_ok()
-        && cargo_quicksilver::util::find_llvm_tool("llvm-profdata", &support::fixture_src()).is_ok()
 }
 
 #[test]
-fn coverage_caught_missed_notcovered_timeout() {
+fn caught_missed_notcovered_timeout() {
     if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
+        eprintln!("skip: nextest not available");
         return;
     }
     let repo = support::setup_tiny();
@@ -96,13 +94,6 @@ fn coverage_caught_missed_notcovered_timeout() {
     let mut cfg = support::cfg_for(repo.path());
     cfg.timeout_floor = std::time::Duration::from_millis(800);
     let mut prepared = prepare(cfg, false, false).expect("prepare");
-
-    let covering = prepared.index.tests_covering("crate_a/src/lib.rs", 1, 3);
-    assert!(
-        covering.iter().any(|t| t.name.contains("add_works")),
-        "add should be covered by add_works; covering={:?}",
-        covering.iter().map(|t| &t.name).collect::<Vec<_>>()
-    );
 
     let uncovered = prepared
         .mutants
@@ -112,9 +103,7 @@ fn coverage_caught_missed_notcovered_timeout() {
         .collect::<Vec<_>>();
     assert!(!uncovered.is_empty(), "expected uncovered mutants");
 
-    let (nc_outcomes, nc_builds) =
-        run_schema(&prepared, 0, Some(&uncovered)).expect("run uncovered");
-    assert_eq!(nc_builds, 0, "NotCovered must not build");
+    let (nc_outcomes, _) = run_schema(&prepared, 0, Some(&uncovered)).expect("run uncovered");
     assert!(
         nc_outcomes
             .iter()
@@ -230,134 +219,45 @@ fn add0_for_triage(
         .expect("add -> 0")
 }
 
+/// Selecting tests by recorded site hits must not lose a kill: every
+/// fixture mutant gets the same verdict with the selected tests as with every
+/// candidate test, and no test reaches the functions selection calls
+/// uncovered. This is `audit-selection` over the whole fixture.
 #[test]
-fn scoped_index_does_not_file_other_crates_as_not_covered() {
+fn selection_loses_no_kill_against_the_full_suite() {
     if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
+        eprintln!("skip: nextest not available");
         return;
     }
     let repo = support::setup_tiny();
     let mut cfg = support::cfg_for(repo.path());
-    cfg.index_scope = Some("tiny_a".into());
+    cfg.timeout_floor = std::time::Duration::from_millis(800);
+    cfg.identity_sample = 0;
     let prepared = prepare(cfg, false, false).expect("prepare");
-    assert!(
-        prepared.mutants.iter().all(|m| m.package == "tiny_a"),
-        "in-scope planning must drop other crates, not keep them as mutants: {:?}",
-        prepared
-            .mutants
-            .iter()
-            .map(|m| m.package.as_str())
-            .collect::<Vec<_>>()
+    let (selected, _) = run_schema(&prepared, 0, None).expect("selected run");
+    let full_plan = cargo_quicksilver::plan::plan_full_suite(
+        &prepared.mutants,
+        prepared.selector(),
+        &prepared.baseline,
+        None,
+        prepared.cfg.build_jobs,
     );
-    assert!(
-        prepared
-            .plan
-            .not_covered
-            .iter()
-            .all(|m| m.package == "tiny_a"),
-        "NotCovered must be in-scope only: {:?}",
-        prepared
-            .plan
-            .not_covered
-            .iter()
-            .map(|m| m.package.as_str())
-            .collect::<Vec<_>>()
-    );
-    // always_ok and maybe_hang live in tiny_a but are reached only from tiny_c's
-    // tests. Scoping the index must not turn cross-crate coverage into NotCovered.
-    let covered_fqns: Vec<String> = prepared
-        .plan
-        .batches
-        .iter()
-        .flat_map(|b| b.mutants.iter())
-        .map(|m| m.mutant.fqn.clone())
-        .collect();
-    assert!(
-        covered_fqns.iter().any(|f| f.contains("always_ok")),
-        "tiny_c covers tiny_a::always_ok; covered={covered_fqns:?}"
-    );
-    assert!(
-        covered_fqns.iter().any(|f| f.contains("maybe_hang")),
-        "tiny_c covers tiny_a::maybe_hang; covered={covered_fqns:?}"
-    );
+    assert!(full_plan.full_suite);
+    let full = cargo_quicksilver::exec::schema::execute(
+        &prepared.cfg,
+        &prepared.paths,
+        full_plan,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        0,
+    )
+    .expect("full-suite run");
+    let report = cargo_quicksilver::report::audit_compare(&selected, &full.outcomes);
     assert_eq!(
-        prepared.plan.not_covered.len(),
-        2,
-        "only uncovered() is NotCovered, f_nc=2/9; not_covered={:?}",
-        prepared
-            .plan
-            .not_covered
-            .iter()
-            .map(|m| m.fqn.as_str())
-            .collect::<Vec<_>>()
+        report.lost_kills, 0,
+        "selection lost kills: {:#?}",
+        report.disagreements
     );
-    assert!(
-        prepared
-            .plan
-            .not_covered
-            .iter()
-            .all(|m| m.fqn.contains("uncovered")),
-        "NotCovered should be uncovered() only"
-    );
-    let all = discover(repo.path(), &filter()).unwrap();
-    assert!(
-        all.iter().any(|m| m.package != "tiny_a"),
-        "fixture must have out-of-scope mutants for this assertion to mean anything"
-    );
-    assert!(
-        prepared.mutants.len() < all.len(),
-        "scoped prepare should drop out-of-crate mutants"
-    );
-}
-
-/// `--test-selection sites` replaces LLVM Stage A and B with one recording
-/// run under the schema binary. On the fixture it must reach the same verdict
-/// as coverage selection for every mutant, without an instrumented build.
-#[test]
-fn site_selection_matches_coverage_selection() {
-    if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
-        return;
-    }
-    let repo = support::setup_tiny();
-    let run = |selection: cargo_quicksilver::config::TestSelection| {
-        let mut cfg = support::cfg_for(repo.path());
-        cfg.timeout_floor = std::time::Duration::from_millis(800);
-        cfg.identity_sample = 0;
-        cfg.test_selection = selection;
-        let paths = cfg.paths();
-        let prepared = prepare(cfg, false, false).expect("prepare");
-        let (outcomes, _) = run_schema(&prepared, 0, None).expect("schema run");
-        let verdicts: std::collections::BTreeMap<String, (String, VerdictKind)> = outcomes
-            .iter()
-            .map(|o| {
-                (
-                    o.mutant.id.clone(),
-                    (
-                        format!("{} -> {}", o.mutant.fqn, o.mutant.replacement),
-                        o.kind,
-                    ),
-                )
-            })
-            .collect();
-        (verdicts, paths.baseline_cov.exists())
-    };
-    // Both runs share the repository's worktree and state, so sites goes
-    // first: it must not leave a coverage build behind.
-    let (sites, instrumented) = run(cargo_quicksilver::config::TestSelection::Sites);
-    let (coverage, _) = run(cargo_quicksilver::config::TestSelection::Coverage);
-    assert!(!instrumented, "sites selection must not build baseline-cov");
-    assert_eq!(coverage.len(), sites.len(), "same mutants in both runs");
-    let diffs: Vec<_> = coverage
-        .iter()
-        .filter(|(id, v)| sites.get(*id) != Some(v))
-        .map(|(id, v)| (v.0.clone(), v.1, sites.get(id).map(|s| s.1)))
-        .collect();
-    assert!(
-        diffs.is_empty(),
-        "coverage vs sites verdicts differ: {diffs:#?}"
-    );
-    let kinds: Vec<VerdictKind> = sites.values().map(|v| v.1).collect();
+    let kinds: Vec<VerdictKind> = selected.iter().map(|o| o.kind).collect();
     for k in [
         VerdictKind::Caught,
         VerdictKind::Missed,
@@ -370,22 +270,16 @@ fn site_selection_matches_coverage_selection() {
     }
 }
 
-/// A test that builds and runs a workspace program in a child process, the
-/// way trycmd runs clap's examples, must see the schema source and the
-/// active mutant. When tests started in the baseline copy, the child
-/// compiled the original source, recorded no site, and the mutant was
-/// NotCovered although the test checks its output.
 #[test]
 fn a_child_process_built_from_the_workspace_sees_the_mutant() {
     if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
+        eprintln!("skip: nextest not available");
         return;
     }
     let repo = support::setup_fixture("child");
     let mut cfg = support::cfg_for(repo.path());
     // The first run in a tree compiles the example; later runs only start it.
     cfg.timeout_floor = std::time::Duration::from_secs(60);
-    cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
     let prepared = prepare(cfg, false, false).expect("prepare");
     let (outcomes, _) = run_schema(&prepared, 0, None).expect("schema run");
     let greeting: Vec<_> = outcomes
@@ -440,13 +334,12 @@ fn preflight_count_is_reused_until_a_build_script_or_manifest_changes() {
 #[test]
 fn sites_mode_reuses_baseline_timings_within_a_session() {
     if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
+        eprintln!("skip: nextest not available");
         return;
     }
     let repo = support::setup_tiny();
     let cfg = || {
-        let mut cfg = support::cfg_for(repo.path());
-        cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
+        let cfg = support::cfg_for(repo.path());
         cfg
     };
     let first = prepare(cfg(), false, false).expect("first prepare");

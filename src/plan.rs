@@ -1,4 +1,3 @@
-use crate::index::CoverageIndex;
 use crate::types::{BaselineReport, LocalityBatch, Mutant, PlannedMutant, TestInfo};
 use std::collections::HashMap;
 
@@ -11,20 +10,8 @@ pub trait TestSelector {
     fn catalog(&self) -> &[TestInfo];
 }
 
-impl TestSelector for CoverageIndex {
-    fn covers(&self, m: &Mutant) -> bool {
-        self.union_covers(&m.path, m.start_line, m.end_line)
-    }
-    fn tests_for(&self, m: &Mutant) -> Vec<TestInfo> {
-        self.tests_covering(&m.path, m.start_line, m.end_line)
-    }
-    fn catalog(&self) -> &[TestInfo] {
-        &self.tests
-    }
-}
-
-/// `--test-selection sites`: every test in a package that depends on the
-/// mutant's package is a candidate. Nothing is NotCovered at plan time; the
+/// Every test in a package that depends on the mutant's package is a
+/// candidate. Nothing is NotCovered at plan time; the
 /// schema executor narrows each mutant to the tests that entered its site.
 pub struct PackageSelector {
     tests: Vec<TestInfo>,
@@ -71,6 +58,9 @@ impl TestSelector for PackageSelector {
 pub struct Plan {
     pub batches: Vec<LocalityBatch>,
     pub not_covered: Vec<Mutant>,
+    /// Run every planned test. Otherwise the executor records which tests
+    /// enter each mutant's function and runs only those.
+    pub full_suite: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +194,7 @@ fn plan_with(
     Plan {
         batches,
         not_covered,
+        full_suite: mode == TestMode::FullSuite,
     }
 }
 

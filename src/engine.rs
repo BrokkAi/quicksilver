@@ -1,12 +1,12 @@
 use crate::baseline::{preflight_recompile_count, prepare_baseline};
 use crate::cargo_cmd::load_metadata;
-use crate::config::{merge_config, Config, ConfigExtras, FileConfig, TestSelection};
+use crate::config::{merge_config, Config, ConfigExtras, FileConfig};
 use crate::discover::DiscoverFilter;
 use crate::estimate::{self, EstimateReport};
-use crate::index::{self, CoverageIndex};
+use crate::index;
 use crate::plan::{self, Plan};
 use crate::scratch;
-use crate::types::{BaselineReport, Mutant, Outcome, Paths};
+use crate::types::{BaselineReport, Mutant, Outcome, Paths, TestInfo};
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,8 +32,6 @@ pub fn config_from_cli(
     extras.packages = common.packages.clone();
     extras.files = common.files.clone();
     extras.in_diff = common.in_diff.clone();
-    extras.index_scope = common.index_scope.clone();
-    extras.reindex = common.reindex;
     extras.json = common.json.clone();
     extras.resume = common.resume;
     extras.shard = common
@@ -65,166 +63,88 @@ pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
     }
 }
 
-pub fn default_index_scope(explicit: Option<&str>, mutants: &[Mutant]) -> Option<String> {
-    if let Some(s) = explicit {
-        return Some(s.to_string());
-    }
-    let mut counts: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
-    for m in mutants {
-        *counts.entry(&m.package).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(_, n)| *n)
-        .map(|(p, _)| p.to_string())
-}
-
 pub struct Prepared {
     pub cfg: Config,
     pub paths: Paths,
     pub baseline: BaselineReport,
     pub mutants: Vec<Mutant>,
-    pub index: CoverageIndex,
-    /// Set under `--test-selection sites` (package candidates).
-    pub packages: Option<Box<dyn plan::TestSelector>>,
+    /// Every listed test, with baseline durations attached.
+    pub tests: Vec<TestInfo>,
+    /// The commit under test; keys evidence that depends on the source.
+    pub source_key: String,
+    /// Candidate tests per package. The executor narrows each mutant to the
+    /// tests its recording run saw enter the mutated function.
+    pub selector: plan::PackageSelector,
     pub plan: Plan,
 }
 
 impl Prepared {
     pub fn selector(&self) -> &dyn plan::TestSelector {
-        match &self.packages {
-            Some(p) => p.as_ref(),
-            None => &self.index,
-        }
+        &self.selector
     }
 }
 
-pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
+pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
     let paths = cfg.paths();
-    let baseline = if cfg.test_selection == TestSelection::Sites && !skip_baseline && !for_estimate
-    {
+    let baseline = if !skip_baseline && !for_estimate {
         crate::baseline::prepare_baseline_reusing_timings(&cfg, &paths)?
     } else {
         prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
     };
     scratch::check_free_space(&paths.session, cfg.max_scratch)?;
 
-    let sites = cfg.test_selection == TestSelection::Sites;
     // Listing tests runs cargo (building the tests when the baseline build
-    // was skipped); discovery is analysis. Neither needs the other, so in
-    // `run` they overlap. `estimate` may narrow the index scope after
-    // discovery, which changes what is listed, so it lists after.
-    let listing = (sites && !for_estimate).then(|| {
+    // was skipped); discovery is analysis. Neither needs the other.
+    let listing = {
         let (cfg, paths) = (cfg.clone(), paths.clone());
         std::thread::spawn(move || index::list_tests_plain(&cfg, &paths))
-    });
-    let mut mutants = if cfg.in_diff.is_some() {
+    };
+    let mutants = if cfg.in_diff.is_some() {
         crate::discover::discover_in_diff(&paths.baseline, &discover_filter(&cfg))?
     } else {
         crate::discover::discover(&paths.baseline, &discover_filter(&cfg))?
     };
     eprintln!("discovered {} mutants", mutants.len());
 
-    if for_estimate && cfg.index_scope.is_none() {
-        cfg.index_scope = default_index_scope(cfg.index_scope.as_deref(), &mutants);
-        if let Some(s) = &cfg.index_scope {
-            eprintln!("index-scope defaulted to {s}");
-        }
-    }
-
-    // Coverage is only valid for the indexed crate. Planning the rest of the
-    // workspace against that index files every out-of-scope mutant as
-    // NotCovered and inflates f_nc (and therefore the headline speedup).
-    if let Some(scope) = cfg.index_scope.clone() {
-        let before = mutants.len();
-        mutants.retain(|m| m.package == scope);
-        eprintln!(
-            "planning {} mutants in index-scope {scope} ({} excluded, not NotCovered)",
-            mutants.len(),
-            before.saturating_sub(mutants.len())
-        );
-    }
-
-    let mut index = if sites {
-        // No Stage A or B: the schema executor records which tests enter
-        // which mutation sites once it has built the schema binary.
-        let tests = match listing {
-            Some(handle) => handle
-                .join()
-                .map_err(|_| anyhow::anyhow!("the test listing thread panicked"))??,
-            None => index::list_tests_plain(&cfg, &paths)?,
-        };
-        eprintln!(
-            "test selection: sites ({} tests catalogued; no coverage build)",
-            tests.len()
-        );
-        index::CoverageIndex {
-            cache_key: index::source_cache_key(&paths.baseline)?,
-            scope: cfg.index_scope.clone(),
-            tests,
-            ..Default::default()
-        }
-    } else {
-        index::build_or_load(&cfg, &paths, &baseline)?
-    };
-    let timing = index::attach_timings(&mut index, &baseline.tests);
-    if !baseline.tests.is_empty() && !index.tests.is_empty() {
+    let mut tests = listing
+        .join()
+        .map_err(|_| anyhow::anyhow!("the test listing thread panicked"))??;
+    eprintln!("{} tests catalogued", tests.len());
+    let timing = index::attach_timings(&mut tests, &baseline.tests);
+    if !baseline.tests.is_empty() && !tests.is_empty() {
         if timing.matched == 0 {
             anyhow::bail!(
-                "failed to attach baseline timings to any of {} indexed tests ({} junit cases). t_sel would collapse to ~0. Match on (binary-id, name), not bare test name.",
+                "failed to attach baseline timings to any of {} listed tests ({} junit cases). Match on (binary-id, name), not bare test name.",
                 timing.total,
                 baseline.tests.len()
             );
         }
         if timing.matched * 5 < timing.total {
             tracing::warn!(
-                "attached timings to only {}/{} indexed tests; t_sel may be biased low",
+                "attached timings to only {}/{} listed tests",
                 timing.matched,
                 timing.total
             );
         }
-        if timing.matched > 0 && !sites {
-            if let Err(err) = index.save(&paths) {
-                tracing::warn!("failed to persist attached timings: {err:#}");
-            }
-        }
     }
-    // Estimate pays Stage B only for the sample (cmd_estimate). Run/index
-    // attribute every in-scope mutant now.
-    if !for_estimate && !sites {
-        let covered: Vec<_> = mutants
-            .iter()
-            .filter(|m| index.union_covers(&m.path, m.start_line, m.end_line))
-            .cloned()
-            .collect();
-        index::stage_b_for_mutants(&cfg, &paths, &mut index, &covered)?;
-        let _ = index::attach_timings(&mut index, &baseline.tests);
-    }
-    let packages: Option<Box<dyn plan::TestSelector>> = match cfg.test_selection {
-        TestSelection::Coverage => None,
-        TestSelection::Sites => {
-            let meta = load_metadata(&paths.baseline)?;
-            Some(Box::new(plan::PackageSelector::new(&meta, &index.tests)))
-        }
-    };
-    let selector: &dyn plan::TestSelector = match &packages {
-        Some(p) => p.as_ref(),
-        None => &index,
-    };
-    let plan = plan::plan(&mutants, selector, &baseline, cfg.shard, cfg.build_jobs);
+    let meta = load_metadata(&paths.baseline)?;
+    let selector = plan::PackageSelector::new(&meta, &tests);
+    let plan = plan::plan(&mutants, &selector, &baseline, cfg.shard, cfg.build_jobs);
     eprintln!(
         "plan: {} to build, {} not covered",
         plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>(),
         plan.not_covered.len()
     );
+    let source_key = crate::worktree::head(&paths.main_tree())?;
 
     Ok(Prepared {
         cfg,
         paths,
         baseline,
         mutants,
-        index,
-        packages,
+        tests,
+        source_key,
+        selector,
         plan,
     })
 }
@@ -260,7 +180,7 @@ pub fn run_schema_detailed(
     let rows = std::mem::take(&mut exec.coupling_rows);
     exec.coupling = Some(crate::coupling::merge_and_save(
         &prepared.paths,
-        &prepared.index.cache_key,
+        &prepared.source_key,
         rows,
     )?);
     Ok(exec)
@@ -316,52 +236,41 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
     }
 }
 
+/// The estimate for a full run, from the executed sample and a census of
+/// every discovered mutant against `map`: a mutant whose function no test
+/// entered needs neither a build nor a test run, and the others run the tests
+/// that entered their function, with the durations the map recorded.
 pub fn estimate_from(
     prepared: &Prepared,
-    sample: &[Mutant],
+    map: &crate::sitemap::SiteMap,
+    sample_size: usize,
     outcomes: &[Outcome],
 ) -> EstimateReport {
-    let scope = prepared
-        .cfg
-        .index_scope
-        .clone()
-        .unwrap_or_else(|| "workspace".into());
-    let sample_plan = plan::plan(
-        sample,
-        prepared.selector(),
+    let scope = if prepared.cfg.packages.is_empty() {
+        "workspace".to_string()
+    } else {
+        prepared.cfg.packages.join(", ")
+    };
+    let selector = crate::sitemap::MapSelector::new(map);
+    let census = plan::plan(
+        &prepared.mutants,
+        &selector,
         &prepared.baseline,
         prepared.cfg.shard,
         prepared.cfg.build_jobs,
     );
-    let mut report = estimate::compute(
+    estimate::compute(
         prepared.mutants.len(),
-        &prepared.plan,
-        &sample_plan,
+        &census,
+        &census,
         &prepared.baseline,
         outcomes,
         prepared.cfg.build_jobs,
         prepared.cfg.test_jobs,
         prepared.cfg.cm_jobs,
         scope,
-        sample.len(),
-    );
-    if prepared.cfg.test_selection == TestSelection::Sites {
-        // No Stage A census: NotCovered is decided per sampled mutant by the
-        // site recording, so f_nc is a sample proportion, not a census.
-        let nc = outcomes
-            .iter()
-            .filter(|o| o.kind == crate::types::VerdictKind::NotCovered)
-            .count();
-        let f_nc = nc as f64 / outcomes.len().max(1) as f64;
-        report.f_nc = f_nc;
-        report.f_nc_low = f_nc;
-        report.f_nc_high = f_nc;
-        report.assumptions.push(format!(
-            "--test-selection sites: f_nc = {f_nc:.3} is the NotCovered share of the executed sample ({nc}/{}), from recorded site hits, not a Stage A census; t_sel is over candidate tests before narrowing.",
-            outcomes.len()
-        ));
-    }
-    report
+        sample_size,
+    )
 }
 
 pub fn write_outputs(
@@ -386,50 +295,4 @@ pub fn write_outputs(
         )?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Mutant;
-
-    fn mutant(package: &str) -> Mutant {
-        Mutant {
-            id: format!("{package}::f"),
-            package: package.into(),
-            path: format!("{package}/src/lib.rs"),
-            fqn: "f".into(),
-            start_byte: 0,
-            end_byte: 1,
-            start_line: 1,
-            end_line: 1,
-            body_start_byte: 0,
-            body_end_byte: 1,
-            replacement: "{ 0 }".into(),
-            return_kind: "number".into(),
-        }
-    }
-
-    #[test]
-    fn index_scope_picks_the_most_populous_package() {
-        let mutants = vec![
-            mutant("brokk-bifrost-core"),
-            mutant("tiny_a"),
-            mutant("tiny_a"),
-            mutant("tiny_a"),
-        ];
-        assert_eq!(
-            default_index_scope(None, &mutants).as_deref(),
-            Some("tiny_a")
-        );
-    }
-
-    #[test]
-    fn index_scope_explicit_wins() {
-        let mutants = vec![mutant("tiny_a"), mutant("tiny_a"), mutant("tiny_b")];
-        assert_eq!(
-            default_index_scope(Some("tiny_b"), &mutants).as_deref(),
-            Some("tiny_b")
-        );
-    }
 }

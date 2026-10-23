@@ -133,11 +133,11 @@ pub fn compute(
             format!("N = {n} is exact from discovery inside scope `{sampled_scope}` (out-of-scope mutants are excluded, not filed as NotCovered)."),
             format!("t_suite = {:.3}s is the workspace nextest wall clock (cargo-mutants runs the whole suite, not only -p scope).", t_suite),
             format!(
-                "f_nc = {:.3} is an exact census of the {scoped_n} in-scope mutants from Stage A union coverage (one suite run, not per-test). Restricting --sources is sound; a test we did not run is not treated as uncovered.",
+                "f_nc = {:.3} is a census of the {scoped_n} mutants against the map: a mutant is not covered when no test entered its function in the map's recording run.",
                 f_nc
             ),
             format!(
-                "t_sel mean = {:.4}s is sampled: per-test attribution (Stage B) over the executed sample (n={}).",
+                "t_sel mean = {:.4}s is over every covered mutant: the tests that entered its function, at the durations the map's recording run measured (the sample is n={}).",
                 t_sel, sample_size
             ),
             format!("t_build mean = {:.3}s from one `cargo build --tests -p P` per package.", t_build),
@@ -149,7 +149,6 @@ pub fn compute(
                 "T_v2 treats one schema compile per crate that has covered mutants ({projected_batches} batches), not one per function. That is a proxy, not a measured schemata run."
             ),
             "Unviable rate by return kind is from the executed sample. Kinds at ~100% (ref, impl_trait, dyn) are the v2 pre-filter.".into(),
-            "Coverage index can under-report tests that spawn other processes. LLVM_PROFILE_FILE uses %p.".into(),
         ],
     }
 }
@@ -363,6 +362,7 @@ mod tests {
                 },
             ],
             not_covered: vec![mutant("a", "uncovered")],
+            full_suite: false,
         };
         let baseline = BaselineReport {
             suite_secs: 10.0,

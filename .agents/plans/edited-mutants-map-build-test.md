@@ -521,3 +521,5 @@ In `src/cli.rs`: `Command::Map(MapArgs)`, `Command::Build(BuildArgs { no_capture
 
 
 Revision note (2026-10-23 14:15Z): recorded the fixture and clap results, the confirmed move-in-arm observation, the cost breakdown of the clap map, and the retrospective. The plan's `dropped` type and `build` signature were updated to what was built (path included; `backend` passed in).
+
+Revision note (2026-10-23, later): `build --restore` was removed (see `.agents/plans/remove-coverage-mode.md`). It was the only place QS wrote into the user's checkout, and `git checkout -- .` does the same. The scratch-root layout this plan describes was replaced by git worktrees (`.agents/plans/git-worktrees-and-mbx.md`).

@@ -42,7 +42,6 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     init_tracing();
     match cli.command {
         cli::Command::List(_) => cmd_list(&cli.common),
-        cli::Command::Index(_) => cmd_index(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
@@ -100,7 +99,6 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         &cfg,
         &paths,
         (!args.no_capture).then_some(checkout.as_path()),
-        args.restore,
     )?;
     if report.discarded_records > 0 {
         eprintln!(
@@ -267,19 +265,6 @@ fn cmd_list(common: &cli::CommonOpts) -> Result<i32> {
     Ok(0)
 }
 
-fn cmd_index(common: &cli::CommonOpts) -> Result<i32> {
-    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
-    // Stage A only; per-test attribution is the sample/run path.
-    let prepared = engine::prepare(cfg, true, true)?;
-    println!(
-        "coverage index: {} tests catalogued, {} files in union, {} files attributed",
-        prepared.index.tests.len(),
-        prepared.index.union.len(),
-        prepared.index.lines.len()
-    );
-    Ok(0)
-}
-
 fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
     let extras = ConfigExtras {
         schema_max_rounds: args.schema_max_rounds,
@@ -353,45 +338,24 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
-    if cfg.test_selection != crate::config::TestSelection::Coverage {
-        anyhow::bail!(
-            "audit-selection audits coverage selection; run it with --test-selection coverage"
-        );
-    }
-    let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
+    let mut prepared = engine::prepare(cfg, args.skip_baseline, false)?;
     if !args.skip_baseline {
         let _ = engine::maybe_preflight(&prepared)?;
     }
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
-    let covered: Vec<_> = sample
-        .iter()
-        .filter(|m| {
-            prepared
-                .index
-                .union_covers(&m.path, m.start_line, m.end_line)
-        })
-        .cloned()
-        .collect();
-    crate::index::stage_b_for_mutants(
-        &prepared.cfg,
-        &prepared.paths,
-        &mut prepared.index,
-        &covered,
-    )?;
     eprintln!(
-        "audit-selection: {} covered mutants (of {} sampled)",
-        covered.len(),
+        "audit-selection: {} mutants, each run with the selected tests and with every candidate test",
         sample.len()
     );
     prepared.cfg.resume = false;
-    let (selected, _) = engine::run_schema(&prepared, 0, Some(&covered))?;
+    let (selected, _) = engine::run_schema(&prepared, 0, Some(&sample))?;
     let jsonl = prepared.paths.state.join("outcomes.jsonl");
     if jsonl.is_file() {
         let _ = std::fs::rename(&jsonl, prepared.paths.state.join("audit-selected.jsonl"));
     }
     let full_plan = crate::plan::plan_full_suite(
-        &covered,
-        &prepared.index,
+        &sample,
+        prepared.selector(),
         &prepared.baseline,
         prepared.cfg.shard,
         prepared.cfg.build_jobs,
@@ -404,11 +368,7 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
     if let Some(path) = &prepared.cfg.json {
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     }
-    Ok(if report.selected_missed_full_caught > 0 {
-        1
-    } else {
-        0
-    })
+    Ok(if report.lost_kills > 0 { 1 } else { 0 })
 }
 
 fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32> {
@@ -423,33 +383,14 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
-    let mut prepared = engine::prepare(cfg, args.skip_baseline, true)?;
-    // Preflight mutates `baseline/` in place. Parallel --skip-baseline shards
-    // hashing that tree then see a different cache key and rebuild Stage A.
+    let prepared = engine::prepare(cfg, args.skip_baseline, true)?;
     if !args.skip_baseline {
         let _ = engine::maybe_preflight(&prepared)?;
     }
+    // Which functions any test enters, for every mutant, from the map of
+    // this commit (built now if there is none).
+    let map = exec::edited::map_for_head(&prepared.cfg, &prepared.paths, &prepared.tests)?;
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
-    if prepared.cfg.test_selection == crate::config::TestSelection::Coverage {
-        let covered_sample: Vec<_> = sample
-            .iter()
-            .filter(|m| {
-                prepared
-                    .index
-                    .union_covers(&m.path, m.start_line, m.end_line)
-            })
-            .cloned()
-            .collect();
-        crate::index::stage_b_for_mutants(
-            &prepared.cfg,
-            &prepared.paths,
-            &mut prepared.index,
-            &covered_sample,
-        )?;
-        // Stage B reloads coverage.json, which used to wipe attached durations
-        // back to the 0.001s index default and 5s-timeout every slow test.
-        let _ = crate::index::attach_timings(&mut prepared.index, &prepared.baseline.tests);
-    }
     eprintln!(
         "running sample of {} mutants through the pipeline",
         sample.len()
@@ -483,7 +424,7 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
             outcomes.len()
         );
     }
-    let mut report = engine::estimate_from(&prepared, &sample, outcomes);
+    let mut report = engine::estimate_from(&prepared, &map, sample.len(), outcomes);
     report.sample_counts.cargo_invocations = cargo_invocations as usize;
     print!("{}", estimate::render(&report));
     if let Some(second_order) = &exec.second_order {

@@ -1,10 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub fn fixture_src() -> PathBuf {
-    fixture_named("tiny")
-}
-
 pub fn fixture_named(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
@@ -93,20 +89,16 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
     let git = cargo_quicksilver::worktree::repo_of(repo).expect("fixture is a git repository");
     Config {
         repo_root: repo.to_path_buf(),
-        test_selection: Default::default(),
         worktree_root: cargo_quicksilver::worktree::root(&git),
         prefix: git.prefix,
         build_jobs: 2,
         test_jobs: 4,
-        index_jobs: 4,
         cm_jobs: 8,
         max_build_memory_frac: 0.7,
         max_scratch: None,
         packages: Vec::new(),
         files: Vec::new(),
         in_diff: None,
-        index_scope: None,
-        reindex: false,
         json: None,
         resume: false,
         shard: None,

@@ -203,7 +203,7 @@ fn build_workspace(
     builds: &AtomicU64,
 ) -> Result<crate::cargo_cmd::CapturedBuild> {
     builds.fetch_add(1, Ordering::SeqCst);
-    build_tests_captured(worker, target, cfg, &[], false)
+    build_tests_captured(worker, target, cfg, &[])
 }
 
 /// `isolate` from the per-crate executor, over every crate at once: build
@@ -379,18 +379,41 @@ fn all_tests_planned(map_tests: &[TestInfo]) -> PlannedMutant {
 /// Build the map: baseline, sites, one workspace build with identity-only
 /// prologues, staged binaries, gates, and the recording run.
 pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
-    let started = Instant::now();
     let baseline = crate::baseline::prepare_baseline(cfg, paths, false, false)?;
-    let mut index = crate::index::CoverageIndex {
-        tests: crate::index::list_tests_plain(cfg, paths)?,
-        ..Default::default()
-    };
-    let timing = crate::index::attach_timings(&mut index, &baseline.tests);
+    let mut tests = crate::index::list_tests_plain(cfg, paths)?;
+    let timing = crate::index::attach_timings(&mut tests, &baseline.tests);
     info!(
         "map: {} tests catalogued, {} with baseline durations",
-        index.tests.len(),
+        tests.len(),
         timing.matched
     );
+    build_map_from(cfg, paths, tests)
+}
+
+/// The map of HEAD: the saved one when it was built at the commit the main
+/// worktree is on, otherwise a new one from `tests`. Building one leaves
+/// the identity-only schema source in the main worktree, so the worktree is
+/// checked out clean again for whatever runs next.
+pub fn map_for_head(cfg: &Config, paths: &Paths, tests: &[TestInfo]) -> Result<SiteMap> {
+    let main = paths.main_tree();
+    let head = crate::worktree::head(&main)?;
+    if let Some(map) = SiteMap::load(paths)? {
+        if map.commit == head {
+            info!("using the map built at {}", &head[..12.min(head.len())]);
+            return Ok(map);
+        }
+    }
+    let map = build_map_from(cfg, paths, tests.to_vec())?;
+    let repo = crate::worktree::repo_of(&main)?;
+    crate::worktree::ensure(&repo, crate::worktree::MAIN, &head)?;
+    Ok(map)
+}
+
+/// [`build_map`] for a baseline that is already checked out and built, with
+/// its tests listed and timed.
+pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Result<SiteMap> {
+    let started = Instant::now();
+    let listed = tests;
     let files = tracked_file_hashes(&cfg.repo_root)?;
 
     let fns =
@@ -441,7 +464,7 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
     );
 
     let run_dir = paths.runs.join("map");
-    let test_refs: Vec<&TestInfo> = index.tests.iter().collect();
+    let test_refs: Vec<&TestInfo> = listed.iter().collect();
     stage_tests(
         cfg,
         &worker.join("target"),
@@ -449,7 +472,7 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
         &test_refs,
         &isolated.executables,
     )?;
-    let planned = all_tests_planned(&index.tests);
+    let planned = all_tests_planned(&listed);
     null_schema_gate(cfg, &run_dir, &worker, std::slice::from_ref(&planned))?;
 
     let recording = record_site_hits(
@@ -469,7 +492,7 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
             .collect();
         hits.insert(test.clone(), entered);
     }
-    let mut tests = index.tests.clone();
+    let mut tests = listed.clone();
     for t in &mut tests {
         if let Some(secs) = recording.recorded_secs(t) {
             t.duration_secs = secs;
@@ -581,17 +604,12 @@ pub struct BuildReport {
 
 /// Capture the checkout's edits (unless `capture_from` is `None`), then
 /// compile every pending and untested mutant into a new generation of
-/// binaries. With `restore`, a captured file is reset to the baseline's
-/// version afterwards so the next edit starts clean.
-pub fn build(
-    cfg: &Config,
-    paths: &Paths,
-    capture_from: Option<&Path>,
-    restore: bool,
-) -> Result<BuildReport> {
+/// binaries. The checkout is only read; resetting it for the next edit is
+/// the caller's job (`git checkout -- .`).
+pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
     let started = Instant::now();
     let map = SiteMap::load(paths)?
-        .context("no map in this scratch session; run `cargo quicksilver map` first")?;
+        .context("no map for this repository; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;
     let discarded_records = state.reconcile(&map);
     let mut report = BuildReport {
@@ -622,18 +640,6 @@ pub fn build(
                         status: Status::Pending,
                         captured_at: now_rfc3339(),
                     });
-                }
-                if restore {
-                    let files: BTreeSet<&str> = m.edits.iter().map(|e| e.path.as_str()).collect();
-                    for rel in files {
-                        let original = crate::worktree::show(
-                            checkout,
-                            &map.commit,
-                            &format!("{}{rel}", map.prefix),
-                        )?;
-                        std::fs::write(checkout.join(rel), original)
-                            .with_context(|| format!("restore {rel}"))?;
-                    }
                 }
                 report.captured = Some(m);
             }

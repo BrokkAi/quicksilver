@@ -256,7 +256,9 @@ pub struct AuditReport {
     pub sample_size: usize,
     pub agreements: usize,
     pub disagreements: Vec<AuditDisagreement>,
-    pub selected_missed_full_caught: usize,
+    /// Mutants the full suite caught but the selected tests did not: Missed
+    /// or NotCovered with selection. Selection lost the test that kills them.
+    pub lost_kills: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -273,7 +275,7 @@ pub fn audit_compare(selected: &[Outcome], full: &[Outcome]) -> AuditReport {
         full.iter().map(|o| (o.mutant.id.as_str(), o)).collect();
     let mut disagreements = Vec::new();
     let mut agreements = 0usize;
-    let mut selected_missed_full_caught = 0usize;
+    let mut lost_kills = 0usize;
     for o in selected {
         let Some(other) = full_by.get(o.mutant.id.as_str()) else {
             disagreements.push(AuditDisagreement {
@@ -285,12 +287,19 @@ pub fn audit_compare(selected: &[Outcome], full: &[Outcome]) -> AuditReport {
             });
             continue;
         };
-        if o.kind == other.kind {
+        // NotCovered with selection and Missed with the full suite say the
+        // same thing: no test catches the mutant. The full suite only ran
+        // tests that never reach it.
+        if o.kind == other.kind
+            || (o.kind == VerdictKind::NotCovered && other.kind == VerdictKind::Missed)
+        {
             agreements += 1;
             continue;
         }
-        if o.kind == VerdictKind::Missed && other.kind == VerdictKind::Caught {
-            selected_missed_full_caught += 1;
+        if matches!(o.kind, VerdictKind::Missed | VerdictKind::NotCovered)
+            && other.kind == VerdictKind::Caught
+        {
+            lost_kills += 1;
         }
         disagreements.push(AuditDisagreement {
             mutant_id: o.mutant.id.clone(),
@@ -304,7 +313,7 @@ pub fn audit_compare(selected: &[Outcome], full: &[Outcome]) -> AuditReport {
         sample_size: selected.len(),
         agreements,
         disagreements,
-        selected_missed_full_caught,
+        lost_kills,
     }
 }
 
@@ -314,8 +323,8 @@ pub fn print_audit(report: &AuditReport) {
     eprintln!("agreements: {}", report.agreements);
     eprintln!("disagreements: {}", report.disagreements.len());
     eprintln!(
-        "selected Missed / full Caught (under-selection): {}",
-        report.selected_missed_full_caught
+        "kills lost by selection (full suite Caught, selected tests Missed or NotCovered): {}",
+        report.lost_kills
     );
     for d in &report.disagreements {
         eprintln!(

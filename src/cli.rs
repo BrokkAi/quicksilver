@@ -22,9 +22,6 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub test_jobs: Option<usize>,
 
-    #[arg(long, global = true)]
-    pub index_jobs: Option<usize>,
-
     /// Parallelism assumed for the cargo-mutants comparison baseline (J_cm).
     /// Defaults to the same RAM/CPU formula as --build-jobs: cargo-mutants
     /// workers each run a full rustc and will not actually use all cores.
@@ -43,20 +40,6 @@ pub struct CommonOpts {
     /// The diff's target must be what is checked out.
     #[arg(long, global = true)]
     pub in_diff: Option<String>,
-
-    /// How each mutant's tests are chosen: `coverage` (LLVM Stage A and B)
-    /// or `sites` (one schema-binary run that records mutation-site hits).
-    #[arg(long, global = true, value_enum, default_value_t = crate::config::TestSelection::Coverage)]
-    pub test_selection: crate::config::TestSelection,
-
-    /// Limit union coverage reporting to this crate's sources (sound).
-    /// Tests from reverse-dependent crates are still run.
-    #[arg(long, global = true)]
-    pub index_scope: Option<String>,
-
-    /// Force coverage index rebuild.
-    #[arg(long, global = true)]
-    pub reindex: bool,
 
     /// Machine-readable outcomes / estimate.
     #[arg(long, global = true)]
@@ -103,9 +86,10 @@ pub enum Command {
     Run(RunArgs),
     /// Print the mutant catalog and exit.
     List(ListArgs),
-    /// Build or refresh the coverage index.
-    Index(IndexArgs),
-    /// Compare impact-selected verdicts to full-suite verdicts.
+    /// Check QS on this repository: run a sample of mutants with the tests
+    /// QS selects and with every candidate test, and report any kill that
+    /// selection lost.
+    #[command(hide = true)]
     AuditSelection(AuditSelectionArgs),
     /// Build once with a switch at every function and record which
     /// functions each test enters. `build` and `test` use the result.
@@ -210,10 +194,6 @@ pub struct BuildArgs {
     /// Compile what is pending without reading the checkout.
     #[arg(long)]
     pub no_capture: bool,
-    /// After capturing, reset every captured file to the baseline's version
-    /// so the next edit starts clean.
-    #[arg(long)]
-    pub restore: bool,
     /// Isolation rebuilds that map rustc diagnostics back to variants.
     #[arg(long, default_value_t = 5)]
     pub schema_max_rounds: u32,
@@ -232,9 +212,6 @@ pub struct ListArgs {
     #[arg(long)]
     pub all: bool,
 }
-
-#[derive(Args, Debug, Default)]
-pub struct IndexArgs {}
 
 pub fn parse_cli() -> Cli {
     let mut args: Vec<String> = std::env::args().collect();

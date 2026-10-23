@@ -1,7 +1,7 @@
 //! Schema pool + test pool. Test binaries do not change between mutants.
 
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
-use crate::config::{Config, TestSelection};
+use crate::config::Config;
 use crate::coupling::CouplingRow;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
@@ -68,6 +68,7 @@ pub fn execute(
     outcomes.extend(decided);
 
     let jsonl = paths.state.join("outcomes.jsonl");
+    let full_suite = plan.full_suite;
     for m in plan.not_covered {
         if decided_ids.contains(&m.id) {
             continue;
@@ -160,6 +161,7 @@ pub fn execute(
                     match run_crate(
                         &cfg,
                         &paths,
+                        full_suite,
                         &w,
                         &package,
                         planned,
@@ -200,7 +202,7 @@ pub fn execute(
                     if cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    let policy = mutant_pool_policy(&cfg);
+                    let policy = mutant_pool_policy(&cfg, full_suite);
                     let observed = run_mutant_tests_observed(
                         &ready.planned,
                         &ready.run_dir,
@@ -509,6 +511,7 @@ fn row_from_run(
 fn run_crate(
     cfg: &Config,
     paths: &Paths,
+    full_suite: bool,
     worker: &Path,
     package: &str,
     planned: Vec<PlannedMutant>,
@@ -623,7 +626,7 @@ fn run_crate(
         // batch has a verdict.
         null_schema_gate(cfg, &run_dir, worker, &planned)?;
         identity_gate(cfg, &run_dir, worker, &isolated.sites, &by_id)?;
-        let recording = if cfg.test_selection == TestSelection::Sites {
+        let recording = if !full_suite {
             Some(record_sites(
                 cfg,
                 &run_dir,
@@ -709,7 +712,7 @@ fn cargo_build(
     cargo_invocations: &AtomicU64,
 ) -> Result<CapturedBuild> {
     cargo_invocations.fetch_add(1, Ordering::SeqCst);
-    build_tests_captured(worker, target, cfg, packages, false)
+    build_tests_captured(worker, target, cfg, packages)
 }
 
 /// Attribution rounds compile only `mutated`. The prologue never changes a
@@ -972,24 +975,25 @@ pub(crate) const NULL_GATE_TESTS: usize = 8;
 /// function, so 3× the green duration is not enough budget.
 pub(crate) const SCHEMA_SLOWDOWN: f64 = 3.0;
 
-/// Budget for mutant runs. Coverage selection only has green durations from
-/// the baseline binary, so it pads them for the schema binary and keeps a
-/// 30 s floor. Sites selection timed every selected test under this schema
-/// binary with no mutant active, so 3x that time over the ordinary floor is
-/// enough; the 30 s floor made each hanging mutant cost 30 s per run on tests
-/// that take milliseconds.
-fn mutant_pool_policy(cfg: &Config) -> TestRunPolicy {
-    match cfg.test_selection {
-        TestSelection::Sites => TestRunPolicy {
-            floor: cfg.timeout_floor,
-            slowdown: 1.0,
-            confirm: true,
-        },
-        TestSelection::Coverage => TestRunPolicy {
+/// Budget for mutant runs. The recording run timed every selected test under
+/// this schema binary with no mutant active, so 3x that time over the
+/// ordinary floor is enough; a 30 s floor made each hanging mutant cost 30 s
+/// per run on tests that take milliseconds. A full-suite run records nothing,
+/// so it has only the baseline binary's durations, padded for the schema
+/// binary, with the 30 s floor.
+fn mutant_pool_policy(cfg: &Config, full_suite: bool) -> TestRunPolicy {
+    if full_suite {
+        TestRunPolicy {
             floor: cfg.timeout_floor.max(Duration::from_secs(30)),
             slowdown: SCHEMA_SLOWDOWN,
             confirm: true,
-        },
+        }
+    } else {
+        TestRunPolicy {
+            floor: cfg.timeout_floor,
+            slowdown: 1.0,
+            confirm: true,
+        }
     }
 }
 
