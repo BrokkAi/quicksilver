@@ -63,6 +63,24 @@ fn edited_mutants_are_captured_built_and_judged() {
     for fqn in ["as_ref", "as_impl", "as_dyn", "identity"] {
         site(fqn);
     }
+    // A function compiled only for another target has no site and is not
+    // listed as uncovered; the map records its target.
+    assert!(!map.target.is_empty());
+    let (here, elsewhere) = if cfg!(windows) {
+        ("windows_only", "not_windows")
+    } else {
+        ("not_windows", "windows_only")
+    };
+    site(here);
+    assert!(!map.sites.iter().any(|s| s.fqn.ends_with(elsewhere)));
+    assert!(
+        map.dropped
+            .iter()
+            .any(|(_, fqn, why)| fqn.ends_with(elsewhere) && why.contains("compiled out")),
+        "{:?}",
+        map.dropped
+    );
+    assert!(!map.unentered().iter().any(|s| s.fqn.ends_with(elsewhere)));
     // A method of an `impl` nested in a function body is a site of its own.
     let nested = site("parse_pair.Pair.parse");
     let outer = site(".parse_pair");

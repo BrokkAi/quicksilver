@@ -9,6 +9,10 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonReport {
+    /// The target triple the verdicts were measured on: a survivor on one
+    /// platform can be killed on another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub outcomes: Vec<Outcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimate: Option<EstimateReport>,
@@ -124,6 +128,7 @@ pub fn write_json_with_evidence(
 ) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
     let mut report = JsonReport {
+        target: crate::target::host_triple(Path::new(".")).ok(),
         outcomes: outcomes.to_vec(),
         estimate: estimate.cloned(),
         counts: CountReport::from(&counts),

@@ -1,5 +1,5 @@
 use crate::cargo_cmd::{load_metadata, mutable_scope, MutableScope};
-use crate::scan::scan_crate;
+use crate::scan::scan_crate_for;
 use crate::types::Mutant;
 use crate::util::{hex, line_col_to_offset, rel_slash};
 use anyhow::{bail, Context, Result};
@@ -125,6 +125,9 @@ pub struct FnDecl {
     /// The return type mentions `impl Trait`, so every return must have the
     /// same concrete type.
     pub opaque_return: bool,
+    /// The `cfg` that is false on this target (the function is not
+    /// compiled here, so no test can reach it).
+    pub cfg_off: Option<String>,
     pub original_body: String,
 }
 
@@ -138,7 +141,7 @@ pub fn scan_workspace(root: &Path, filter: &DiscoverFilter) -> Result<Vec<FnDecl
 fn expand(fns: Vec<FnDecl>) -> Result<Vec<Mutant>> {
     let mut mutants = Vec::new();
     for f in &fns {
-        if f.skip || f.unsafe_fn || f.const_fn || f.boring_body {
+        if f.skip || f.unsafe_fn || f.const_fn || f.boring_body || f.cfg_off.is_some() {
             continue;
         }
         for repl in f.return_kind.replacements() {
@@ -204,6 +207,7 @@ fn scan_functions(
     let root_abs = PathBuf::from(meta.workspace_root.as_str());
     let root_abs = root_abs.canonicalize().unwrap_or(root_abs);
     let mut skipped_proc_macro: BTreeSet<String> = BTreeSet::new();
+    let target = crate::target::Target::probe_or_unknown(root);
 
     let mut fns = Vec::new();
     for pkg in meta.workspace_packages() {
@@ -225,7 +229,7 @@ fn scan_functions(
             .map(|t| t.name.replace('-', "_"))
             .unwrap_or_else(|| package.replace('-', "_"));
         let scope = canonical_scope(scope);
-        for file in scan_crate(&crate_name, &scope.root_file)? {
+        for file in scan_crate_for(&crate_name, &scope.root_file, &target)? {
             let Ok(rel) = file.path.strip_prefix(&root_abs) else {
                 continue;
             };
@@ -271,6 +275,7 @@ fn scan_functions(
                     skip: has_skip(&f.attrs),
                     boring_body: boring_body(&f.block),
                     opaque_return: returns_opaque(&f.sig.output),
+                    cfg_off: f.cfg_off.clone(),
                     original_body: file.source[f.body_start_byte..f.body_end_byte].to_string(),
                 });
             }

@@ -32,6 +32,16 @@ pub async fn add_async(a: i32, b: i32) -> i32 {
     a + b
 }
 
+#[cfg(windows)]
+pub fn windows_only() -> u32 {
+    1
+}
+
+#[cfg(not(windows))]
+pub fn not_windows() -> u32 {
+    2
+}
+
 pub fn parse_pair(s: &str) -> (i32, i32) {
     struct Pair(i32, i32);
     impl Pair {

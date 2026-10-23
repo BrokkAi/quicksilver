@@ -19,6 +19,7 @@ pub mod scan;
 pub mod schema;
 pub mod scratch;
 pub mod sitemap;
+pub mod target;
 pub mod types;
 pub mod util;
 pub mod worktree;
@@ -168,10 +169,15 @@ fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
         println!("{}:{} {}", s.path, s.start_line, s.fqn);
     }
     eprintln!(
-        "{} of {} functions are entered by no test (map at {})",
+        "{} of {} functions are entered by no test (map at {}, target {})",
         unentered.len(),
         total,
-        &map.commit[..12.min(map.commit.len())]
+        &map.commit[..12.min(map.commit.len())],
+        if map.target.is_empty() {
+            "unknown"
+        } else {
+            map.target.as_str()
+        }
     );
     if !map.not_green.is_empty() {
         eprintln!(
@@ -219,6 +225,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
             .collect();
         let report = serde_json::json!({
             "commit": map.as_ref().map(|m| m.commit.clone()),
+            "target": map.as_ref().map(|m| m.target.clone()),
             "mutants": rows,
         });
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;

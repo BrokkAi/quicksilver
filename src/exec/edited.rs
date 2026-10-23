@@ -650,6 +650,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         commit: commit.clone(),
         prefix: cfg.prefix.clone(),
         repo_root: cfg.repo_root.clone(),
+        target: crate::target::host_triple(&worker).unwrap_or_default(),
         files,
         sites: map_sites,
         dropped,

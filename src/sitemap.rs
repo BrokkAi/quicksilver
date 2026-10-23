@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 4;
+pub const MAP_VERSION: u32 = 5;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -48,6 +48,9 @@ pub struct SiteMap {
     /// in `/`; git paths are `<prefix><path>`.
     pub prefix: String,
     pub repo_root: PathBuf,
+    /// The target triple the map was built and recorded for.
+    #[serde(default)]
+    pub target: String,
     /// Every tracked file of the checkout and its SHA-256 when the map was
     /// made. `build` compares the checkout against this.
     pub files: BTreeMap<String, String>,
@@ -202,15 +205,19 @@ pub fn sites_from_functions(fns: &[FnDecl]) -> Result<(Vec<MapSite>, Vec<Dropped
     let mut sorted: Vec<&FnDecl> = fns.iter().collect();
     sorted.sort_by(|a, b| (&a.path, a.start_byte).cmp(&(&b.path, b.start_byte)));
     for f in sorted {
-        let why = if f.const_fn {
-            Some("const fn: a const body cannot call the runtime switch")
+        let why = if let Some(cfg) = &f.cfg_off {
+            Some(format!(
+                "compiled out on this target ({cfg}); no test here can reach it"
+            ))
+        } else if f.const_fn {
+            Some("const fn: a const body cannot call the runtime switch".to_string())
         } else if f.skip {
-            Some("carries a skip attribute")
+            Some("carries a skip attribute".to_string())
         } else {
             None
         };
         if let Some(why) = why {
-            dropped.push((f.path.clone(), f.fqn.clone(), why.to_string()));
+            dropped.push((f.path.clone(), f.fqn.clone(), why));
             continue;
         }
         // A function nested in another's body is a site of its own; an edit
@@ -313,6 +320,7 @@ mod tests {
             skip: false,
             boring_body: false,
             opaque_return: false,
+            cfg_off: None,
             original_body: "{}".into(),
         }
     }
@@ -379,6 +387,7 @@ mod tests {
             commit: String::new(),
             prefix: String::new(),
             repo_root: PathBuf::new(),
+            target: String::new(),
             files: BTreeMap::new(),
             sites: vec![site(7, "p.entered", 10), site(8, "p.untouched", 40)],
             dropped: Vec::new(),
@@ -433,6 +442,7 @@ mod tests {
             commit: String::new(),
             prefix: String::new(),
             repo_root: PathBuf::new(),
+            target: String::new(),
             files: BTreeMap::new(),
             sites: Vec::new(),
             dropped: Vec::new(),
