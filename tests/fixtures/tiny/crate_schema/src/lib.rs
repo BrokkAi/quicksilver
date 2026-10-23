@@ -32,6 +32,18 @@ pub async fn add_async(a: i32, b: i32) -> i32 {
     a + b
 }
 
+pub fn parse_pair(s: &str) -> (i32, i32) {
+    struct Pair(i32, i32);
+    impl Pair {
+        fn parse(s: &str) -> Pair {
+            let mut it = s.split(',').map(|x| x.trim().parse::<i32>().unwrap());
+            Pair(it.next().unwrap(), it.next().unwrap())
+        }
+    }
+    let p = Pair::parse(s);
+    (p.0, p.1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +95,11 @@ mod tests {
     fn impl_and_dyn_work() {
         let _ = format!("{}", as_impl());
         let _ = format!("{:?}", as_dyn());
+    }
+
+    #[test]
+    fn parse_pair_works() {
+        assert_eq!(parse_pair("1, 2"), (1, 2));
     }
 
     #[test]

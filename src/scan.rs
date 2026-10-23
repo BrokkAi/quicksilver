@@ -129,6 +129,44 @@ impl Walker {
     }
 }
 
+/// Items declared anywhere inside a function body (in its statements,
+/// nested blocks or closures), without descending into those items: their
+/// own bodies are walked when they are scanned.
+fn nested_items(block: &syn::Block) -> Vec<syn::Item> {
+    struct Collect(Vec<syn::Item>);
+    impl<'ast> syn::visit::Visit<'ast> for Collect {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            self.0.push(item.clone());
+        }
+    }
+    let mut c = Collect(Vec::new());
+    syn::visit::Visit::visit_block(&mut c, block);
+    c.0
+}
+
+/// Scan one function and the items nested in its body, which are named
+/// under it (`outer.Inner.method`, `outer.helper`) and are sites of their
+/// own: a serde `Visitor` impl inside `deserialize` holds the real logic.
+#[allow(clippy::too_many_arguments)]
+fn push_fn(
+    fqn: String,
+    attrs: &[syn::Attribute],
+    vis: Option<&syn::Visibility>,
+    sig: &syn::Signature,
+    block: &syn::Block,
+    in_test: bool,
+    dirs: &Dirs,
+    index: &LineIndex,
+    out: &mut Vec<ScannedFn>,
+    pending: &mut Vec<(PathBuf, Vec<String>, bool)>,
+) {
+    out.push(scanned(fqn.clone(), attrs, vis, sig, block, in_test, index));
+    let nested = nested_items(block);
+    if !nested.is_empty() {
+        walk_items(&nested, &[fqn], in_test, dirs, index, out, pending);
+    }
+}
+
 fn walk_items(
     items: &[syn::Item],
     module_path: &[String],
@@ -142,15 +180,18 @@ fn walk_items(
         match item {
             syn::Item::Fn(f) => {
                 let test = in_test || is_cfg_test(&f.attrs) || is_test_fn(&f.attrs);
-                out.push(scanned(
+                push_fn(
                     join(module_path, &f.sig.ident.to_string()),
                     &f.attrs,
                     Some(&f.vis),
                     &f.sig,
                     &f.block,
                     test,
+                    dirs,
                     index,
-                ));
+                    out,
+                    pending,
+                );
             }
             syn::Item::Impl(i) => {
                 let test = in_test || is_cfg_test(&i.attrs);
@@ -158,15 +199,18 @@ fn walk_items(
                 for member in &i.items {
                     if let syn::ImplItem::Fn(m) = member {
                         let test = test || is_cfg_test(&m.attrs) || is_test_fn(&m.attrs);
-                        out.push(scanned(
+                        push_fn(
                             format!("{owner}.{}", m.sig.ident),
                             &m.attrs,
                             Some(&m.vis),
                             &m.sig,
                             &m.block,
                             test,
+                            dirs,
                             index,
-                        ));
+                            out,
+                            pending,
+                        );
                     }
                 }
             }
@@ -177,15 +221,18 @@ fn walk_items(
                     if let syn::TraitItem::Fn(m) = member {
                         let Some(block) = &m.default else { continue };
                         let test = test || is_cfg_test(&m.attrs);
-                        out.push(scanned(
+                        push_fn(
                             format!("{owner}.{}", m.sig.ident),
                             &m.attrs,
                             None,
                             &m.sig,
                             block,
                             test,
+                            dirs,
                             index,
-                        ));
+                            out,
+                            pending,
+                        );
                     }
                 }
             }
@@ -566,6 +613,43 @@ mod tests {
         let g = &files[0].functions[1];
         assert_eq!(&src[g.start_byte..g.end_byte], "const fn g() {}");
         assert!(g.sig.constness.is_some());
+    }
+
+    #[test]
+    fn items_nested_in_function_bodies_are_scanned_under_their_function() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "src/lib.rs",
+            "pub struct X;\n\
+             impl X {\n\
+                 pub fn deserialize() -> u32 {\n\
+                     struct V;\n\
+                     impl V { fn visit_seq(&self) -> u32 { fn inner() -> u32 { 1 } inner() } }\n\
+                     let f = || { fn in_closure() {} in_closure() };\n\
+                     f();\n\
+                     V.visit_seq()\n\
+                 }\n\
+             }\n\
+             #[cfg(test)] fn t() { fn h() {} }\n",
+        );
+        let files = scan_crate("k", &root.join("src/lib.rs")).unwrap();
+        assert_eq!(
+            fqns(&files),
+            vec![
+                ("k.X.deserialize".into(), false),
+                ("k.X.deserialize.V.visit_seq".into(), false),
+                ("k.X.deserialize.V.visit_seq.inner".into(), false),
+                ("k.X.deserialize.in_closure".into(), false),
+                ("k.t".into(), true),
+                ("k.t.h".into(), true),
+            ]
+        );
+        let f = &files[0].functions;
+        let outer = f.iter().find(|g| g.fqn == "k.X.deserialize").unwrap();
+        let visit = f.iter().find(|g| g.fqn.ends_with("visit_seq")).unwrap();
+        assert!(outer.body_start_byte < visit.start_byte && visit.end_byte < outer.body_end_byte);
     }
 
     #[test]

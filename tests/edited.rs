@@ -63,6 +63,12 @@ fn edited_mutants_are_captured_built_and_judged() {
     for fqn in ["as_ref", "as_impl", "as_dyn", "identity"] {
         site(fqn);
     }
+    // A method of an `impl` nested in a function body is a site of its own.
+    let nested = site("parse_pair.Pair.parse");
+    let outer = site(".parse_pair");
+    assert!(
+        outer.body_start_byte < nested.fn_start_byte && nested.body_end_byte < outer.body_end_byte
+    );
 
     let lib = repo.path().join("crate_a/src/lib.rs");
     let original = fs::read_to_string(&lib).unwrap();
@@ -190,6 +196,30 @@ fn edited_mutants_are_captured_built_and_judged() {
     }
     reset();
 
+    // An edit inside the nested method is that method's mutant.
+    let schema_lib = repo.path().join("crate_schema/src/lib.rs");
+    let schema_original = fs::read_to_string(&schema_lib).unwrap();
+    fs::write(
+        &schema_lib,
+        schema_original.replace(
+            "Pair(it.next().unwrap(), it.next().unwrap())",
+            "Pair(it.next().unwrap(), 0)",
+        ),
+    )
+    .unwrap();
+    let report = run_build(true);
+    assert_eq!(report.captured.len(), 1, "{:?}", report.captured);
+    let nested_m = report.captured[0].clone();
+    assert!(
+        nested_m.fqns().ends_with("parse_pair.Pair.parse"),
+        "{nested_m:?}"
+    );
+    assert!(matches!(
+        status_of(&report.results, &nested_m),
+        Status::Built { .. }
+    ));
+    fs::write(&schema_lib, &schema_original).unwrap();
+
     // An edit outside any body rejects the round, unless edits outside
     // bodies are skipped: then the body edit is kept and the comment dropped.
     edit(
@@ -257,6 +287,7 @@ fn edited_mutants_are_captured_built_and_judged() {
         (&greeting_m, "greeting_works"),
         (&mul_m, "add_works"),
         (&flag_m, "flag_is_true"),
+        (&nested_m, "parse_pair_works"),
     ] {
         let v = verdict(m);
         assert_eq!(v.kind, VerdictKind::Caught, "{}: {v:?}", m.fqns());

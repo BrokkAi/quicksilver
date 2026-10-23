@@ -385,18 +385,32 @@ pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<Applie
     for (_, at, prologue, _) in &prepared {
         text.insert_str(*at, prologue);
     }
+    // Where an original offset lands in the rewritten text: shifted by every
+    // prologue inserted before it. Prologues of nested functions sit inside
+    // the outer body, so an outer function's end moves by theirs too.
+    let mut inserts: Vec<(usize, usize)> = prepared
+        .iter()
+        .map(|(_, at, prologue, _)| (*at, prologue.len()))
+        .collect();
+    inserts.sort_unstable();
+    let shifted = |orig: usize| -> usize {
+        orig + inserts
+            .iter()
+            .take_while(|(at, _)| *at < orig)
+            .map(|(_, len)| len)
+            .sum::<usize>()
+    };
     prepared.sort_by_key(|(s, _, _, _)| s.body_start_byte);
     let mut applied = Vec::new();
-    let mut shift = 0usize;
     for (site, at, prologue, rel) in &prepared {
-        let insert_at = at + shift;
+        let insert_at = shifted(*at);
         applied.push(AppliedSite {
             site_id: site.site_id,
             path: site.path.clone(),
             prologue_start: insert_at,
             prologue_end: insert_at + prologue.len(),
-            fn_start: site.fn_start_byte + shift,
-            fn_end: site.body_end_byte + shift + prologue.len(),
+            fn_start: shifted(site.fn_start_byte),
+            fn_end: shifted(site.body_end_byte),
             variants: rel
                 .iter()
                 .map(|(index, mutant_id, start, end)| AppliedVariant {
@@ -408,7 +422,6 @@ pub fn apply_to_source(src: &str, sites: &[&Site]) -> Result<(String, Vec<Applie
                 })
                 .collect(),
         });
-        shift += prologue.len();
     }
     Ok((text, applied))
 }
@@ -601,32 +614,30 @@ enum SpanHit {
     Site(u32),
 }
 
+/// The variant a span falls in (the tightest), else the innermost site whose
+/// prologue or function it overlaps: with nested functions, an error inside
+/// the inner one also lies inside the outer one's range.
 fn hit_for_span(applied: &[AppliedSite], sp: &CompilerSpan, worker: &Path) -> Option<SpanHit> {
-    for a in applied {
-        if !span_matches_path(&sp.file, &a.path, worker) {
-            continue;
-        }
-        let mut best: Option<&AppliedVariant> = None;
-        for v in &a.variants {
-            if overlaps(sp.byte_start, sp.byte_end, v.start, v.end) {
-                let tighter = best
-                    .map(|b| (v.end - v.start) < (b.end - b.start))
-                    .unwrap_or(true);
-                if tighter {
-                    best = Some(v);
-                }
-            }
-        }
-        if let Some(v) = best {
-            return Some(SpanHit::Variant(v.mutant_id.clone()));
-        }
-        if overlaps(sp.byte_start, sp.byte_end, a.prologue_start, a.prologue_end)
-            || overlaps(sp.byte_start, sp.byte_end, a.fn_start, a.fn_end)
-        {
-            return Some(SpanHit::Site(a.site_id));
-        }
+    let in_file: Vec<&AppliedSite> = applied
+        .iter()
+        .filter(|a| span_matches_path(&sp.file, &a.path, worker))
+        .collect();
+    let variant = in_file
+        .iter()
+        .flat_map(|a| a.variants.iter())
+        .filter(|v| overlaps(sp.byte_start, sp.byte_end, v.start, v.end))
+        .min_by_key(|v| v.end - v.start);
+    if let Some(v) = variant {
+        return Some(SpanHit::Variant(v.mutant_id.clone()));
     }
-    None
+    in_file
+        .iter()
+        .filter(|a| {
+            overlaps(sp.byte_start, sp.byte_end, a.prologue_start, a.prologue_end)
+                || overlaps(sp.byte_start, sp.byte_end, a.fn_start, a.fn_end)
+        })
+        .min_by_key(|a| a.fn_end - a.fn_start)
+        .map(|a| SpanHit::Site(a.site_id))
 }
 
 fn span_matches_path(span_file: &str, rel: &str, worker: &Path) -> bool {
@@ -803,6 +814,75 @@ mod tests {
             body_end_byte: body_end,
             replacement: repl.into(),
             return_kind: "number".into(),
+        }
+    }
+
+    #[test]
+    fn nested_sites_get_offsets_into_the_rewritten_text() {
+        let src = "fn outer() -> u32 {\n    fn inner() -> u32 { 1 }\n    inner()\n}\nfn after() -> u32 { 2 }\n";
+        let site = |id: u32, fqn: &str, fn_start: usize, body_start: usize, body_end: usize| Site {
+            site_id: id,
+            salt: 0,
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: fqn.into(),
+            body_start_byte: body_start,
+            body_end_byte: body_end,
+            fn_start_byte: fn_start,
+            identity_variant: 1,
+            variants: vec![SiteVariant {
+                index: 0,
+                mutant_id: format!("m-{fqn}"),
+                return_kind: "number".into(),
+                return_stmt: "return 7".into(),
+            }],
+        };
+        let outer_start = src.find("fn outer").unwrap();
+        let outer_body = src.find('{').unwrap();
+        let outer_end = src.find("\n}\n").unwrap() + 2;
+        let inner_start = src.find("fn inner").unwrap();
+        let inner_body = src[inner_start..].find('{').unwrap() + inner_start;
+        let inner_end = src[inner_start..].find('}').unwrap() + inner_start + 1;
+        let after_start = src.find("fn after").unwrap();
+        let after_body = src[after_start..].find('{').unwrap() + after_start;
+        let sites = [
+            site(1, "outer", outer_start, outer_body, outer_end),
+            site(2, "outer.inner", inner_start, inner_body, inner_end),
+            site(3, "after", after_start, after_body, src.len() - 1),
+        ];
+        let refs: Vec<&Site> = sites.iter().collect();
+        let (text, applied) = apply_to_source(src, &refs).unwrap();
+        for a in &applied {
+            let f = &text[a.fn_start..a.fn_end];
+            assert!(
+                f.starts_with("fn ") && f.ends_with('}'),
+                "{}: {f:?}",
+                a.site_id
+            );
+            assert!(
+                text[a.prologue_start..a.prologue_end].contains(&format!("{:#010x}", a.site_id)),
+                "{}",
+                a.site_id
+            );
+            for v in &a.variants {
+                assert_eq!(&text[v.start..v.end], "0 => return 7, ");
+            }
+        }
+        let outer = applied.iter().find(|a| a.site_id == 1).unwrap();
+        let inner = applied.iter().find(|a| a.site_id == 2).unwrap();
+        assert!(outer.fn_start < inner.fn_start && inner.fn_end < outer.fn_end);
+        // An error inside the inner function is the inner site's.
+        let span = CompilerSpan {
+            file: "src/lib.rs".into(),
+            byte_start: inner.prologue_end,
+            byte_end: inner.prologue_end + 1,
+            is_primary: true,
+            message: "e".into(),
+            rendered: String::new(),
+        };
+        match hit_for_span(&applied, &span, Path::new("/w")) {
+            Some(SpanHit::Site(id)) => assert_eq!(id, 2),
+            _ => panic!("expected the inner site"),
         }
     }
 

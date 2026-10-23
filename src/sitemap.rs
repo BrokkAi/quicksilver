@@ -209,19 +209,9 @@ pub fn sites_from_functions(fns: &[FnDecl]) -> Result<(Vec<MapSite>, Vec<Dropped
             dropped.push((f.path.clone(), f.fqn.clone(), why.to_string()));
             continue;
         }
-        let nested = kept
-            .iter()
-            .rev()
-            .take_while(|k| k.path == f.path)
-            .any(|k| k.body_start_byte <= f.start_byte && f.end_byte <= k.body_end_byte);
-        if nested {
-            dropped.push((
-                f.path.clone(),
-                f.fqn.clone(),
-                "nested in another function's body, which is the site".to_string(),
-            ));
-            continue;
-        }
+        // A function nested in another's body is a site of its own; an edit
+        // inside it is that function's, an edit elsewhere in the outer body
+        // is the outer function's (`capture::split_nested`).
         kept.push(f);
     }
     let seeds: Vec<String> = kept
@@ -322,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_const_and_skipped_functions_get_no_site() {
+    fn const_and_skipped_functions_get_no_site_but_nested_ones_do() {
         let mut inner = decl("a.rs", "outer::inner", 20, 40, 30);
         inner.fqn = "inner".into();
         let mut k = decl("a.rs", "k", 100, 120, 110);
@@ -338,23 +328,17 @@ mod tests {
         ];
         let (sites, dropped) = sites_from_functions(&fns).unwrap();
         let kept: Vec<&str> = sites.iter().map(|s| s.fqn.as_str()).collect();
-        assert_eq!(kept, vec!["outer", "next"]);
+        assert_eq!(kept, vec!["outer", "inner", "next"]);
         let why: Vec<(&str, &str)> = dropped
             .iter()
             .map(|(_, fqn, why)| (fqn.as_str(), why.split(':').next().unwrap()))
             .collect();
         assert_eq!(
             why,
-            vec![
-                (
-                    "inner",
-                    "nested in another function's body, which is the site"
-                ),
-                ("k", "const fn"),
-                ("s", "carries a skip attribute"),
-            ]
+            vec![("k", "const fn"), ("s", "carries a skip attribute"),]
         );
-        assert_ne!(sites[0].site_id, sites[1].site_id);
+        let ids: std::collections::BTreeSet<u32> = sites.iter().map(|s| s.site_id).collect();
+        assert_eq!(ids.len(), 3);
     }
 
     #[test]

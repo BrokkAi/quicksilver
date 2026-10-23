@@ -151,6 +151,57 @@ pub fn split_bodies(
     Ok(out)
 }
 
+/// [`split_bodies`] for ranges that may nest (a function inside another's
+/// body). The outermost bodies are split first; a changed outer body is then
+/// split against the functions inside it. When only inner bodies changed,
+/// the edits are theirs; when the outer function's own text changed, the
+/// whole outer body is the edit.
+pub fn split_nested(
+    original: &str,
+    edited: &str,
+    bodies: &[BodyRange],
+) -> Result<Vec<(u32, String)>, Rejection> {
+    let mut sorted: Vec<&BodyRange> = bodies.iter().collect();
+    sorted.sort_by_key(|b| (b.start, std::cmp::Reverse(b.end)));
+    let mut tops: Vec<BodyRange> = Vec::new();
+    for b in sorted {
+        if tops
+            .last()
+            .is_some_and(|t| b.start >= t.start && b.end <= t.end)
+        {
+            continue;
+        }
+        tops.push(b.clone());
+    }
+    let mut out = Vec::new();
+    for (site_id, new_body) in split_bodies(original, edited, &tops)? {
+        let top = tops
+            .iter()
+            .find(|t| t.site_id == site_id)
+            .expect("split returns its own sites");
+        let inner: Vec<BodyRange> = bodies
+            .iter()
+            .filter(|b| b.start > top.start && b.end < top.end)
+            .map(|b| BodyRange {
+                site_id: b.site_id,
+                fqn: b.fqn.clone(),
+                start: b.start - top.start,
+                end: b.end - top.start,
+            })
+            .collect();
+        if !inner.is_empty() {
+            if let Ok(sub) = split_nested(&original[top.start..top.end], &new_body, &inner) {
+                if !sub.is_empty() {
+                    out.extend(sub);
+                    continue;
+                }
+            }
+        }
+        out.push((site_id, new_body));
+    }
+    Ok(out)
+}
+
 fn push_if_changed(
     out: &mut Vec<(u32, String)>,
     b: &BodyRange,
@@ -634,7 +685,7 @@ fn capture_files(
             &format!("{}{rel}", map.prefix),
         )?)
         .with_context(|| format!("{rel} at {} is not UTF-8", map.commit))?;
-        let bodies = match split_bodies(&original, &edited, ranges) {
+        let bodies = match split_nested(&original, &edited, ranges) {
             Ok(bodies) => bodies,
             Err(Rejection::BadRanges(why)) => {
                 problems.push(format!("`{rel}`: {}", Rejection::BadRanges(why)));
@@ -654,7 +705,7 @@ fn capture_files(
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
-                match split_bodies(&original, &kept, ranges) {
+                match split_nested(&original, &kept, ranges) {
                     Ok(bodies) => bodies,
                     Err(why) => {
                         problems.push(format!("`{rel}`: {why}"));
@@ -770,7 +821,7 @@ pub fn keep_body_hunks(original: &str, edited: &str, ranges: &[BodyRange]) -> (S
     let mut dropped = Vec::new();
     for i in 0..hunks.len() {
         let alone = crate::linediff::apply(original, edited, &hunks, &[i]);
-        if split_bodies(original, &alone, ranges).is_ok() {
+        if split_nested(original, &alone, ranges).is_ok() {
             kept.push(i);
         } else {
             dropped.push(hunks[i].b.start + 1);
@@ -944,6 +995,47 @@ mod tests {
             split_bodies(SRC, SRC, &r),
             Err(Rejection::BadRanges(_))
         ));
+    }
+
+    #[test]
+    fn an_edit_belongs_to_the_innermost_function_it_changes() {
+        let src =
+            "fn outer() -> u32 {\n    fn inner() -> u32 {\n        1\n    }\n    inner() + 1\n}\n";
+        let range = |id: u32, fqn: &str, open: &str, close: &str| {
+            let start = src.find(open).unwrap() + open.len() - 1;
+            let end = src[start..].find(close).unwrap() + start + close.len();
+            BodyRange {
+                site_id: id,
+                fqn: fqn.into(),
+                start,
+                end,
+            }
+        };
+        let ranges = vec![
+            range(1, "outer", "fn outer() -> u32 {", "\n}"),
+            range(2, "outer.inner", "fn inner() -> u32 {", "\n    }"),
+        ];
+        // Only the inner body changed: the inner function's edit.
+        let edited = src.replace("        1\n", "        2\n");
+        assert_eq!(
+            split_nested(src, &edited, &ranges),
+            Ok(vec![(2, "{\n        2\n    }".into())])
+        );
+        // The outer function's own text changed: the whole outer body.
+        let edited = src.replace("inner() + 1", "inner() + 2");
+        let got = split_nested(src, &edited, &ranges).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 1);
+        assert!(got[0].1.contains("inner() + 2"));
+        // Both changed: still one outer edit, which carries both.
+        let edited = src
+            .replace("        1\n", "        2\n")
+            .replace("inner() + 1", "inner() + 2");
+        let got = split_nested(src, &edited, &ranges).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 1);
+        // Flat ranges behave as before.
+        assert_eq!(split_nested(SRC, SRC, &super::tests::ranges()), Ok(vec![]));
     }
 
     #[test]
