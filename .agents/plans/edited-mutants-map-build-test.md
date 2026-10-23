@@ -26,18 +26,35 @@ The user's checkout is only ever read. Every build and every test run happens in
 
 - [x] (2026-10-23 05:10Z) Read the schema engine (`src/exec/schema.rs`), the test runner (`src/exec/test.rs`), discovery (`src/discover.rs`), the baseline code (`src/baseline.rs`) and the fixtures, and designed the three commands.
 - [x] (2026-10-23 05:30Z) Wrote this plan.
-- [ ] Milestone 1: body splitting. `src/capture.rs` with `split_bodies` and unit tests.
-- [ ] Milestone 2: function scan and the map artifact. `discover::scan_functions`, `src/sitemap.rs`, `cargo quicksilver map`.
-- [ ] Milestone 3: capture and build. `capture::capture`, `src/exec/edited.rs::build`, `cargo quicksilver build`.
-- [ ] Milestone 4: test. `src/exec/edited.rs::test`, `cargo quicksilver test`.
-- [ ] Milestone 5: end-to-end test on the `tiny` fixture and a run on a real crate.
+- [x] (2026-10-23 13:20Z) Milestone 1: body splitting. `src/capture.rs` with `split_bodies`, `braces_balanced` and 12 unit tests. Commit 0e145f5.
+- [x] (2026-10-23 13:20Z) Milestone 2: `discover::scan_functions` and `scan_workspace` (`FnDecl`), `src/sitemap.rs` (`SiteMap`, `sites_from_functions`, `tracked_file_hashes`), `exec::edited::build_map`, `cargo quicksilver map`. Commits 0e145f5 and e7aa6bd.
+- [x] (2026-10-23 14:00Z) Milestone 3: `capture::capture`, `exec::edited::build` with `isolate_all`, `cargo quicksilver build` with `--no-capture` and `--restore`. Commit e7aa6bd.
+- [x] (2026-10-23 14:00Z) Milestone 4: `exec::edited::test`, `cargo quicksilver test --mutant`. Commit e7aa6bd.
+- [x] (2026-10-23 14:05Z) Milestone 5, fixture: `tests/edited.rs` passes (map, two-body caught, unviable with rustc reason, NotCovered, Missed, three rejections, duplicate, checkout untouched). The CLI round trip on a fixture copy: map 2.9 s, build 0.5 s, test caught.
+- [x] (2026-10-23 14:12Z) Milestone 5, real crate: `map`, two hand-written mutants, `build`, `test` on the local clap copy. Timings in Artifacts and Notes.
+- [x] (2026-10-23 14:15Z) Outcomes & Retrospective.
 
 
 ## Surprises & Discoveries
 
 
 - Observation: a mutant that moves a parameter in its new body still compiles after the original body. The arm is `N => return { <body> }`, and `return` diverges, so the borrow checker does not see the move on the path that falls through to the original body.
-  Evidence: reasoning from Rust's flow-sensitive move checking; to be confirmed by the fixture test in Milestone 5.
+  Evidence: confirmed on clap. `Arg::required(self, yes: bool) -> Self` edited to `{ let _ = yes; self.setting(ArgSettings::Required) }` moves `self` in the arm; the mutant compiled (generation 2, 5.9 s) and was caught by `app_settings::allow_missing_positional_no_default`.
+
+- Observation: on clap the map's cost is Bifrost's cold whole-workspace open, not the build or the recording. Tests were catalogued at 14:04:34, the declaration scan finished at 14:09:52 (75 s of scan, the rest opening the store), the schema build took 10 s and recording 1,334 tests took 36 s. The store persists in `baseline/.bifrost/cache`, so a second `map` in the same scratch session would skip most of that.
+  Evidence: `/mnt/optane/quicksilver/local/clap-edited-map.log`, INFO lines quoted in Artifacts and Notes.
+
+- Observation: clap's workspace suite enters `clap_builder::util::str_to_bool` from exactly one test (`flags::non_bool_type_flag`). A mutant that makes unknown strings truthy (and flips `FalseyValueParser`'s fallback, which cancels for that parser) survives. `BoolishValueParser`, which would turn the mutant into "no error on an invalid boolean", is entered by no workspace test. Doc tests are not in the catalogue, so this says nothing about them.
+  Evidence: `MISSED 669557f59202647f ... (1 tests passed: flags::non_bool_type_flag)` and the map's `hits`.
+
+- Observation: nextest test ids and names carry the module path. The id is `tiny_a::tests::add_works` and the name `tests::add_works`, not `add_works`. Bifrost's fqns are dotted: `tiny_a.add`.
+  Evidence: the first two runs of `tests/edited.rs` failed on exactly those strings (`add_works enters add: {"tiny_a::tests::add_works": [2738065847], ...}` and `Verdict { kind: Caught, test: Some("tests::greeting_works"), ... }`). Messages that name a function print the dotted form.
+
+- Observation: `disable_attributed` reports a dropped site through its variants, so an identity-only site that rustc rejects is removed silently. `isolate_all` therefore diffs the site ids before and after each round to find whole sites that were dropped, and the map lists them under `dropped` with "its prologue did not compile".
+  Evidence: `src/schema.rs::disable_attributed` pushes one `(mutant_id, reason)` per variant and returns `false` for the site; with zero variants nothing is pushed.
+
+- Observation: `identity_gate` in `src/exec/schema.rs` indexes `site.variants[0]` and would panic on an identity-only site, so the map has its own gate (`identity_gate_map`), which runs after recording so it can pick the tests that actually enter each sampled site.
+  Evidence: `src/exec/schema.rs::identity_gate`, `by_id.get(&site.variants[0].mutant_id)`.
 
 
 ## Decision Log
@@ -83,11 +100,31 @@ The user's checkout is only ever read. Every build and every test run happens in
   Rationale: incremental rebuilds in `build` depend on the worker's target directory from the map build.
   Date/Author: 2026-10-23, Claude.
 
+- Decision: `dropped` in the map is a (path, fqn, why) triple, not (fqn, why).
+  Rationale: `capture` needs the path to tell a model that the file it changed has functions without a site, and why, instead of the generic "no mutable function" message.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision: `build --restore` is opt-in and copies only the captured files back from the baseline.
+  Rationale: the loop a model runs is edit, build, reset, edit. Resetting from the baseline copy is exact and cheap, but writing into the user's checkout is something QS otherwise never does, so it stays behind a flag.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision: `build` compiles the union of every pending and every untested mutant, and `test` runs only the current generation.
+  Rationale: a build replaces the staged binaries, so an untested mutant from an earlier generation must be in the new ones to be runnable. Tested mutants are final and are left out of later builds.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision: the map's state link is a random `map_id`; a state built against another map is discarded with a count printed.
+  Rationale: `Built` records name site ids and generation directories that a new map invalidates; keeping them would produce wrong activations.
+  Date/Author: 2026-10-23, Claude.
+
 
 ## Outcomes & Retrospective
 
 
-Not yet written. To be filled at the end of Milestone 5.
+Achieved. A model or a person can now edit function bodies in a checkout and have QS judge the edit as a mutant: `map` once (clap: 6.5 minutes, most of it Bifrost's cold open; the fixture: 3 s), then `build` in 6 to 10 s on clap and `test` in well under a second, because only the tests that enter the edited functions run. Several bodies per mutant, across files, work as one activation. Edits outside bodies, to test code, or in new files are rejected with the file, the line and the functions they sit between. The checkout is only read, and `--restore` resets the captured files from the baseline copy.
+
+What remains. The map's largest cost on a real crate is Bifrost opening the whole workspace; `--in-diff`-style scoped discovery does not apply because the map wants every function. A cheaper function scan (syn over the crate's files, without Bifrost) would cut the clap map to about a minute, and is the obvious next step if `map` is run often. The rejection line for a changed signature is the line where the unchanged text could not be found, which is exact for the first and last anchors and approximate between functions. The map includes only tests nextest lists, so doc tests are not in the catalogue. Nothing yet drives a model: the loop is three commands and a convention (edit, build, reset).
+
+Lessons. Reusing the schema engine was the right call: the prologue, the error attribution and the test runner needed no change, only an identity-only site shape, a `return { body }` arm and a generalisation of isolation to all crates at once. The two things that did need new code were the byte-anchored split and the map artifact, both small. The fixture test caught every naming mistake (nextest ids, dotted fqns) before the clap run, which then worked on the first try.
 
 
 ## Context and Orientation
@@ -386,7 +423,64 @@ If the worker is deleted, `build` fails with a message to run `map` again. If th
 ## Artifacts and Notes
 
 
-To be filled: the fixture transcript and the clap timings.
+The CLI round trip on a copy of `tests/fixtures/tiny` (2026-10-23, this host, debug build of QS):
+
+    $ cargo quicksilver map --scratch-root $D/scratch --clone-backend copy --allow-copy
+    map: 17 sites, 0 functions without a site
+    map: schema built in 1 cargo invocation(s); 17 sites kept
+    map: recorded 12 tests in 0.0s, 0 not green; 14 of 17 sites entered
+    map: 17 sites (0 functions without a site), 12 tests (12 green), 14 sites entered by at least one test, 2.9s
+    map written to $D/scratch/76ecd99627ff8c2a/index/sitemap.json
+    next: edit function bodies in $D/repo, then run `cargo quicksilver build`
+
+    $ sed -i 's/    a + b$/    a - b/; s/"hello".into()/"bye".into()/' crate_a/src/lib.rs
+    $ cargo quicksilver build --scratch-root $D/scratch --clone-backend copy --allow-copy --restore
+    captured mutant 3598881ff4b42d31 from $D/repo: edits tiny_a.greeting + tiny_a.add
+      COMPILED 3598881ff4b42d31 tiny_a.greeting + tiny_a.add
+    build: 1 mutant(s) compiled, 0 unviable (generation 1, 1 cargo invocation(s), 0.5s)
+    $ git diff --stat        (empty: --restore reset the file)
+
+    $ sed -i 's/pub fn add(a: i32, b: i32) -> i32/pub fn add(a: i64, b: i64) -> i64/' crate_a/src/lib.rs
+    $ cargo quicksilver build ...
+    the edits in $D/repo were not captured:
+      `crate_a/src/lib.rs`: edit outside a function body before `tiny_a.add` (line 1 of the edited file)
+    a mutant may only change function bodies outside test code; reset the checkout and edit again
+
+    $ cargo quicksilver test ...
+      CAUGHT      3598881ff4b42d31 tiny_a.greeting + tiny_a.add by tests::greeting_works
+    $ cargo quicksilver test ...
+    no compiled mutants to test; run `cargo quicksilver build` first
+
+The clap run (clap v4.6.7 copy at `/mnt/optane/quicksilver/local/clap`, debug QS, this host, mbx on, 2026-10-23):
+
+    $ cargo quicksilver map --scratch-root /mnt/optane/quicksilver/clap-edited --clone-backend copy --allow-copy
+    14:04:34 map: 1334 tests catalogued, 1334 with baseline durations
+    14:09:52 discovery: 0.00s diff analysis, 75.46s declaration scan, 1474 functions
+    14:09:53 map: 1448 sites, 26 functions without a site
+    14:10:04 map: schema built in 1 cargo invocation(s); 1448 sites kept
+    14:10:40 map: recorded 1334 tests in 35.7s, 0 not green; 967 of 1448 sites entered
+    map: 1448 sites (26 functions without a site), 1334 tests (1334 green), 967 sites entered by at least one test, 382.4s
+    Elapsed (wall clock): 6:25, maximum resident set 5.5 GB
+
+    # str_to_bool: unknown strings become Some(true); FalseyValueParser: unwrap_or(false)
+    $ cargo quicksilver build ... --restore
+    captured mutant 669557f59202647f from /mnt/optane/quicksilver/local/clap: edits clap_builder.builder.value_parser.FalseyValueParser.parse_ref + clap_builder.util.str_to_bool.str_to_bool
+      COMPILED 669557f59202647f ...
+    build: 1 mutant(s) compiled, 0 unviable (generation 1, 1 cargo invocation(s), 9.6s)
+
+    # Arg::required ignores `yes` and always sets Required (moves self in the arm)
+    $ cargo quicksilver build ... --restore
+    captured mutant e1a2853eb638848c from /mnt/optane/quicksilver/local/clap: edits clap_builder.builder.arg.Arg.required
+      COMPILED 669557f59202647f ...
+      COMPILED e1a2853eb638848c clap_builder.builder.arg.Arg.required
+    build: 2 mutant(s) compiled, 0 unviable (generation 2, 1 cargo invocation(s), 5.9s)
+
+    $ cargo quicksilver test ...
+      MISSED      669557f59202647f clap_builder.builder.value_parser.FalseyValueParser.parse_ref + clap_builder.util.str_to_bool.str_to_bool (1 tests passed: flags::non_bool_type_flag)
+      CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by app_settings::allow_missing_positional_no_default
+    test wall 0.13s
+
+The 26 functions without a site on clap are `const fn`s and nested functions; none was dropped by rustc.
 
 
 ## Interfaces and Dependencies
@@ -408,7 +502,7 @@ In `src/sitemap.rs`:
 
     pub struct MapSite { ... }  pub struct SiteMap { ... }
     impl SiteMap { pub fn save(&self, paths: &Paths) -> Result<()>; pub fn load(paths: &Paths) -> Result<Option<SiteMap>>; pub fn path(paths: &Paths) -> PathBuf; }
-    pub fn sites_from_functions(fns: &[FnDecl]) -> (Vec<MapSite>, Vec<(String, String)>);
+    pub fn sites_from_functions(fns: &[FnDecl]) -> Result<(Vec<MapSite>, Vec<Dropped>)>;  // Dropped = (path, fqn, why)
     pub fn tracked_file_hashes(root: &Path) -> Result<BTreeMap<String, String>>;
 
 In `src/discover.rs`:
@@ -419,8 +513,11 @@ In `src/discover.rs`:
 In `src/exec/edited.rs`:
 
     pub fn build_map(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>) -> Result<SiteMap>;
-    pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>, restore: bool) -> Result<BuildReport>;
+    pub fn build(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>, capture_from: Option<&Path>, restore: bool) -> Result<BuildReport>;
     pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedMutant, Verdict)>>;
     pub struct State { ... }  impl State { pub fn load(paths) ; pub fn save(&self, paths) }
 
 In `src/cli.rs`: `Command::Map(MapArgs)`, `Command::Build(BuildArgs { no_capture: bool, restore: bool })`, `Command::Test(TestArgs { mutant: Vec<String> })`.
+
+
+Revision note (2026-10-23 14:15Z): recorded the fixture and clap results, the confirmed move-in-arm observation, the cost breakdown of the clap map, and the retrospective. The plan's `dropped` type and `build` signature were updated to what was built (path included; `backend` passed in).
