@@ -138,6 +138,38 @@ pub fn discover_in_diff(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Muta
     discover_with(&opened.workspace, root, filter, Some(diff), diff_secs)
 }
 
+/// One function with a body, as discovery sees it before any filter that
+/// decides whether the built-in generator mutates it.
+#[derive(Debug, Clone)]
+pub struct FnDecl {
+    pub package: String,
+    /// Repository-relative path using forward slashes.
+    pub path: String,
+    pub fqn: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_line: usize,
+    pub end_line: usize,
+    /// Absolute byte range of the body, braces included.
+    pub body_start_byte: usize,
+    pub body_end_byte: usize,
+    pub return_kind: ReturnKind,
+    pub unsafe_fn: bool,
+    pub const_fn: bool,
+    /// Carries `#[quicksilver::skip]` or `#[mutants::skip]`.
+    pub skip: bool,
+    /// Empty, or a single `todo!()`-style placeholder.
+    pub boring_body: bool,
+    pub original_body: String,
+}
+
+/// Every function with a body in the workspace, outside test regions and
+/// test-like paths, in mutable (non proc-macro) packages.
+pub fn scan_workspace(root: &Path, filter: &DiscoverFilter) -> Result<Vec<FnDecl>> {
+    let opened = crate::bifrost::open_workspace(root)?;
+    scan_functions(&opened.workspace, root, filter, None, 0.0)
+}
+
 fn discover_with(
     workspace: &WorkspaceAnalyzer,
     root: &Path,
@@ -145,6 +177,53 @@ fn discover_with(
     diff_fqns: Option<DiffSelection>,
     diff_secs: f64,
 ) -> Result<Vec<Mutant>> {
+    let fns = scan_functions(workspace, root, filter, diff_fqns, diff_secs)?;
+    let mut mutants = Vec::new();
+    for f in &fns {
+        if f.skip || f.unsafe_fn || f.const_fn || f.boring_body {
+            continue;
+        }
+        for repl in f.return_kind.replacements() {
+            if collapse_ws(repl) == collapse_ws(&f.original_body) {
+                continue;
+            }
+            let id = mutant_id(&f.package, &f.path, &f.fqn, repl);
+            mutants.push(Mutant {
+                id,
+                package: f.package.clone(),
+                path: f.path.clone(),
+                fqn: f.fqn.clone(),
+                start_byte: f.start_byte,
+                end_byte: f.end_byte,
+                start_line: f.start_line,
+                end_line: f.end_line,
+                body_start_byte: f.body_start_byte,
+                body_end_byte: f.body_end_byte,
+                replacement: (*repl).to_string(),
+                return_kind: f.return_kind.label().to_string(),
+            });
+        }
+    }
+    mutants.sort_by(|a, b| {
+        (&a.package, &a.path, a.start_byte, &a.replacement).cmp(&(
+            &b.package,
+            &b.path,
+            b.start_byte,
+            &b.replacement,
+        ))
+    });
+    disambiguate_ids(&mut mutants);
+    tracing::info!("discovery: {} mutants", mutants.len());
+    Ok(mutants)
+}
+
+fn scan_functions(
+    workspace: &WorkspaceAnalyzer,
+    root: &Path,
+    filter: &DiscoverFilter,
+    diff_fqns: Option<DiffSelection>,
+    diff_secs: f64,
+) -> Result<Vec<FnDecl>> {
     let meta = load_metadata(root)?;
     let globset = file_globset(&filter.files)?;
     let scan_started = std::time::Instant::now();
@@ -155,7 +234,7 @@ fn discover_with(
         std::collections::HashMap::new();
     let mut skipped_proc_macro: BTreeSet<String> = BTreeSet::new();
 
-    let mut mutants = Vec::new();
+    let mut fns = Vec::new();
     for unit in analyzer.all_declarations() {
         if unit.is_synthetic() {
             continue;
@@ -231,56 +310,37 @@ fn discover_with(
             Ok(p) => p,
             Err(_) => continue,
         };
-        if parsed.skip {
-            continue;
-        }
-        if parsed.unsafe_fn || parsed.const_fn {
-            continue;
-        }
-        if parsed.boring_body {
-            continue;
-        }
         let body_start = range.start_byte + parsed.body_start;
         let body_end = range.start_byte + parsed.body_end;
         if body_end > source.len() || body_start >= body_end {
             continue;
         }
-        let original_body = &source[body_start..body_end];
-        for repl in parsed.kind.replacements() {
-            if collapse_ws(repl) == collapse_ws(original_body) {
-                continue;
-            }
-            let id = mutant_id(&package, &rel, &fqn, repl);
-            mutants.push(Mutant {
-                id,
-                package: package.clone(),
-                path: rel.clone(),
-                fqn: fqn.clone(),
-                start_byte: range.start_byte,
-                end_byte: range.end_byte,
-                start_line: range.start_line,
-                end_line: range.end_line,
-                body_start_byte: body_start,
-                body_end_byte: body_end,
-                replacement: (*repl).to_string(),
-                return_kind: parsed.kind.label().to_string(),
-            });
-        }
+        fns.push(FnDecl {
+            package: package.clone(),
+            path: rel.clone(),
+            fqn: fqn.clone(),
+            start_byte: range.start_byte,
+            end_byte: range.end_byte,
+            start_line: range.start_line,
+            end_line: range.end_line,
+            body_start_byte: body_start,
+            body_end_byte: body_end,
+            return_kind: parsed.kind,
+            unsafe_fn: parsed.unsafe_fn,
+            const_fn: parsed.const_fn,
+            skip: parsed.skip,
+            boring_body: parsed.boring_body,
+            original_body: source[body_start..body_end].to_string(),
+        });
     }
-    mutants.sort_by(|a, b| {
-        (&a.package, &a.path, a.start_byte, &a.replacement).cmp(&(
-            &b.package,
-            &b.path,
-            b.start_byte,
-            &b.replacement,
-        ))
+    fns.sort_by(|a, b| {
+        (&a.package, &a.path, a.start_byte).cmp(&(&b.package, &b.path, b.start_byte))
     });
-    disambiguate_ids(&mut mutants);
     tracing::info!(
-        "discovery: {:.2}s diff analysis, {:.2}s declaration scan, {} mutants",
+        "discovery: {:.2}s diff analysis, {:.2}s declaration scan, {} functions",
         diff_secs,
         scan_started.elapsed().as_secs_f64(),
-        mutants.len()
+        fns.len()
     );
     if !skipped_proc_macro.is_empty() {
         eprintln!(
@@ -288,7 +348,7 @@ fn discover_with(
             skipped_proc_macro.into_iter().collect::<Vec<_>>().join(", ")
         );
     }
-    Ok(mutants)
+    Ok(fns)
 }
 
 /// Two functions in one file can share an fqn (`impl Display for Version`

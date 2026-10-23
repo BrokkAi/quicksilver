@@ -1,5 +1,6 @@
 pub mod baseline;
 pub mod bifrost;
+pub mod capture;
 pub mod cargo_cmd;
 pub mod cli;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod reach;
 pub mod report;
 pub mod schema;
 pub mod scratch;
+pub mod sitemap;
 pub mod types;
 pub mod util;
 
