@@ -18,15 +18,19 @@ After this change QS lists functions itself, with `syn`, by walking the module t
 
 - [x] (2026-10-23 15:00Z) Surveyed every Bifrost use: `src/bifrost.rs`, `src/discover.rs` (declarations, test regions, ranges, fqns, and the diff-analysis fallback for `--in-diff`), `src/engine.rs` (open for discovery and the static selector), `src/reach.rs` and `graph-probe` (feature `static-selection`), `src/scratch.rs` (keeping `.bifrost/cache` across baseline syncs), `Cargo.toml`.
 - [x] (2026-10-23 15:05Z) Collected Bifrost's fully qualified name format from the clap map so ids stay stable: see Decision Log.
-- [ ] Milestone 1: `src/scan.rs`, the module walk, with unit tests on inline source.
-- [ ] Milestone 2: `src/discover.rs` on the walk; `--in-diff` through git only; delete `src/bifrost.rs`, `src/reach.rs`, the feature, the `Static` selection and `graph-probe`; drop the dependencies.
-- [ ] Milestone 3: tests pass; the clap map again, with the function count and the time compared with the Bifrost run (1,474 functions, 6 min 25 s).
+- [x] (2026-10-23 15:40Z) Milestone 1: `src/scan.rs` with five unit tests (module files, inline and `#[path]` modules, methods and trait default methods, test marking, ranges, a file included twice). Commit 3321a24.
+- [x] (2026-10-23 15:45Z) Milestone 2: discovery on the walk, git-only `--in-diff`, Bifrost, `reach.rs`, the feature, `Static` and `graph-probe` removed, Cargo.lock regenerated. `cargo tree` shows no `brokk` crate. Commit 3321a24.
+- [x] (2026-10-23 16:05Z) Milestone 3: 113 lib tests, engine (9), schema (3) and edited (1) pass. The clap map took 1 min 29 s against 6 min 25 s with Bifrost; see Artifacts and Notes.
 
 
 ## Surprises & Discoveries
 
 
-(none yet)
+- Observation: the walk finds 1,493 functions on clap where Bifrost reported 1,474. The 19 extra are unverified: the Bifrost map was deleted before the comparison. Likely candidates are trait default methods and functions inside inline modules Bifrost named differently.
+  Evidence: `discovery: 0.89s module walk, 1493 functions` against `75.46s declaration scan, 1474 functions` in the earlier log.
+
+- Observation: the walk is about 80 times faster than Bifrost's scan alone (0.9 s against 75 s) and removes the four-minute open entirely; peak memory of `map` fell from 5.5 GB to 0.58 GB.
+  Evidence: `/usr/bin/time -v` lines in both clap logs.
 
 
 ## Decision Log
@@ -56,7 +60,7 @@ After this change QS lists functions itself, with `syn`, by walking the module t
 ## Outcomes & Retrospective
 
 
-(to be written)
+Done. QS lists functions itself, builds from crates.io dependencies only, and the clap map went from 6 min 25 s to 1 min 29 s, measured under a worse host load (load average about 125 against about 20). Bifrost's fqn form is kept so persisted ids survive. What was lost: `--in-diff` against a target that is not checked out (now an error with instructions), and the static selection experiment, which the owner had already dropped. What is unverified: the 19 extra functions on clap, and the fqn form for self types that are not a plain path.
 
 
 ## Context and Orientation
@@ -124,7 +128,18 @@ All steps are plain edits and test runs; the clap map can be re-run after `rm -r
 ## Artifacts and Notes
 
 
-(to be filled with the clap map transcript)
+The clap map without Bifrost (2026-10-23, same flags as the Bifrost run, debug QS, host load average about 125):
+
+    map: 1334 tests catalogued, 1334 with baseline durations
+    discovery: 0.89s module walk, 1493 functions
+    map: 1467 sites, 26 functions without a site
+    cloned baseline -> .../workers/w00 in 9.7s via copy
+    map: schema built in 1 cargo invocation(s); 1467 sites kept
+    map: recorded 1334 tests in 20.9s, 0 not green; 973 of 1467 sites entered
+    map: 1467 sites (26 functions without a site), 1334 tests (1334 green), 973 sites entered by at least one test, 83.8s
+    Elapsed (wall clock) time: 1:28.66, maximum resident set 576 MB
+
+With Bifrost, earlier the same day: 1,474 functions, 1,448 sites, 967 entered, 382.4 s in QS, 6:25 wall, 5.5 GB.
 
 
 ## Interfaces and Dependencies
