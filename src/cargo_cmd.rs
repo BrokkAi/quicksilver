@@ -22,17 +22,6 @@ pub fn nextest_profile_args() -> Vec<String> {
     vec!["--profile".into(), NEXTEST_PROFILE.into()]
 }
 
-/// Which crates' tests the green suite / unscoped cargo should run.
-///
-/// Bare `cargo nextest run` follows `default-members`. On bifrost that is the
-/// facade crate, so a core-scoped estimate got 8525 facade JUnit cases and
-/// zero timings for the 317 indexed core tests.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackageSelect {
-    Workspace,
-    Packages(Vec<String>),
-}
-
 /// The packages whose code is mutated: `--package`, or none for all.
 pub fn covering_seeds(cfg: &Config) -> Vec<String> {
     cfg.packages.clone()
@@ -55,16 +44,28 @@ pub fn packages_for_rebuild_timing(packages: &[String], meta: &Metadata) -> Vec<
     }
 }
 
-pub fn package_select(cfg: &Config, meta: &Metadata) -> PackageSelect {
-    package_select_from(&cfg.packages, meta)
+/// The packages whose tests QS builds, lists, times and runs; empty means
+/// the whole workspace. With `--package`, only the named packages' own
+/// tests, unless `--reverse-dependents` adds every workspace package that
+/// depends on one. Every build and suite run uses this one list, so the
+/// recorded tests and the staged binaries always agree.
+///
+/// Reverse dependents are opt-in because a low crate is a dependency of the
+/// whole workspace: on bifrost, `-p brokk-bifrost-core` with dependents
+/// selects about 20,000 tests instead of core's ~470.
+pub fn test_packages(cfg: &Config, meta: &Metadata) -> Vec<String> {
+    test_packages_from(&cfg.packages, cfg.reverse_dependents, meta)
 }
 
-pub fn package_select_from(packages: &[String], meta: &Metadata) -> PackageSelect {
-    let seeds = packages.to_vec();
-    if seeds.is_empty() {
-        PackageSelect::Workspace
+pub fn test_packages_from(
+    packages: &[String],
+    reverse: bool,
+    meta: &Metadata,
+) -> Vec<String> {
+    if reverse {
+        reverse_dependents(meta, packages).into_iter().collect()
     } else {
-        PackageSelect::Packages(reverse_dependents(meta, &seeds).into_iter().collect())
+        packages.to_vec()
     }
 }
 
@@ -112,17 +113,16 @@ pub fn reverse_dependents(meta: &Metadata, seeds: &[String]) -> BTreeSet<String>
     out
 }
 
-pub fn apply_package_select(cmd: &mut Command, select: &PackageSelect) {
-    match select {
-        PackageSelect::Workspace => {
-            cmd.arg("--workspace");
-        }
-        PackageSelect::Packages(pkgs) => {
-            let root = cmd.get_current_dir().map(Path::to_path_buf);
-            for p in package_specs(root.as_deref(), pkgs) {
-                cmd.arg("-p").arg(p);
-            }
-        }
+/// `--workspace` for no packages, else one `-p` per package. Bare cargo
+/// follows `default-members`, which on bifrost is only the facade crate.
+pub fn apply_package_select(cmd: &mut Command, packages: &[String]) {
+    if packages.is_empty() {
+        cmd.arg("--workspace");
+        return;
+    }
+    let root = cmd.get_current_dir().map(Path::to_path_buf);
+    for p in package_specs(root.as_deref(), packages) {
+        cmd.arg("-p").arg(p);
     }
 }
 
@@ -309,16 +309,8 @@ pub fn build_tests(
     apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
-    // package pays startup + lock + fingerprint 2–4× on the compile-bound path.
-    // Empty means the whole workspace — cargo-mutants pays for everything, and
-    // default-members can be just a facade crate.
-    if packages.is_empty() {
-        cmd.arg("--workspace");
-    } else {
-        for p in package_specs(Some(root), packages) {
-            cmd.arg("-p").arg(p);
-        }
-    }
+    // package pays startup + lock + fingerprint 2-4x on the compile-bound path.
+    apply_package_select(&mut cmd, packages);
     if json {
         cmd.arg("--message-format=json");
         cmd.stdout(Stdio::piped());
@@ -377,13 +369,7 @@ pub fn build_tests_captured(
     cmd.current_dir(root);
     apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
-    if packages.is_empty() {
-        cmd.arg("--workspace");
-    } else {
-        for p in package_specs(Some(root), packages) {
-            cmd.arg("-p").arg(p);
-        }
-    }
+    apply_package_select(&mut cmd, packages);
     cmd.arg("--message-format=json");
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
@@ -591,10 +577,15 @@ mod tests {
     }
 
     #[test]
-    fn package_select_unscoped_is_workspace() {
+    fn test_packages_are_the_named_ones_unless_dependents_are_asked_for() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
         let meta = load_metadata(&root).expect("tiny metadata");
-        assert_eq!(package_select_from(&[], &meta), PackageSelect::Workspace);
+        assert!(test_packages_from(&[], false, &meta).is_empty());
+        assert!(test_packages_from(&[], true, &meta).is_empty());
+        let a = ["tiny_a".to_string()];
+        assert_eq!(test_packages_from(&a, false, &meta), a.to_vec());
+        let with_dependents = test_packages_from(&a, true, &meta);
+        assert!(with_dependents.contains(&"tiny_b".to_string()), "{with_dependents:?}");
     }
 
     #[test]

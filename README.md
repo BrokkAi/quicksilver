@@ -46,6 +46,11 @@ Or every function in a package:
 cargo quicksilver run --package my_crate
 ```
 
+With `--package`, only that package's own tests are built and run. Add
+`--reverse-dependents` to also use the tests of every workspace package that
+depends on it. For a crate low in the dependency graph, that can be most of
+the workspace's tests.
+
 Quicksilver replaces each function's body with a simple value of its return
 type, such as `0`, `true`, `None` or `Default::default()`. It prints a
 summary and a line for each missed mutant:

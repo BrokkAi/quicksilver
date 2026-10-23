@@ -97,6 +97,7 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         max_build_memory_frac: 0.7,
         max_scratch: None,
         packages: Vec::new(),
+        reverse_dependents: false,
         files: Vec::new(),
         in_diff: None,
         json: None,

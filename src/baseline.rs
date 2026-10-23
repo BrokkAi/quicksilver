@@ -39,7 +39,9 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
 pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     let target = paths.baseline.join("target");
     info!("baseline cargo build --tests (profile quicksilver)");
-    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &[], false)
+    let meta = load_metadata(&paths.baseline)?;
+    let packages = crate::cargo_cmd::test_packages(cfg, &meta);
+    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &packages, false)
 }
 
 pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>, Vec<String>)> {
@@ -63,11 +65,9 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
         cmd.arg("--config-file").arg(&config_path);
-        // Workspace suite: cargo-mutants runs everything. Timings for reverse-dep
-        // covering tests are a subset of this JUnit.
         crate::cargo_cmd::apply_package_select(
             &mut cmd,
-            &crate::cargo_cmd::PackageSelect::Workspace,
+            &crate::cargo_cmd::test_packages(cfg, &meta),
         );
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());

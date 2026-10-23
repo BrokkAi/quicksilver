@@ -2,7 +2,7 @@
 //! suite's durations attached to it.
 
 use crate::cargo_cmd::{
-    apply_build_env, apply_package_select, load_metadata, package_dir_rel, package_select,
+    apply_build_env, apply_package_select, load_metadata, package_dir_rel, test_packages,
     relative_to_target,
 };
 use crate::config::Config;
@@ -20,7 +20,7 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
     cmd.current_dir(&paths.baseline);
     apply_build_env(&mut cmd, cfg);
     cmd.args(["nextest", "list", "--message-format", "json"]);
-    apply_package_select(&mut cmd, &package_select(cfg, &meta));
+    apply_package_select(&mut cmd, &test_packages(cfg, &meta));
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
         bail!(

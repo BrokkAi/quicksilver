@@ -196,15 +196,17 @@ fn apply_all(
     Ok(applied)
 }
 
-fn build_workspace(
+/// Build the tests of `test_packages` (empty: the workspace) in `worker`.
+fn build_schema(
     cfg: &Config,
     worker: &Path,
-    target: &Path,
+    test_packages: &[String],
     builds: &AtomicU64,
 ) -> Result<crate::cargo_cmd::CapturedBuild> {
     builds.fetch_add(1, Ordering::SeqCst);
+    let target = worker.join("target");
     let progress = crate::progress::Progress::new("compiling", None, cfg.quiet);
-    let built = build_tests_captured(worker, target, cfg, &[], Some(&progress))?;
+    let built = build_tests_captured(worker, &target, cfg, test_packages, Some(&progress))?;
     progress.finish(&format!(
         "compiled {} crate(s) in {:.1}s{}",
         progress.done(),
@@ -219,16 +221,17 @@ fn build_workspace(
 }
 
 /// `isolate` from the per-crate executor, over every crate at once: build
-/// the workspace, attribute rustc errors to variants or sites, drop them,
-/// repeat. When nothing can be attributed, bisect the sites.
+/// the tests of `test_packages`, attribute rustc errors to variants or
+/// sites, drop them, repeat. When nothing can be attributed, bisect the
+/// sites.
 fn isolate_all(
     cfg: &Config,
     worker: &Path,
+    test_packages: &[String],
     originals: &HashMap<String, Vec<u8>>,
     crate_roots: &BTreeMap<String, String>,
     mut sites: Vec<Site>,
 ) -> Result<IsolatedAll> {
-    let target = worker.join("target");
     let builds = AtomicU64::new(0);
     let mut unviable = Vec::new();
     let mut dropped_sites = BTreeSet::new();
@@ -244,7 +247,7 @@ fn isolate_all(
             }
         }
         let applied = apply_all(worker, &sites, crate_roots)?;
-        let built = build_workspace(cfg, worker, &target, &builds)?;
+        let built = build_schema(cfg, worker, test_packages, &builds)?;
         if built.success {
             return Ok(IsolatedAll {
                 sites,
@@ -279,7 +282,15 @@ fn isolate_all(
             continue;
         }
         warn!("schema isolation round {round}: no attributable rustc span; bisecting");
-        let offenders = bisect_all(cfg, worker, originals, crate_roots, &sites, &builds)?;
+        let offenders = bisect_all(
+            cfg,
+            worker,
+            test_packages,
+            originals,
+            crate_roots,
+            &sites,
+            &builds,
+        )?;
         if offenders.is_empty() {
             bail!(
                 "schema build failed with no attributable site and bisection found none:\n{}",
@@ -306,18 +317,18 @@ fn first_error_for(rendered: &str, max: usize) -> String {
 fn bisect_all(
     cfg: &Config,
     worker: &Path,
+    test_packages: &[String],
     originals: &HashMap<String, Vec<u8>>,
     crate_roots: &BTreeMap<String, String>,
     sites: &[Site],
     builds: &AtomicU64,
 ) -> Result<BTreeSet<u32>> {
-    let target = worker.join("target");
     let mut remaining = sites.to_vec();
     let mut offenders = BTreeSet::new();
     while !remaining.is_empty() {
         restore_files(worker, originals)?;
         apply_all(worker, &remaining, crate_roots)?;
-        if build_workspace(cfg, worker, &target, builds)?.success {
+        if build_schema(cfg, worker, test_packages, builds)?.success {
             break;
         }
         if remaining.len() == 1 {
@@ -329,7 +340,7 @@ fn bisect_all(
         let left = remaining[..mid].to_vec();
         restore_files(worker, originals)?;
         apply_all(worker, &left, crate_roots)?;
-        if !build_workspace(cfg, worker, &target, builds)?.success {
+        if !build_schema(cfg, worker, test_packages, builds)?.success {
             remaining = left;
         } else {
             remaining = remaining[mid..].to_vec();
@@ -451,7 +462,15 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
     let commit = crate::worktree::head(&worker)?;
     let originals = read_originals(&worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
     let sites: Vec<Site> = map_sites.iter().map(identity_site).collect();
-    let isolated = isolate_all(cfg, &worker, &originals, &crate_roots, sites)?;
+    let test_packages = crate::cargo_cmd::test_packages(cfg, &meta);
+    let isolated = isolate_all(
+        cfg,
+        &worker,
+        &test_packages,
+        &originals,
+        &crate_roots,
+        sites,
+    )?;
     let kept: BTreeSet<u32> = isolated.sites.iter().map(|s| s.site_id).collect();
     let mut map_sites: Vec<MapSite> = map_sites;
     for s in &map_sites {
@@ -536,6 +555,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         sites: map_sites,
         dropped,
         crate_roots,
+        test_packages,
         tests,
         hits,
         not_green: recording.not_green.clone(),
@@ -751,7 +771,14 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
         &map.crate_roots,
     )?;
     let all_sites: Vec<Site> = sites.into_values().collect();
-    let isolated = isolate_all(cfg, &map.worker, &originals, &map.crate_roots, all_sites)?;
+    let isolated = isolate_all(
+        cfg,
+        &map.worker,
+        &map.test_packages,
+        &originals,
+        &map.crate_roots,
+        all_sites,
+    )?;
     report.builds = isolated.builds;
     let mut unviable: BTreeMap<String, String> = BTreeMap::new();
     for (id, why) in &isolated.unviable {

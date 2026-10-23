@@ -34,6 +34,8 @@ pub struct Config {
     pub max_build_memory_frac: f64,
     pub max_scratch: Option<u64>,
     pub packages: Vec<String>,
+    /// Whether tests of packages depending on `packages` cover them too.
+    pub reverse_dependents: bool,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
     pub json: Option<PathBuf>,
@@ -127,6 +129,7 @@ pub fn merge_config(
         max_build_memory_frac,
         max_scratch: cli.max_scratch,
         packages: extras.packages,
+        reverse_dependents: cli.reverse_dependents,
         files: extras.files,
         in_diff: extras.in_diff,
         json: extras.json,

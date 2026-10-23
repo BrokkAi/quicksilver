@@ -32,6 +32,12 @@ pub struct CommonOpts {
     #[arg(long = "package", short = 'p', global = true)]
     pub packages: Vec<String>,
 
+    /// With `--package`, also build and run the tests of every workspace
+    /// package that depends on one. By default only the named packages' own
+    /// tests count as covering them.
+    #[arg(long, global = true)]
+    pub reverse_dependents: bool,
+
     /// Restrict mutants to matching files (globs).
     #[arg(long = "file", global = true)]
     pub files: Vec<String>,

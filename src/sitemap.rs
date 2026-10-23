@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 2;
+pub const MAP_VERSION: u32 = 3;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -52,6 +52,9 @@ pub struct SiteMap {
     pub dropped: Vec<Dropped>,
     /// package -> crate root source file, repository-relative.
     pub crate_roots: BTreeMap<String, String>,
+    /// The packages whose tests were built and recorded; empty means the
+    /// workspace. `build` compiles the same set.
+    pub test_packages: Vec<String>,
     /// The catalogued tests with their durations under the schema binary.
     pub tests: Vec<TestInfo>,
     /// test id -> site ids the test entered with no mutant active.
@@ -389,6 +392,7 @@ mod tests {
             sites: vec![site(7, "p.entered", 10), site(8, "p.untouched", 40)],
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
+            test_packages: Vec::new(),
             tests: vec![t("p::t1")],
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
             not_green: Vec::new(),
@@ -442,6 +446,7 @@ mod tests {
             sites: Vec::new(),
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
+            test_packages: Vec::new(),
             tests: vec![t("slow", 2.0), t("fast", 0.1), t("other", 0.5)],
             hits: [
                 ("slow".to_string(), vec![1, 2]),
