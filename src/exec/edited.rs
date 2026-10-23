@@ -16,7 +16,8 @@ use crate::exec::schema::{
     SCHEMA_SLOWDOWN,
 };
 use crate::exec::test::{
-    record_site_hits, run_mutant_tests_observed, run_mutant_tests_with_env, TestRunPolicy,
+    record_site_hits, run_mutant_tests_against, run_mutant_tests_observed,
+    run_mutant_tests_with_env, TestRunPolicy, DIRECT_MUTANT_ENV,
 };
 use crate::schema::{
     apply_schema_to_tree, attribute_spans, disable_attributed, disable_sites, inject_runtime,
@@ -44,9 +45,13 @@ pub enum Status {
         message: String,
     },
     /// In the staged binaries of `generation`, switched on by `activation`.
+    /// A `direct` mutant (of an `impl Trait` function) has binaries of its
+    /// own that always contain it, in `gen-N/direct-<id>`.
     Built {
         generation: u32,
         activation: Vec<(u32, u32)>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        direct: bool,
     },
     Tested {
         verdict: Verdict,
@@ -153,6 +158,84 @@ impl State {
 /// Generation run directory: `runs/edited/gen-N`.
 fn generation_dir(paths: &Paths, generation: u32) -> PathBuf {
     paths.runs.join("edited").join(format!("gen-{generation}"))
+}
+
+/// Binaries of one directly built mutant: `runs/edited/gen-N/direct-<id>`.
+fn direct_dir(paths: &Paths, generation: u32, id: &str) -> PathBuf {
+    generation_dir(paths, generation).join(format!("direct-{id}"))
+}
+
+/// Build one mutant of an `impl Trait` function directly: its body replaces
+/// the original in the source, and every other site is as in the main
+/// generation (`main_sites`, which compiled), so a failure is the mutant's.
+/// A schema arm cannot hold such a mutant: the original body stays after the
+/// prologue, and the opaque type must be the same for every return, which a
+/// different closure or iterator adapter already breaks. Returns the test
+/// executables, or rustc's errors when the mutant does not compile.
+fn build_direct(
+    cfg: &Config,
+    map: &SiteMap,
+    originals: &HashMap<String, Vec<u8>>,
+    main_sites: &[Site],
+    edit: &crate::capture::BodyEdit,
+) -> Result<std::result::Result<Vec<BuiltExe>, String>> {
+    let site = map
+        .site(edit.site_id)
+        .with_context(|| format!("unknown site {:#x}", edit.site_id))?;
+    let (start, end) = (site.body_start_byte, site.body_end_byte);
+    let original = originals
+        .get(&edit.path)
+        .with_context(|| format!("no original text for {}", edit.path))?;
+    let text = std::str::from_utf8(original).context("source is not UTF-8")?;
+    let mut files = originals.clone();
+    files.insert(
+        edit.path.clone(),
+        format!("{}{}{}", &text[..start], edit.body, &text[end..]).into_bytes(),
+    );
+    let delta = edit.body.len() as isize - (end - start) as isize;
+    let shift = |off: usize| {
+        if off >= end {
+            (off as isize + delta) as usize
+        } else {
+            off
+        }
+    };
+    // The replaced function and anything nested in it lose their prologues;
+    // sites after it in the same file move by the change in length.
+    let sites: Vec<Site> = main_sites
+        .iter()
+        .filter(|s| !(s.path == edit.path && s.body_start_byte >= start && s.body_end_byte <= end))
+        .map(|s| {
+            let mut s = s.clone();
+            if s.path == edit.path {
+                s.fn_start_byte = shift(s.fn_start_byte);
+                s.body_start_byte = shift(s.body_start_byte);
+                s.body_end_byte = shift(s.body_end_byte);
+            }
+            s
+        })
+        .collect();
+    restore_files(&map.worker, &files)?;
+    apply_all(&map.worker, &sites, &map.crate_roots)?;
+    let built = build_schema(cfg, &map.worker, &map.test_packages, &AtomicU64::new(0))?;
+    if built.success {
+        Ok(Ok(built.executables))
+    } else {
+        Ok(Err(format!(
+            "rustc (built on its own, as an `impl Trait` function's mutant):\n{}",
+            first_error_for(&compiler_errors(&built.stdout, &built.stderr), 1500)
+        )))
+    }
+}
+
+fn first_error_for(rendered: &str, max: usize) -> String {
+    let s = rendered.trim();
+    let end = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .find(|i| *i >= max)
+        .unwrap_or(s.len());
+    s[..end].to_string()
 }
 
 fn now_rfc3339() -> String {
@@ -851,7 +934,13 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         .map(|s| (s.site_id, identity_site(s)))
         .collect();
     let mut activation: BTreeMap<String, Vec<(u32, u32)>> = BTreeMap::new();
-    for m in &set {
+    let opaque = |m: &EditedMutant| {
+        m.edits
+            .iter()
+            .any(|e| map.site(e.site_id).is_some_and(|s| s.opaque_return))
+    };
+    let direct_set: Vec<EditedMutant> = set.iter().filter(|m| opaque(m)).cloned().collect();
+    for m in set.iter().filter(|m| !opaque(m)) {
         for e in &m.edits {
             let site = sites
                 .get_mut(&e.site_id)
@@ -935,6 +1024,53 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         let _ = std::fs::remove_dir_all(generation_dir(paths, generation - 1));
     }
 
+    // Mutants of `impl Trait` functions: one build each, then the main
+    // generation's source again, so that tests which run cargo themselves
+    // build what the main binaries were built from.
+    let mut direct: BTreeSet<String> = BTreeSet::new();
+    if !direct_set.is_empty() {
+        eprintln!(
+            "building {} mutant(s) of `impl Trait` functions one at a time",
+            direct_set.len()
+        );
+        for m in &direct_set {
+            let Some(e) = m.edits.first() else { continue };
+            let tests = map.tests_entering(&[e.site_id]);
+            if tests.is_empty() {
+                // No test enters it: NotCovered at test time, no build needed.
+                direct.insert(m.id.clone());
+                continue;
+            }
+            report.builds += 1;
+            match build_direct(cfg, &map, &originals, &isolated.sites, e)? {
+                Ok(executables) => {
+                    let refs: Vec<&TestInfo> = tests.iter().collect();
+                    stage_tests(
+                        cfg,
+                        &map.worker.join("target"),
+                        &direct_dir(paths, generation, &m.id),
+                        &refs,
+                        &executables,
+                    )?;
+                    direct.insert(m.id.clone());
+                }
+                Err(why) => {
+                    unviable.insert(m.id.clone(), why);
+                }
+            }
+        }
+        restore_files(&map.worker, &originals)?;
+        apply_all(&map.worker, &isolated.sites, &map.crate_roots)?;
+        report.builds += 1;
+        let back = build_schema(cfg, &map.worker, &map.test_packages, &AtomicU64::new(0))?;
+        if !back.success {
+            bail!(
+                "the main generation no longer builds after the `impl Trait` builds:\n{}",
+                compiler_errors(&back.stdout, &back.stderr)
+            );
+        }
+    }
+
     for r in &mut state.records {
         if !set.iter().any(|m| m.id == r.mutant.id) {
             continue;
@@ -946,6 +1082,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
             None => Status::Built {
                 generation,
                 activation: activation.remove(&r.mutant.id).unwrap_or_default(),
+                direct: direct.contains(&r.mutant.id),
             },
         };
         report.results.push((r.mutant.clone(), r.status.clone()));
@@ -1029,6 +1166,10 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
     }
 }
 
+/// A mutant ready to test: its activation, and whether it was built on its
+/// own.
+type BuiltMutant = (EditedMutant, Vec<(u32, u32)>, bool);
+
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
 pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedMutant, Verdict)>> {
@@ -1043,7 +1184,7 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
     }
     let generation = state.generation;
     let run_dir = generation_dir(paths, generation);
-    let set: Vec<(EditedMutant, Vec<(u32, u32)>)> = state
+    let set: Vec<BuiltMutant> = state
         .records
         .iter()
         .filter(|r| only.is_empty() || only.iter().any(|p| r.mutant.id.starts_with(p.as_str())))
@@ -1051,7 +1192,8 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
             Status::Built {
                 generation: g,
                 activation,
-            } if *g == generation => Some((r.mutant.clone(), activation.clone())),
+                direct,
+            } if *g == generation => Some((r.mutant.clone(), activation.clone(), *direct)),
             _ => None,
         })
         .collect();
@@ -1077,7 +1219,7 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
         for _ in 0..cfg.test_jobs.max(1).min(set.len()) {
             scope.spawn(|| loop {
                 let k = next.fetch_add(1, Ordering::SeqCst);
-                let Some((m, activation)) = set.get(k) else {
+                let Some((m, activation, direct)) = set.get(k) else {
                     break;
                 };
                 let sites: Vec<u32> = m.edits.iter().map(|e| e.site_id).collect();
@@ -1097,15 +1239,27 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
                         estimated_cost_secs: tests.iter().map(|t| t.duration_secs).sum(),
                         tests,
                     };
-                    let env = vec![qs_mutants_env(activation)];
-                    match run_mutant_tests_observed(
-                        &planned,
-                        &run_dir,
-                        &map.worker,
-                        &policy,
-                        &env,
-                        false,
-                    ) {
+                    let outcome = if *direct {
+                        run_mutant_tests_against(
+                            &planned,
+                            &direct_dir(paths, generation, &m.id),
+                            Some(&run_dir),
+                            &map.worker,
+                            &policy,
+                            &[(DIRECT_MUTANT_ENV.to_string(), m.id.clone())],
+                            false,
+                        )
+                    } else {
+                        run_mutant_tests_observed(
+                            &planned,
+                            &run_dir,
+                            &map.worker,
+                            &policy,
+                            &[qs_mutants_env(activation)],
+                            false,
+                        )
+                    };
+                    match outcome {
                         Ok(run) => {
                             verdict_from(&run.outcome, &run, started.elapsed().as_secs_f64())
                         }

@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn impl_and_dyn_work() {
-        let _ = format!("{}", as_impl());
+        assert_eq!(format!("{}", as_impl()), "42");
         let _ = format!("{:?}", as_dyn());
     }
 

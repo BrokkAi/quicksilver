@@ -122,6 +122,9 @@ pub struct FnDecl {
     pub skip: bool,
     /// Empty, or a single `todo!()`-style placeholder.
     pub boring_body: bool,
+    /// The return type mentions `impl Trait`, so every return must have the
+    /// same concrete type.
+    pub opaque_return: bool,
     pub original_body: String,
 }
 
@@ -267,6 +270,7 @@ fn scan_functions(
                     const_fn: f.sig.constness.is_some(),
                     skip: has_skip(&f.attrs),
                     boring_body: boring_body(&f.block),
+                    opaque_return: returns_opaque(&f.sig.output),
                     original_body: file.source[f.body_start_byte..f.body_end_byte].to_string(),
                 });
             }
@@ -556,6 +560,22 @@ fn is_placeholder_macro(path: &syn::Path) -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+/// Whether a return type contains `impl Trait` anywhere, such as
+/// `impl Iterator` or `Option<impl Fn()>`.
+pub fn returns_opaque(output: &ReturnType) -> bool {
+    fn has_impl(tokens: proc_macro2::TokenStream) -> bool {
+        tokens.into_iter().any(|t| match t {
+            proc_macro2::TokenTree::Ident(i) => i == "impl",
+            proc_macro2::TokenTree::Group(g) => has_impl(g.stream()),
+            _ => false,
+        })
+    }
+    match output {
+        ReturnType::Default => false,
+        ReturnType::Type(_, ty) => has_impl(ty.to_token_stream()),
+    }
 }
 
 pub fn classify_return(output: &ReturnType) -> ReturnKind {

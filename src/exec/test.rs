@@ -159,8 +159,59 @@ pub fn run_mutant_tests_observed(
     extra_env: &[(String, String)],
     complete_vector: bool,
 ) -> Result<ObservedRun> {
+    run_mutant_tests_against(
+        planned,
+        run_dir,
+        None,
+        tree_root,
+        policy,
+        extra_env,
+        complete_vector,
+    )
+}
+
+/// The variable that marks a run of a directly built mutant (one whose
+/// binaries contain the mutated body with no switch). Runs without it are
+/// the confirmation runs with no mutant active.
+pub const DIRECT_MUTANT_ENV: &str = "QS_DIRECT_MUTANT";
+
+/// [`run_mutant_tests_observed`] for binaries that always contain the
+/// mutant. `null_run_dir` holds binaries of the same tests without it: the
+/// confirmation runs (a failure's null run, a timeout's calibration) use
+/// those. `extra_env` must contain [`DIRECT_MUTANT_ENV`].
+pub fn run_mutant_tests_against(
+    planned: &PlannedMutant,
+    run_dir: &Path,
+    null_run_dir: Option<&Path>,
+    tree_root: &Path,
+    policy: &TestRunPolicy,
+    extra_env: &[(String, String)],
+    complete_vector: bool,
+) -> Result<ObservedRun> {
     let tests = resolve_tests(planned, run_dir, tree_root)?;
+    let null_binary: HashMap<PathBuf, PathBuf> = match null_run_dir {
+        Some(dir) => {
+            let nulls = resolve_tests(planned, dir, tree_root)?;
+            tests
+                .iter()
+                .filter_map(|t| {
+                    nulls
+                        .iter()
+                        .find(|n| n.id == t.id && n.name == t.name)
+                        .map(|n| (t.binary.clone(), n.binary.clone()))
+                })
+                .collect()
+        }
+        None => HashMap::new(),
+    };
     let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, String)> {
+        let mut spec = spec.clone();
+        if !null_binary.is_empty() && !spec.env.iter().any(|(k, _)| k == DIRECT_MUTANT_ENV) {
+            if let Some(null) = null_binary.get(&spec.binary) {
+                spec.binary = null.clone();
+            }
+        }
+        let spec = &spec;
         if spec.capture {
             run_exact_capture_with_env(
                 &spec.binary,

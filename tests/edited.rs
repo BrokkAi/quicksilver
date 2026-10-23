@@ -220,6 +220,32 @@ fn edited_mutants_are_captured_built_and_judged() {
     ));
     fs::write(&schema_lib, &schema_original).unwrap();
 
+    // Two mutants of an `impl Trait` function with different concrete
+    // types cannot share a schema `match`; each gets a build of its own.
+    fs::write(
+        &schema_lib,
+        schema_original.replace("Display {\n    42\n}", "Display {\n    \"forty-two\"\n}"),
+    )
+    .unwrap();
+    let str_patch = repo.path().join("../impl_str.patch");
+    fs::write(&str_patch, git_diff()).unwrap();
+    fs::write(
+        &schema_lib,
+        schema_original.replace("Display {\n    42\n}", "Display {\n    43\n}"),
+    )
+    .unwrap();
+    let report = build_with(vec![str_patch], false);
+    assert_eq!(report.captured.len(), 2, "{:?}", report.captured);
+    for m in &report.captured {
+        assert!(m.fqns().ends_with(".as_impl"), "{m:?}");
+        match status_of(&report.results, m) {
+            Status::Built { direct, .. } => assert!(direct, "{m:?} is built on its own"),
+            other => panic!("{}: expected built, got {other:?}", m.edits[0].body),
+        }
+    }
+    let impl_ms = report.captured.clone();
+    fs::write(&schema_lib, &schema_original).unwrap();
+
     // An edit outside any body rejects the round, unless edits outside
     // bodies are skipped: then the body edit is kept and the comment dropped.
     edit(
@@ -288,6 +314,8 @@ fn edited_mutants_are_captured_built_and_judged() {
         (&mul_m, "add_works"),
         (&flag_m, "flag_is_true"),
         (&nested_m, "parse_pair_works"),
+        (&impl_ms[0], "impl_and_dyn_work"),
+        (&impl_ms[1], "impl_and_dyn_work"),
     ] {
         let v = verdict(m);
         assert_eq!(v.kind, VerdictKind::Caught, "{}: {v:?}", m.fqns());

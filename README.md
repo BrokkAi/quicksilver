@@ -102,7 +102,8 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    ```
 
    A body that does not compile is reported as `UNVIABLE` with the compiler's
-   message. An edit outside a body rejects the round with its file and line;
+   message. Mutants of functions that return `impl Trait` are built one at a
+   time, since each may return a different concrete type. An edit outside a body rejects the round with its file and line;
    `--skip-outside-bodies` drops such edits with a warning and keeps the rest.
 
    Repeat steps 2 and 3 for as many mutants as you like. A second mutant of

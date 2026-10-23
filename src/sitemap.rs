@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 3;
+pub const MAP_VERSION: u32 = 4;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -29,6 +29,10 @@ pub struct MapSite {
     pub body_end_byte: usize,
     pub start_line: usize,
     pub end_line: usize,
+    /// The function returns `impl Trait`: its edited mutants are built one
+    /// per build instead of as schema arms.
+    #[serde(default)]
+    pub opaque_return: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +237,7 @@ pub fn sites_from_functions(fns: &[FnDecl]) -> Result<(Vec<MapSite>, Vec<Dropped
             body_end_byte: f.body_end_byte,
             start_line: f.start_line,
             end_line: f.end_line,
+            opaque_return: f.opaque_return,
         })
         .collect();
     Ok((sites, dropped))
@@ -307,6 +312,7 @@ mod tests {
             const_fn: false,
             skip: false,
             boring_body: false,
+            opaque_return: false,
             original_body: "{}".into(),
         }
     }
@@ -355,6 +361,7 @@ mod tests {
             body_end_byte: body + 5,
             start_line: 1,
             end_line: 1,
+            opaque_return: false,
         };
         let t = |id: &str| TestInfo {
             id: id.into(),
