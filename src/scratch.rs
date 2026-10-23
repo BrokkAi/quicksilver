@@ -28,7 +28,7 @@ pub fn ensure_worker(paths: &Paths, slot: usize) -> Result<PathBuf> {
     let start = Instant::now();
     let tree = crate::worktree::ensure(&repo, &worker_name(slot), &commit)
         .with_context(|| format!("worker {slot}"))?;
-    let root = tree.join(repo.prefix.trim_end_matches('/'));
+    let root = crate::worktree::under(&tree, &repo.prefix);
     info!(
         "worker {slot}: worktree {} at {} in {:.1}s",
         root.display(),

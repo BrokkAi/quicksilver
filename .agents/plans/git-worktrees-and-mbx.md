@@ -21,9 +21,9 @@ To see it work: in a committed repository, `cargo quicksilver map` prints the wo
 
 
 - [x] (2026-10-23 17:30Z) Read mbx's managed-target, incremental and cache-result docs and the prediction code; measured fresh worktree builds on clap (34.8 s with no lookups, then 7.9 s with 162 hits); confirmed `git worktree remove` without `--force` removes a worktree whose only extra files are ignored.
-- [ ] Milestone 1: `src/worktree.rs` (git and mbx plumbing) with tests on temporary repositories.
-- [ ] Milestone 2: QS on worktrees: `Paths`, baseline, workers, cargo invocation, the edited-mutant commands, `clean`; the clone layer, `probe`, and the scratch flags removed.
-- [ ] Milestone 3: tests and README updated; the edited-mutant loop and `run` measured on clap.
+- [x] (2026-10-23 18:00Z) Milestone 1: `src/worktree.rs` with three tests on temporary repositories.
+- [x] (2026-10-23 18:40Z) Milestone 2: QS on worktrees, cargo through `mbx` with ordinary settings, originals from git, `clean`; clone layer, `probe` and scratch flags removed. Coverage paths fixed with `--remap-path-prefix` (see Surprises). Commit 7aeab29.
+- [x] (2026-10-23 19:10Z) Milestone 3: all tests pass (106 unit, 13 integration); README rewritten; on clap, `map`, `build --restore`, `test`, `run --build-jobs 3` and `clean` all work (see Artifacts).
 
 
 ## Surprises & Discoveries
@@ -40,6 +40,12 @@ To see it work: in a committed repository, `cargo quicksilver map` prints the wo
 
 - Observation: the first build of a fresh clap worktree looked nothing up ("168 unconsulted"), the second took 7.9 s with 162 hits. mbx groups its predictions of what each compilation reads by the `Cargo.lock` digest, not by path, and keys them by the exact compiler invocation. QS's earlier builds of the same commit used other flags and were bypassed, so there was nothing to predict from.
   Evidence: `mbx explain --last` in the first worktree; `crates/mbx-cache-cargo/src/lib.rs::build_identity` (identity = lockfile digest, OS, architecture). Which difference (the mold flag, the custom profile, or the target directory) mattered is not isolated.
+
+- Observation: LLVM coverage broke under mbx: every mutant came out NotCovered. mbx restored an instrumented test binary compiled in another checkout of the same content, and its coverage map named that checkout's absolute paths (`SF:/mnt/optane/tmp/tiny-probe/crate_a/src/lib.rs` in a worktree elsewhere). Building with `--remap-path-prefix=<workspace root>/=` makes coverage name workspace files by relative path (`SF:crate_a/src/lib.rs`) whichever checkout compiled them. Matching foreign absolute paths by suffix was considered and rejected: a path dependency's `src/lib.rs` would be attributed to the root crate.
+  Evidence: `llvm-cov export` on a cache-restored binary, before and after the remap; `tests/engine.rs::site_selection_matches_coverage_selection` failed before and passes after.
+
+- Observation: wall-clock times on this host are not comparable between runs. Under a load average of 75 to 110, the clap `map` took 2 min 12 s (1 min 29 s before this change, under similar load) and `build` 25 s (6 to 10 s before); a direct probe that alternated `debug = 0` and the default debuginfo on the same rebuild gave 2.9 to 15 s with no pattern. The owner: "it's a busy host my man, wall clock isn't super useful here". Comparisons should use deterministic counts: cache hits and misses, units compiled, cargo invocations.
+  Evidence: `/mnt/optane/quicksilver/local/clap-wt/*.log`; the rebuild probe's six runs (4.2, 15.0, 9.3, 3.4, 3.0, 2.9 s).
 
 - Observation: mbx rejects `--config` before the subcommand (`mbx --config ... metadata` fails), but passes cargo subcommands such as `nextest` through.
   Evidence: `error: unexpected argument '--config' found` from `mbx --config 'profile.x.inherits="dev"' metadata`; `mbx nextest --version` prints `cargo-nextest 0.9.140`.
@@ -84,7 +90,11 @@ To see it work: in a committed repository, `cargo quicksilver map` prints the wo
 ## Outcomes & Retrospective
 
 
-(to be written)
+Done. QS has no scratch root any more: its trees are git worktrees under `.git/quicksilver/`, visible in `git worktree list`, built through mbx with the user's own settings, and removed by `cargo quicksilver clean`, which tells mbx first. Several hundred lines of clone, probe and sync code are gone. The edited-mutant workflow and `run` work on clap.
+
+Not settled. Whether the new layout is faster or slower than the old one on clap is unknown: wall time on this host is too noisy, and the deterministic comparison (mbx hits and misses per build, before and after) has not been made. QS's builds capture cargo's output, so mbx's per-build summary is not in QS's logs; surfacing it would make that comparison easy. Target-unit seeding needs Cargo 1.100; until then a new worktree's first build restores every dependency through mbx's compiler wrapper, one start per unit.
+
+Lessons. Reading the cache's documentation and code answered more than the timing experiments did. The coverage failure was found by the existing coverage-versus-sites test, which is the reason to keep it.
 
 
 ## Context and Orientation
@@ -146,10 +156,33 @@ From the repository root:
 ## Artifacts and Notes
 
 
-(to be filled)
+clap v4.6.7 (`/mnt/optane/quicksilver/local/clap`), debug QS, host load average 75 to 110, 2026-10-23:
+
+    worktree /mnt/optane/quicksilver/local/clap/.git/quicksilver/main at 13f2db5072d6
+    map: 1467 sites (26 functions without a site), 1334 tests (1334 green), 973 sites entered by at least one test, 131.0s
+
+    $ git worktree list
+    /mnt/optane/quicksilver/local/clap                       13f2db50 (detached HEAD)
+    /mnt/optane/quicksilver/local/clap/.git/quicksilver/main 13f2db50 (detached HEAD)
+
+    captured mutant e1a2853eb638848c from /mnt/optane/quicksilver/local/clap: edits clap_builder.builder.arg.Arg.required
+      COMPILED e1a2853eb638848c clap_builder.builder.arg.Arg.required
+      CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by default_vals::default_ifs_arg_present_order
+
+    $ cargo quicksilver run --test-selection sites --build-jobs 3 --limit 120 -p clap_lex -p clap_complete
+    worker 1: worktree /mnt/optane/quicksilver/local/clap/.git/quicksilver/w01 at 13f2db5072d6 in 0.1s
+    outcomes: 120 total — 46 caught (0 by crash), 1 missed, 56 not covered, 16 unviable, 0 errored, 1 timeout (59 mutant builds, 5 cargo invocations)
+    (after the run, `git worktree list` shows only the checkout and main)
+
+    $ cargo quicksilver clean
+    removed /mnt/optane/quicksilver/local/clap/.git/quicksilver/main
+    (`git worktree list` shows only the checkout; `.git/quicksilver` is gone)
 
 
 ## Interfaces and Dependencies
 
 
 No new crates. `reflink-copy` stays, for `reflink_or_copy` when staging test binaries. Requires `git` and `mbx` on `PATH`, and cargo-nextest.
+
+
+Revision note (2026-10-23 19:10Z): recorded the mbx session's corrections (the incremental-bypass claim was likely wrong; two features are both called seeding), the coverage path failure and its fix, the clap transcript, the owner's note that wall time on this host is not a usable measure, and the retrospective.

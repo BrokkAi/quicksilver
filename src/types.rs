@@ -223,7 +223,7 @@ impl Paths {
         let session = main.join(crate::worktree::STATE_DIR);
         Self {
             repo_root: repo_root.to_path_buf(),
-            baseline: main.join(prefix.trim_end_matches('/')),
+            baseline: crate::worktree::under(&main, prefix),
             baseline_cov: session.join("cov-target"),
             index: session.join("index"),
             workers: worktree_root.to_path_buf(),

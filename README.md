@@ -24,20 +24,25 @@ There are two ways to use it:
   checkout. Quicksilver checks the edit, compiles it into the same switched
   build, and runs the tests that reach the edited functions.
 
-Your checkout is only ever read. Every build and test run happens in a
-scratch copy.
+Your checkout is only ever read. Every build and test run happens in a git
+worktree of your repository, built through the mbx build cache.
 
 
 ## Install
 
-You need a Rust toolchain, git, and
-[cargo-nextest](https://nexte.st), which quicksilver uses to list and time
-tests.
+You need a Rust toolchain, git, [cargo-nextest](https://nexte.st), which
+quicksilver uses to list and time tests, and
+[mbx](https://mr-boxington.jdx.dev/installation), the build cache quicksilver
+builds through.
 
 ```
 cargo install cargo-nextest
 cargo install --path .
 ```
+
+Install mbx by following its installation guide. Quicksilver runs cargo as
+`mbx build ...` itself, so `mbx setup` is not required, but it lets your own
+builds share their cache with quicksilver's.
 
 The default test selection, `coverage`, also needs the `llvm-tools`
 component. The recommended selection, `sites`, does not.
@@ -47,27 +52,32 @@ rustup component add llvm-tools
 ```
 
 
-## Set up a scratch directory
+## Where quicksilver builds
 
-Quicksilver copies your workspace into a scratch directory and builds there.
-Point it at a fast local disk with room for a few copies of your `target`
-directory. The built-in default is a path on the author's machine, so set
-one of these:
+Quicksilver tests a commit, so commit your changes first. It refuses to start
+when tracked files have uncommitted changes. Untracked files are ignored.
 
-- the `--scratch-root <dir>` flag,
-- the `QS_SCRATCH_ROOT` environment variable,
-- `scratch-root = "<dir>"` in `quicksilver.toml` at the workspace root.
+It builds in git worktrees of your repository, under `.git/quicksilver/`:
 
-Quicksilver prefers copy-on-write clones (reflinks on Btrfs and XFS, or ZFS
-clones), which make copies almost free. On other file systems it refuses to
-make plain copies unless you allow it:
+- `main` is checked out at the commit under test. It holds the baseline
+  build and quicksilver's state, in `main/.quicksilver/`.
+- `w01`, `w02` and so on are extra workers that `run` creates when it builds
+  several crates in parallel. It removes them when the run ends.
+
+`git worktree list` shows them. mbx gives each worktree its own build
+directory and fills it from its cache, so a new worktree does not compile
+from scratch.
+
+To remove everything quicksilver keeps for a repository:
 
 ```
-cargo quicksilver probe --scratch-root /fast/disk/qs
-cargo quicksilver run --scratch-root /fast/disk/qs --clone-backend copy --allow-copy
+cargo quicksilver clean
 ```
 
-`probe` reports which clone method works on your scratch disk.
+This tells mbx to drop the worktrees' build directories, then removes the
+worktrees and quicksilver's state. If you use mbx's budget settings, you can
+let it collect these build directories first with
+`mbx settings set target.evict_first .git/quicksilver`.
 
 
 ## Built-in mutants
@@ -104,7 +114,7 @@ Other commands:
 - `--json <file>` on `run`, `estimate` and `list` writes machine-readable
   results.
 - `--resume` skips mutants already decided by an earlier run in the same
-  scratch directory.
+  repository.
 
 `run` exits with 0 when no mutant was missed, and 1 when at least one was.
 
@@ -122,16 +132,16 @@ reset as often as you like, then run `test`.
 ### 1. Map the workspace
 
 ```
-cargo quicksilver map --scratch-root /fast/disk/qs
+cargo quicksilver map
 ```
 
 This builds the workspace once with a switch in every function and records
-which functions each test enters. On clap (about 1,500 functions and 1,300
-tests) it takes about a minute and a half. Run it again when the code under
-test changes, for example after a pull or a commit.
+which functions each test enters. Run it again whenever you commit or pull:
+the map belongs to one commit, and `build` refuses edits made on top of
+another.
 
-The workspace must be a git repository: quicksilver compares your edits with
-the files git tracks.
+Quicksilver compares your edits with the files git tracks, and reads the
+original text from the commit.
 
 ### 2. Edit function bodies
 
@@ -150,7 +160,7 @@ These edits are rejected:
 ### 3. Build
 
 ```
-cargo quicksilver build --scratch-root /fast/disk/qs --restore
+cargo quicksilver build --restore
 ```
 
 `build` captures your edits as one mutant and compiles every captured mutant
@@ -183,7 +193,7 @@ pending without reading the checkout.
 ### 4. Test
 
 ```
-cargo quicksilver test --scratch-root /fast/disk/qs
+cargo quicksilver test
 ```
 
 ```
@@ -217,13 +227,15 @@ particular mutants, and `--json <file>` writes the results.
 ## Configuration
 
 `quicksilver.toml` (or `.quicksilver.toml`) at the workspace root can set
-`scratch-root`, `clone-backend`, `allow-copy`, `build-jobs`, `test-jobs`, and
-a `[build-env]` table of environment variables for every build. Command-line
-flags override the file.
+`build-jobs`, `test-jobs`, and a `[build-env]` table of environment variables
+for every build. Command-line flags override the file.
+
+Builds use your workspace's ordinary dev and test profiles and your
+`RUSTFLAGS`, so they share mbx cache entries with your own builds.
 
 If your tests start `cargo` themselves (for example with trycmd or
-snapbox), they run inside the scratch copy and build there, so they see the
-mutant too.
+snapbox), they run inside quicksilver's worktree and build there, so they
+see the mutant too.
 
 
 ## Limitations

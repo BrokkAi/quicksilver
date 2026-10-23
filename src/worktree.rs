@@ -84,6 +84,17 @@ pub fn require_committed(dir: &Path) -> Result<String> {
     head(dir)
 }
 
+/// `tree` joined with a workspace prefix such as `crates/app/`, or `tree`
+/// itself for an empty prefix (`Path::join("")` would add a trailing `/`).
+pub fn under(tree: &Path, prefix: &str) -> PathBuf {
+    let prefix = prefix.trim_end_matches('/');
+    if prefix.is_empty() {
+        tree.to_path_buf()
+    } else {
+        tree.join(prefix)
+    }
+}
+
 /// Where QS's worktrees of this repository live.
 pub fn root(repo: &Repo) -> PathBuf {
     repo.common_dir.join("quicksilver")
