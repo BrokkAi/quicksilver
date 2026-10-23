@@ -99,10 +99,8 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    A body that does not compile is reported as `UNVIABLE` with the compiler's
    message. An edit outside a body is rejected with its file and line.
 
-   Repeat steps 2 and 3 for as many mutants as you like. For a second
-   mutant of a function you already edited, `cargo quicksilver capture`
-   records the edits without compiling, so several rounds share one
-   `build`.
+   Repeat steps 2 and 3 for as many mutants as you like. A second mutant of
+   a function you already edited needs its own round.
 
 4. **Test them all.**
 
@@ -115,6 +113,19 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    ```
 
    Each mutant runs only the tests that enter the functions it changed.
+
+
+## Find functions no test reaches
+
+After `map`, list every function no test enters, as `path:line name`:
+
+```
+cargo quicksilver uncovered
+```
+
+These are test gaps that need no mutants to find. Mutants there would only
+come back not covered, so write tests first. `--package` and `--file` narrow
+the list.
 
 
 ## What the results mean

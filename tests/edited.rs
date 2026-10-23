@@ -49,6 +49,15 @@ fn edited_mutants_are_captured_built_and_judged() {
             .any(|s| s.fqn.ends_with("test_only_helper")),
         "test-module functions are not sites"
     );
+    let unentered: Vec<&str> = map.unentered().iter().map(|s| s.fqn.as_str()).collect();
+    assert!(
+        unentered.iter().any(|f| f.ends_with(".uncovered")),
+        "{unentered:?}"
+    );
+    assert!(
+        !unentered.iter().any(|f| f.ends_with(".add")),
+        "{unentered:?}"
+    );
     // The generator pre-filters these; the map still has them.
     for fqn in ["as_ref", "as_impl", "as_dyn", "identity"] {
         site(fqn);
@@ -63,8 +72,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     };
     let reset = || fs::write(&lib, &original).unwrap();
     let run_build =
-        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path()), true).expect("build");
-    let capture_only = || build(&cfg, &paths, Some(repo.path()), false).expect("capture");
+        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path())).expect("build");
     let by_fqn = |captured: &[EditedMutant], name: &str| {
         captured
             .iter()
@@ -102,18 +110,16 @@ fn edited_mutants_are_captured_built_and_judged() {
 
     // Capturing the same edit again is a duplicate, not a second mutant.
     edit("    a + b\n", "    a - b\n");
-    let report = capture_only();
+    let report = run_build(true);
     assert_eq!(report.duplicates.len(), 1);
     assert!(report.captured.is_empty());
     reset();
 
-    // Two more mutants of `add` cannot share a checkout: capture one without
-    // compiling, reset, edit again, and build both at once. A body that does
-    // not type-check is unviable with rustc's reason; the rest still build.
+    // A second mutant of `add` needs its own round. A body that does not
+    // type-check is unviable with rustc's reason; the rest still build.
     edit("    a + b\n", "    a * b\n");
-    let report = capture_only();
+    let report = run_build(true);
     assert_eq!(report.captured.len(), 1);
-    assert!(report.results.is_empty(), "capture does not compile");
     let mul_m = report.captured[0].clone();
     reset();
     edit("    a + b\n", "    \"x\"\n");

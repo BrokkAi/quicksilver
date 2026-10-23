@@ -620,16 +620,11 @@ pub struct BuildReport {
 }
 
 /// Capture the checkout's edits (unless `capture_from` is `None`) as one
-/// mutant per edited function; then, with `compile`, compile every pending
-/// and untested mutant into a new generation of binaries in one build. The
-/// checkout is only read; resetting it for the next edit is the caller's job
+/// mutant per edited function, then compile every pending and untested
+/// mutant into a new generation of binaries in one build. The checkout is
+/// only read; resetting it for the next edit is the caller's job
 /// (`git checkout -- .`).
-pub fn build(
-    cfg: &Config,
-    paths: &Paths,
-    capture_from: Option<&Path>,
-    compile: bool,
-) -> Result<BuildReport> {
+pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
     let started = Instant::now();
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
@@ -691,10 +686,6 @@ pub fn build(
             }
         }
         state.save(paths)?;
-    }
-    if !compile {
-        report.secs = started.elapsed().as_secs_f64();
-        return Ok(report);
     }
 
     let set: Vec<EditedMutant> = state

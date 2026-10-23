@@ -99,12 +99,11 @@ pub enum Command {
     /// edited function, and compile every captured mutant into the schema
     /// binary in one build.
     Build(BuildArgs),
-    /// Capture the edited function bodies without compiling. Several
-    /// mutants of the same function cannot share one checkout, so capture
-    /// one, reset, edit again, and compile them all with one `build`.
-    Capture,
     /// Run each compiled mutant against the tests that enter its functions.
     Test(TestArgs),
+    /// List the functions no test enters, from the map of HEAD. `--package`
+    /// and `--file` narrow the list.
+    Uncovered,
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,

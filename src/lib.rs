@@ -48,8 +48,8 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
-        cli::Command::Capture => cmd_capture(&cli.common),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
+        cli::Command::Uncovered => cmd_uncovered(&cli.common),
         cli::Command::Clean => cmd_clean(&cli.common),
     }
 }
@@ -101,7 +101,6 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         &cfg,
         &paths,
         (!args.no_capture).then_some(checkout.as_path()),
-        true,
     )?;
     // The capture result and any rejection were printed by `build` before
     // it compiled anything.
@@ -142,18 +141,48 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     Ok(if unviable > 0 { 1 } else { 0 })
 }
 
-fn cmd_capture(common: &cli::CommonOpts) -> Result<i32> {
+fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
-    let paths = cfg.paths();
-    paths.ensure()?;
-    let checkout = cfg.repo_root.clone();
-    let report = exec::edited::build(&cfg, &paths, Some(checkout.as_path()), false)?;
-    if !report.rejected.is_empty() {
-        return Ok(2);
+    let head = worktree::head(&cfg.repo_root)?;
+    let map = exec::edited::map_at(&cfg.paths(), &head)?;
+    let files = crate::discover::file_globset(&cfg.files)?;
+    let in_scope = |s: &sitemap::MapSite| {
+        (cfg.packages.is_empty() || cfg.packages.iter().any(|p| *p == s.package))
+            && files.as_ref().is_none_or(|g| g.is_match(&s.path))
+    };
+    let total = map.sites.iter().filter(|s| in_scope(s)).count();
+    let unentered: Vec<&sitemap::MapSite> = map
+        .unentered()
+        .into_iter()
+        .filter(|s| in_scope(s))
+        .collect();
+    // The list is the command's output, on stdout; the summary is on stderr.
+    for s in &unentered {
+        println!("{}:{} {}", s.path, s.start_line, s.fqn);
     }
     eprintln!(
-        "next: reset the checkout (`git checkout -- .`) and edit again, or run `cargo quicksilver build`"
+        "{} of {} functions are entered by no test (map at {})",
+        unentered.len(),
+        total,
+        &map.commit[..12.min(map.commit.len())]
     );
+    if !map.not_green.is_empty() {
+        eprintln!(
+            "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed",
+            map.not_green.len()
+        );
+    }
+    if let Some(path) = &cfg.json {
+        let rows: Vec<serde_json::Value> = unentered
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "package": s.package, "path": s.path, "line": s.start_line, "fqn": s.fqn,
+                })
+            })
+            .collect();
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&rows)?)?;
+    }
     Ok(0)
 }
 

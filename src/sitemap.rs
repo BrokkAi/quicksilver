@@ -96,6 +96,21 @@ impl SiteMap {
         self.sites.iter().find(|s| s.site_id == id)
     }
 
+    /// Functions with a site that no green test entered, by path and line.
+    /// Functions without a site (`const fn`, skipped, nested) are not here:
+    /// the map cannot say whether tests reach them.
+    pub fn unentered(&self) -> Vec<&MapSite> {
+        let entered: std::collections::HashSet<u32> =
+            self.hits.values().flatten().copied().collect();
+        let mut out: Vec<&MapSite> = self
+            .sites
+            .iter()
+            .filter(|s| !entered.contains(&s.site_id))
+            .collect();
+        out.sort_by(|a, b| (&a.path, a.start_line).cmp(&(&b.path, b.start_line)));
+        out
+    }
+
     /// Tests that entered `site`, cheapest first, with their recorded
     /// durations.
     pub fn tests_entering(&self, sites: &[u32]) -> Vec<TestInfo> {
@@ -395,6 +410,8 @@ mod tests {
             replacement: "{ 0 }".into(),
             return_kind: "number".into(),
         };
+        let unentered: Vec<&str> = map.unentered().iter().map(|s| s.fqn.as_str()).collect();
+        assert_eq!(unentered, vec!["p.untouched"]);
         let sel = MapSelector::new(&map);
         assert!(sel.covers(&mutant("p.entered", 10)));
         assert_eq!(sel.tests_for(&mutant("p.entered", 10)).len(), 1);

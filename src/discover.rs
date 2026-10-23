@@ -327,7 +327,7 @@ fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn file_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+pub(crate) fn file_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
     if patterns.is_empty() {
         return Ok(None);
     }
