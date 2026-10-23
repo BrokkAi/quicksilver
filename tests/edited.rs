@@ -72,16 +72,21 @@ fn edited_mutants_are_captured_built_and_judged() {
         fs::write(&lib, text.replace(from, to)).unwrap();
     };
     let reset = || fs::write(&lib, &original).unwrap();
-    let build_with = |patches: Vec<std::path::PathBuf>, skip: bool| {
+    let build_full = |patches: Vec<std::path::PathBuf>, skip: bool, intents: &[(&str, &str)]| {
         let sources = CaptureSources {
             checkout: Some(repo.path().to_path_buf()),
             patches,
             options: CaptureOptions {
                 skip_outside_bodies: skip,
             },
+            intents: intents
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
         };
         build(&cfg, &paths, &sources).expect("build")
     };
+    let build_with = |patches: Vec<std::path::PathBuf>, skip: bool| build_full(patches, skip, &[]);
     let run_build = |_capture: bool| build_with(Vec::new(), false);
     let git_diff = || {
         let out = std::process::Command::new("git")
@@ -108,7 +113,14 @@ fn edited_mutants_are_captured_built_and_judged() {
         "pub fn always_ok() -> bool {\n    true\n",
         "pub fn always_ok() -> bool {\n    false\n",
     );
-    let report = run_build(true);
+    let report = build_full(
+        Vec::new(),
+        false,
+        &[
+            ("tiny_a.always_ok", "returns the opposite constant"),
+            ("crate_a/src/lib.rs:2", "subtracts instead of adding"),
+        ],
+    );
     assert!(report.rejected.is_empty(), "{:?}", report.rejected);
     assert_eq!(report.captured.len(), 4, "{:?}", report.captured);
     assert!(report.captured.iter().all(|m| m.edits.len() == 1));
@@ -117,6 +129,14 @@ fn edited_mutants_are_captured_built_and_judged() {
     let greeting_m = by_fqn(&report.captured, ".greeting");
     let uncovered_m = by_fqn(&report.captured, ".uncovered");
     let missed_m = by_fqn(&report.captured, ".always_ok");
+    assert_eq!(
+        missed_m.intent.as_deref(),
+        Some("returns the opposite constant")
+    );
+    assert_eq!(add_m.intent.as_deref(), Some("subtracts instead of adding"));
+    assert_eq!(greeting_m.intent, None);
+    assert_eq!(missed_m.edits[0].original, "{\n    true\n}");
+    assert_eq!(missed_m.edits[0].line, 9);
     for m in &report.captured {
         assert!(
             matches!(status_of(&report.results, m), Status::Built { .. }),
@@ -248,6 +268,14 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert_eq!(verdict(&uncovered_m).kind, VerdictKind::NotCovered);
     let v = verdict(&missed_m);
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
+    let shown = cargo_quicksilver::exec::edited::verdict_line(&missed_m, v);
+    assert!(
+        shown.contains("intent: returns the opposite constant")
+            && shown.contains("crate_a/src/lib.rs:9")
+            && shown.contains("-     true")
+            && shown.contains("+     false"),
+        "{shown}"
+    );
     assert!(
         v.tests_run
             .iter()

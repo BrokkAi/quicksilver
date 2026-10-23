@@ -333,6 +333,12 @@ pub struct BodyEdit {
     pub package: String,
     pub path: String,
     pub fqn: String,
+    /// The function's first line at the map's commit.
+    #[serde(default)]
+    pub line: usize,
+    /// The body at the map's commit, braces included.
+    #[serde(default)]
+    pub original: String,
     /// The new body, braces included.
     pub body: String,
 }
@@ -343,6 +349,9 @@ pub struct BodyEdit {
 pub struct EditedMutant {
     pub id: String,
     pub edits: Vec<BodyEdit>,
+    /// What the author meant the mutant to model, from `build --intents`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 impl EditedMutant {
@@ -665,6 +674,11 @@ fn capture_files(
                 package: site.package.clone(),
                 path: site.path.clone(),
                 fqn: site.fqn.clone(),
+                line: site.start_line,
+                original: original
+                    .get(site.body_start_byte..site.body_end_byte)
+                    .unwrap_or_default()
+                    .to_string(),
                 body,
             });
         }
@@ -684,6 +698,7 @@ fn capture_files(
             EditedMutant {
                 id: mutant_id(&one),
                 edits: one,
+                intent: None,
             }
         })
         .collect();
@@ -692,6 +707,53 @@ fn capture_files(
         problems,
         dropped,
     })
+}
+
+/// Attach author's notes to mutants. A key is a function's full name as QS
+/// prints it, or `path:line` with any line of the function (the path
+/// relative to the workspace or, with `prefix`, to the repository). A key
+/// that matches several mutants is not applied: guessing is how notes ended
+/// up on sibling mutants. `spans` gives each mutant's first and last line.
+/// Returns one warning per key not applied.
+pub fn attach_intents(
+    mutants: &mut [EditedMutant],
+    spans: &[(usize, usize)],
+    intents: &BTreeMap<String, String>,
+    prefix: &str,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for (key, text) in intents {
+        let by_line = key.rsplit_once(':').and_then(|(path, line)| {
+            let line: usize = line.parse().ok()?;
+            Some((path.strip_prefix(prefix).unwrap_or(path), line))
+        });
+        let hits: Vec<usize> = mutants
+            .iter()
+            .enumerate()
+            .filter(|(i, m)| {
+                m.edits.iter().any(|e| {
+                    e.fqn == *key
+                        || by_line.is_some_and(|(path, line)| {
+                            e.path == path && spans[*i].0 <= line && line <= spans[*i].1
+                        })
+                })
+            })
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [] => warnings.push(format!("intent for `{key}` matched no captured mutant")),
+            [one] => mutants[*one].intent = Some(text.clone()),
+            many => warnings.push(format!(
+                "intent for `{key}` matched {} mutants ({}); not applied",
+                many.len(),
+                many.iter()
+                    .map(|i| mutants[*i].id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+    warnings
 }
 
 /// `edited` with every change outside the function bodies undone: each
@@ -945,6 +1007,62 @@ mod tests {
         );
     }
 
+    fn mutant_at(
+        fqn: &str,
+        path: &str,
+        line: usize,
+        lines: usize,
+    ) -> (EditedMutant, (usize, usize)) {
+        let m = EditedMutant {
+            id: format!("id-{fqn}-{line}"),
+            edits: vec![BodyEdit {
+                site_id: 1,
+                package: "p".into(),
+                path: path.into(),
+                fqn: fqn.into(),
+                line,
+                original: "{}".into(),
+                body: "{ 1 }".into(),
+            }],
+            intent: None,
+        };
+        (m, (line, line + lines))
+    }
+
+    #[test]
+    fn intents_attach_by_full_name_or_line_and_skip_ambiguous_keys() {
+        let (a, a_lines) = mutant_at("k.Scope.new", "src/scope.rs", 10, 5);
+        let (b, b_lines) = mutant_at("k.SchemaVersionRegistry.new", "src/registry.rs", 40, 3);
+        let (c1, c1_lines) = mutant_at("k.twice", "src/t.rs", 1, 2);
+        let (c2, c2_lines) = mutant_at("k.twice", "src/t.rs", 1, 2);
+        let mut mutants = vec![a, b, c1, c2];
+        let spans = vec![a_lines, b_lines, c1_lines, c2_lines];
+        let intents: BTreeMap<String, String> = [
+            ("k.Scope.new", "off-by-one at the upper bound"),
+            ("src/registry.rs:42", "inverted negation"),
+            ("k.twice", "ambiguous"),
+            ("new", "a short name matches nothing"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let warnings = attach_intents(&mut mutants, &spans, &intents, "");
+        assert_eq!(
+            mutants[0].intent.as_deref(),
+            Some("off-by-one at the upper bound")
+        );
+        assert_eq!(mutants[1].intent.as_deref(), Some("inverted negation"));
+        assert_eq!(mutants[2].intent, None);
+        assert_eq!(mutants[3].intent, None);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("k.twice") && w.contains("2 mutants")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("`new`") && w.contains("no captured")));
+    }
+
     #[test]
     fn the_id_ignores_edit_order() {
         let e = |site: u32, body: &str| BodyEdit {
@@ -952,6 +1070,8 @@ mod tests {
             package: "p".into(),
             path: "src/lib.rs".into(),
             fqn: "f".into(),
+            line: 1,
+            original: "{}".into(),
             body: body.into(),
         };
         assert_eq!(

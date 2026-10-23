@@ -687,16 +687,26 @@ pub struct CaptureSources {
     pub checkout: Option<PathBuf>,
     pub patches: Vec<PathBuf>,
     pub options: CaptureOptions,
+    /// Author's notes by full function name or `path:line`, applied to the
+    /// mutants this build captures (see `capture::attach_intents`).
+    pub intents: BTreeMap<String, String>,
 }
 
-/// Record one capture's mutants as pending, and print what happened.
-/// Returns false when the capture was rejected.
-fn record_capture(
-    state: &mut State,
-    source: &str,
-    outcome: CaptureOutcome,
-    report: &mut BuildReport,
-) -> bool {
+/// Read an intents file: a JSON object from function name or `path:line`
+/// to the fault the mutant models.
+pub fn read_intents(path: &Path) -> Result<BTreeMap<String, String>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    serde_json::from_str(&text).with_context(|| {
+        format!(
+            "{} must be a JSON object mapping a function name or `path:line` to text",
+            path.display()
+        )
+    })
+}
+
+/// Print a capture's dropped edits and problems. Returns false when the
+/// capture was rejected.
+fn check_capture(source: &str, outcome: &CaptureOutcome, report: &mut BuildReport) -> bool {
     for d in &outcome.dropped {
         eprintln!("  dropped: {d}");
     }
@@ -707,9 +717,19 @@ fn record_capture(
             eprintln!("  {p}");
         }
         eprintln!("a mutant may only change function bodies outside test code; fix the edits (or pass --skip-outside-bodies) and build again");
-        report.rejected.extend(outcome.problems);
+        report.rejected.extend(outcome.problems.iter().cloned());
         return false;
     }
+    true
+}
+
+/// Record one capture's mutants as pending, and print what happened.
+fn record_capture(
+    state: &mut State,
+    source: &str,
+    outcome: CaptureOutcome,
+    report: &mut BuildReport,
+) {
     let (mut new, mut dup) = (0usize, 0usize);
     for m in outcome.mutants {
         if state.find(&m.id).is_some() {
@@ -738,7 +758,6 @@ fn record_capture(
             }
         );
     }
-    true
 }
 
 /// Capture edits from `sources` as one mutant per edited function, then
@@ -750,30 +769,54 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     let started = Instant::now();
     let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(paths)?;
-    let mut ok = true;
+    let mut captures: Vec<(String, CaptureOutcome)> = Vec::new();
     if let Some(checkout) = &sources.checkout {
         let outcome = capture_checkout(&map, checkout, sources.options)?;
-        ok &= record_capture(
-            &mut state,
-            &checkout.display().to_string(),
-            outcome,
-            &mut report,
-        );
+        captures.push((checkout.display().to_string(), outcome));
     }
     for patch in &sources.patches {
         let outcome = capture_patch(&map, &cfg.repo_root, patch, sources.options)?;
-        ok &= record_capture(
-            &mut state,
-            &patch.display().to_string(),
-            outcome,
-            &mut report,
-        );
+        captures.push((patch.display().to_string(), outcome));
+    }
+    let mut ok = true;
+    for (source, outcome) in &captures {
+        ok &= check_capture(source, outcome, &mut report);
     }
     if !ok {
         report.secs = started.elapsed().as_secs_f64();
         return Ok(report);
     }
-    if sources.checkout.is_some() || !sources.patches.is_empty() {
+    if !sources.intents.is_empty() {
+        // Intents are matched across everything this build captured, so a
+        // key naming a function that two sources edited is ambiguous.
+        let mut all: Vec<EditedMutant> = captures
+            .iter()
+            .flat_map(|(_, o)| o.mutants.iter().cloned())
+            .collect();
+        let spans: Vec<(usize, usize)> = all
+            .iter()
+            .map(|m| {
+                m.edits
+                    .first()
+                    .and_then(|e| map.site(e.site_id))
+                    .map_or((0, 0), |s| (s.start_line, s.end_line))
+            })
+            .collect();
+        for w in crate::capture::attach_intents(&mut all, &spans, &sources.intents, &map.prefix) {
+            eprintln!("  {w}");
+        }
+        let mut it = all.into_iter();
+        for (_, outcome) in &mut captures {
+            for m in &mut outcome.mutants {
+                *m = it.next().expect("same count");
+            }
+        }
+    }
+    let captured_any = !captures.is_empty();
+    for (source, outcome) in captures {
+        record_capture(&mut state, &source, outcome, &mut report);
+    }
+    if captured_any {
         state.save(paths)?;
     }
 
@@ -941,19 +984,31 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
             v.test.as_deref().unwrap_or("?"),
             if v.message.is_some() { " (crash)" } else { "" }
         ),
-        VerdictKind::Missed => format!(
-            "  MISSED      {} {} ({} tests passed: {}{})",
-            m.id,
-            m.fqns(),
-            v.tests_run.len(),
-            v.tests_run
-                .iter()
-                .take(4)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", "),
-            if v.tests_run.len() > 4 { ", ..." } else { "" }
-        ),
+        VerdictKind::Missed => {
+            let mut line = format!(
+                "  MISSED      {} {} ({} tests passed: {}{})",
+                m.id,
+                m.fqns(),
+                v.tests_run.len(),
+                v.tests_run
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if v.tests_run.len() > 4 { ", ..." } else { "" }
+            );
+            if let Some(intent) = &m.intent {
+                line.push_str(&format!("\n      intent: {intent}"));
+            }
+            for e in &m.edits {
+                line.push_str(&format!("\n      {}:{}\n", e.path, e.line));
+                line.push_str(
+                    crate::linediff::render(&e.original, &e.body, "      ").trim_end_matches('\n'),
+                );
+            }
+            line
+        }
         VerdictKind::NotCovered => format!(
             "  NOT_COVERED {} {} (no test enters these functions)",
             m.id,

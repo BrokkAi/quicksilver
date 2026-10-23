@@ -214,6 +214,12 @@ pub struct BuildArgs {
     /// rejecting the whole capture.
     #[arg(long)]
     pub skip_outside_bodies: bool,
+    /// JSON object mapping a function's full name (as QS prints it) or
+    /// `path:line` to what the mutant models, such as "off-by-one at the
+    /// upper bound". Applied to the mutants this build captures; shown with
+    /// survivors and kept in `test --json`.
+    #[arg(long, value_name = "FILE")]
+    pub intents: Option<std::path::PathBuf>,
     /// Isolation rebuilds that map rustc diagnostics back to variants.
     #[arg(long, default_value_t = 5)]
     pub schema_max_rounds: u32,

@@ -119,6 +119,12 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    Each patch is captured on its own. Concurrent `build` and `test` runs
    wait for each other.
 
+   To keep what each mutant was meant to model, pass
+   `--intents notes.json`: a JSON object from a function's full name (as
+   quicksilver prints it) or `path:line` to a note, such as
+   `{"crate_a/src/lib.rs:2": "subtracts instead of adding"}`. Survivors are
+   shown with their note and a diff of the original body.
+
 4. **Test them all.**
 
    ```

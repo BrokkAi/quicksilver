@@ -103,6 +103,10 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         options: capture::CaptureOptions {
             skip_outside_bodies: args.skip_outside_bodies,
         },
+        intents: match &args.intents {
+            Some(path) => exec::edited::read_intents(path)?,
+            None => Default::default(),
+        },
     };
     let report = exec::edited::build(&cfg, &paths, &sources)?;
     // The capture result and any rejection were printed by `build` before
@@ -198,7 +202,26 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
         eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
     }
     if let Some(path) = &cfg.json {
-        crate::util::write_atomic(path, serde_json::to_vec_pretty(&results)?)?;
+        let map = sitemap::SiteMap::load(&paths)?;
+        let rows: Vec<serde_json::Value> = results
+            .iter()
+            .map(|(m, v)| {
+                serde_json::json!({
+                    "id": m.id,
+                    "intent": m.intent,
+                    "edits": m.edits.iter().map(|e| serde_json::json!({
+                        "fqn": e.fqn, "path": e.path, "line": e.line,
+                        "original": e.original, "body": e.body,
+                    })).collect::<Vec<_>>(),
+                    "verdict": v,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "commit": map.as_ref().map(|m| m.commit.clone()),
+            "mutants": rows,
+        });
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     }
     Ok(0)
 }
