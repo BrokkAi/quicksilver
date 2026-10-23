@@ -1,5 +1,4 @@
 pub mod baseline;
-pub mod bifrost;
 pub mod capture;
 pub mod cargo_cmd;
 pub mod cli;
@@ -13,9 +12,8 @@ pub mod higher_order;
 pub mod index;
 pub mod outcome;
 pub mod plan;
-#[cfg(feature = "static-selection")]
-pub mod reach;
 pub mod report;
+pub mod scan;
 pub mod schema;
 pub mod scratch;
 pub mod sitemap;
@@ -48,7 +46,6 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Run(args) => cmd_run(&cli.common, args),
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
-        cli::Command::GraphProbe(args) => cmd_graph_probe(&cli.common, args),
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
@@ -226,90 +223,6 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     }
     if let Some(path) = &cfg.json {
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&results)?)?;
-    }
-    Ok(0)
-}
-
-#[cfg(not(feature = "static-selection"))]
-fn cmd_graph_probe(_common: &cli::CommonOpts, _args: cli::GraphProbeArgs) -> Result<i32> {
-    anyhow::bail!("graph-probe needs a build with --features static-selection")
-}
-
-#[cfg(feature = "static-selection")]
-fn cmd_graph_probe(common: &cli::CommonOpts, args: cli::GraphProbeArgs) -> Result<i32> {
-    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
-    let root = args.root.clone().unwrap_or_else(|| cfg.repo_root.clone());
-    let opened = crate::bifrost::open_workspace(&root)?;
-    eprintln!(
-        "bifrost open: {:.2}s (store {:?})",
-        opened.open_secs, opened.store_path
-    );
-    let start = std::time::Instant::now();
-    let mutants =
-        crate::discover::discover_in(&opened.workspace, &root, &engine::discover_filter(&cfg))?;
-    eprintln!(
-        "discovered {} mutants in {:.2}s",
-        mutants.len(),
-        start.elapsed().as_secs_f64()
-    );
-    let meta = crate::cargo_cmd::load_metadata(&root)?;
-    let tests = match &args.nextest_list {
-        Some(p) => {
-            let bytes = std::fs::read(p)?;
-            crate::index::parse_nextest_list(&bytes, &meta, &root.join("target"))?
-        }
-        None => Vec::new(),
-    };
-    let reach = crate::reach::ReachIndex::build(&opened.workspace, &meta, &tests)?;
-    println!("{}", serde_json::to_string_pretty(&reach.stats)?);
-    let start = std::time::Instant::now();
-    let sample = sample_mutants(&mutants, args.sample, args.sample_seed);
-    let mut complete = 0usize;
-    let mut total_tests = 0usize;
-    for m in &sample {
-        let sel = reach.select(m);
-        complete += usize::from(sel.complete);
-        total_tests += sel.tests.len();
-        println!(
-            "{:<70} complete={} reached_fns={} tests={}{}",
-            format!("{}:{}", m.path, m.fqn),
-            sel.complete,
-            sel.reached_functions,
-            sel.tests.len(),
-            sel.fallback_reason
-                .map(|r| format!(" ({r})"))
-                .unwrap_or_default()
-        );
-        for t in sel.tests.iter().take(5) {
-            println!("    {}", t.id);
-        }
-    }
-    eprintln!(
-        "selected for {} mutants in {:.2}s: {} complete, {} tests total",
-        sample.len(),
-        start.elapsed().as_secs_f64(),
-        complete,
-        total_tests
-    );
-    if let Some(path) = &cfg.json {
-        let selections: Vec<serde_json::Value> = sample
-            .iter()
-            .map(|m| {
-                let sel = reach.select(m);
-                serde_json::json!({
-                    "id": m.id, "path": m.path, "fqn": m.fqn, "start_byte": m.start_byte,
-                    "complete": sel.complete, "fallback_reason": sel.fallback_reason,
-                    "reached_functions": sel.reached_functions,
-                    "tests": sel.tests.iter().map(|t| t.id.clone()).collect::<Vec<_>>(),
-                })
-            })
-            .collect();
-        crate::util::write_atomic(
-            path,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "stats": reach.stats, "selections": selections,
-            }))?,
-        )?;
     }
     Ok(0)
 }

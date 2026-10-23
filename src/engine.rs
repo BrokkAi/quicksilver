@@ -7,7 +7,7 @@ use crate::index::{self, CoverageIndex};
 use crate::plan::{self, Plan};
 use crate::scratch::{self, CloneBackend};
 use crate::types::{BaselineReport, Mutant, Outcome, Paths};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -87,8 +87,7 @@ pub struct Prepared {
     pub baseline: BaselineReport,
     pub mutants: Vec<Mutant>,
     pub index: CoverageIndex,
-    /// Set under `--test-selection sites` (package candidates) and `static`
-    /// (Bifrost usage graph with package fallback).
+    /// Set under `--test-selection sites` (package candidates).
     pub packages: Option<Box<dyn plan::TestSelector>>,
     pub plan: Plan,
 }
@@ -116,33 +115,19 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
     };
 
-    let sites = matches!(
-        cfg.test_selection,
-        TestSelection::Sites | TestSelection::Static
-    );
+    let sites = cfg.test_selection == TestSelection::Sites;
     // Listing tests runs cargo (building the tests when the baseline build
-    // was skipped); opening Bifrost and discovery are analysis. Neither needs
-    // the other, so in `run` they overlap. `estimate` may narrow the index
-    // scope after discovery, which changes what is listed, so it lists after.
+    // was skipped); discovery is analysis. Neither needs the other, so in
+    // `run` they overlap. `estimate` may narrow the index scope after
+    // discovery, which changes what is listed, so it lists after.
     let listing = (sites && !for_estimate).then(|| {
         let (cfg, paths) = (cfg.clone(), paths.clone());
         std::thread::spawn(move || index::list_tests_plain(&cfg, &paths))
     });
-    // Under --in-diff only the changed files need analysis. Static selection
-    // walks the whole workspace's usage graph, so it still opens everything.
-    let (opened, mut mutants) = if cfg.in_diff.is_some()
-        && cfg.test_selection != TestSelection::Static
-    {
-        let mutants = crate::discover::discover_in_diff(&paths.baseline, &discover_filter(&cfg))?;
-        (None, mutants)
+    let mut mutants = if cfg.in_diff.is_some() {
+        crate::discover::discover_in_diff(&paths.baseline, &discover_filter(&cfg))?
     } else {
-        let opened = crate::bifrost::open_workspace(&paths.baseline)?;
-        let mutants = crate::discover::discover_in(
-            &opened.workspace,
-            &paths.baseline,
-            &discover_filter(&cfg),
-        )?;
-        (Some(opened), mutants)
+        crate::discover::discover(&paths.baseline, &discover_filter(&cfg))?
     };
     eprintln!("discovered {} mutants", mutants.len());
 
@@ -227,16 +212,7 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
             let meta = load_metadata(&paths.baseline)?;
             Some(Box::new(plan::PackageSelector::new(&meta, &index.tests)))
         }
-        TestSelection::Static => Some(static_selector(
-            opened
-                .as_ref()
-                .context("static selection opens the whole workspace")?,
-            &paths,
-            &mutants,
-            &index,
-        )?),
     };
-    drop(opened);
     let selector: &dyn plan::TestSelector = match &packages {
         Some(p) => p.as_ref(),
         None => &index,
@@ -259,38 +235,6 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
         packages,
         plan,
     })
-}
-
-#[cfg(feature = "static-selection")]
-fn static_selector(
-    opened: &crate::bifrost::OpenedWorkspace,
-    paths: &Paths,
-    mutants: &[Mutant],
-    index: &CoverageIndex,
-) -> Result<Box<dyn plan::TestSelector>> {
-    let meta = load_metadata(&paths.baseline)?;
-    let reach = crate::reach::ReachIndex::build(&opened.workspace, &meta, &index.tests)?;
-    let fallback = plan::PackageSelector::new(&meta, &index.tests);
-    let selector = crate::reach::StaticSelector::build(&reach, mutants, fallback);
-    let s = &selector.summary;
-    eprintln!(
-        "static selection: graph {:.1}s; {} of {} mutants complete ({} NotCovered), {} fall back; mean {:.1} of {:.1} candidate tests",
-        s.graph_secs, s.complete, s.mutants, s.not_covered, s.fallback, s.mean_selected, s.mean_candidates
-    );
-    for (why, n) in &s.fallback_reasons {
-        eprintln!("  fallback x{n}: {why}");
-    }
-    Ok(Box::new(selector))
-}
-
-#[cfg(not(feature = "static-selection"))]
-fn static_selector(
-    _opened: &crate::bifrost::OpenedWorkspace,
-    _paths: &Paths,
-    _mutants: &[Mutant],
-    _index: &CoverageIndex,
-) -> Result<Box<dyn plan::TestSelector>> {
-    anyhow::bail!("--test-selection static needs a build with --features static-selection")
 }
 
 pub fn run_schema(

@@ -660,9 +660,8 @@ pub struct SyncReport {
 
 /// Bring an existing baseline copy up to date with `repo` in place. Only
 /// files whose content differs are rewritten, so cargo's incremental state
-/// stays valid for the rest. `target/` and Bifrost's `.bifrost/cache/` are
-/// never touched; replacing the baseline would throw both away on every
-/// commit.
+/// stays valid for the rest. `target/` is never touched; replacing the
+/// baseline would throw it away on every commit.
 pub fn sync_baseline(repo: &Path, baseline: &Path) -> Result<SyncReport> {
     let mut report = SyncReport::default();
     let mut seen: HashSet<PathBuf> = HashSet::new();
@@ -715,7 +714,7 @@ pub fn sync_baseline(repo: &Path, baseline: &Path) -> Result<SyncReport> {
         .git_exclude(true)
         .filter_entry(|e| {
             let name = e.file_name();
-            name != "target" && name != ".git" && !e.path().ends_with(".bifrost/cache")
+            name != "target" && name != ".git"
         })
         .build()
         .filter_map(|e| e.ok())
@@ -1107,11 +1106,6 @@ mod tests {
         w(repo.path(), ".gitignore", "/target\n");
         materialize_baseline(repo.path(), base.path()).unwrap();
         w(base.path(), "target/debug/keep", "build state");
-        w(
-            base.path(),
-            ".bifrost/cache/bifrost_cache.db",
-            "analysis state",
-        );
         let untouched = fs::metadata(base.path().join("Cargo.toml"))
             .unwrap()
             .modified()
@@ -1130,10 +1124,6 @@ mod tests {
         assert!(base.path().join("src/new.rs").is_file());
         assert!(!base.path().join("src/gone.rs").exists());
         assert!(base.path().join("target/debug/keep").is_file());
-        assert!(base
-            .path()
-            .join(".bifrost/cache/bifrost_cache.db")
-            .is_file());
         assert!(base.path().join(".cargo/config.toml").is_file());
         assert_eq!(
             fs::metadata(base.path().join("Cargo.toml"))

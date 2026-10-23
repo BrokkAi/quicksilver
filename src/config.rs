@@ -36,9 +36,6 @@ pub enum TestSelection {
     /// One run of every candidate test under the schema binary, recording
     /// which mutation sites it enters. No instrumented build, no LLVM.
     Sites,
-    /// Bifrost's usage graph walked back from each mutated function; no
-    /// test run before mutants. Needs the `static-selection` feature.
-    Static,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

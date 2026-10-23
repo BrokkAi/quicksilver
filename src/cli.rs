@@ -48,7 +48,8 @@ pub struct CommonOpts {
     #[arg(long = "file", global = true)]
     pub files: Vec<String>,
 
-    /// Mutate only symbols `analyze_diff` reports as edited or introduced.
+    /// Mutate only functions a `git diff` touches, e.g. `HEAD^...HEAD`.
+    /// The diff's target must be what is checked out.
     #[arg(long, global = true)]
     pub in_diff: Option<String>,
 
@@ -135,25 +136,6 @@ pub enum Command {
     Build(BuildArgs),
     /// Run each compiled mutant against the tests that enter its functions.
     Test(TestArgs),
-    /// Build Bifrost's usage graph and print static test selections.
-    #[command(hide = true)]
-    GraphProbe(GraphProbeArgs),
-}
-
-#[derive(Args, Debug)]
-pub struct GraphProbeArgs {
-    /// Workspace to analyze. Defaults to the repository root.
-    #[arg(long)]
-    pub root: Option<std::path::PathBuf>,
-    /// nextest test list JSON (`cargo nextest list --message-format json`).
-    /// Without it, selections report reached functions only.
-    #[arg(long)]
-    pub nextest_list: Option<std::path::PathBuf>,
-    /// Mutants to print selections for (0 = none).
-    #[arg(long, default_value_t = 20)]
-    pub sample: usize,
-    #[arg(long, default_value_t = 1)]
-    pub sample_seed: u64,
 }
 
 #[derive(Args, Debug)]

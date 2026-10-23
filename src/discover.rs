@@ -1,17 +1,13 @@
-use crate::cargo_cmd::{load_metadata, package_for_path};
+use crate::cargo_cmd::{load_metadata, mutable_scope, MutableScope};
+use crate::scan::scan_crate;
 use crate::types::Mutant;
-use crate::util::{hex, line_col_to_offset};
-use anyhow::{Context, Result};
-use brokk_bifrost_analysis::analyzer::test_paths;
-use brokk_bifrost_analysis::{CancellationToken, CodeUnitType, Language, WorkspaceAnalyzer};
-use brokk_bifrost_tools::diff_analysis::{
-    analyze_diff_at_root, AnalyzeDiffParams, DiffAnalysisOptions, DiffCallEdges,
-};
+use crate::util::{hex, line_col_to_offset, rel_slash};
+use anyhow::{bail, Context, Result};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use quote::ToTokens;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use syn::spanned::Spanned;
 use syn::{Block, ImplItemFn, ItemFn, ReturnType, Type};
 
@@ -87,55 +83,21 @@ pub struct DiscoverFilter {
 }
 
 pub fn discover(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
-    let opened = crate::bifrost::open_workspace(root)?;
-    discover_in(&opened.workspace, root, filter)
-}
-
-pub fn discover_in(
-    workspace: &WorkspaceAnalyzer,
-    root: &Path,
-    filter: &DiscoverFilter,
-) -> Result<Vec<Mutant>> {
-    let diff_started = std::time::Instant::now();
     let diff = match &filter.in_diff {
-        Some(spec) => Some(diff_symbol_fqns(root, spec)?),
+        Some(spec) => Some(diff_lines(root, spec)?),
         None => None,
     };
-    discover_with(
-        workspace,
-        root,
-        filter,
-        diff,
-        diff_started.elapsed().as_secs_f64(),
-    )
+    expand(scan_functions(root, filter, diff.as_ref())?)
 }
 
-/// `--in-diff` discovery that analyzes only the files the diff touches,
-/// through a scoped analyzer over the shared store, instead of opening the
-/// whole workspace.
+/// `--in-diff` discovery: `discover` with the filter's diff, which selects
+/// a function when a hunk of `git diff -U0 <spec>` overlaps its lines.
 pub fn discover_in_diff(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
-    let spec = filter
+    filter
         .in_diff
         .as_deref()
         .context("discover_in_diff needs --in-diff")?;
-    let diff_started = std::time::Instant::now();
-    let diff = match git_diff_lines(root, spec)? {
-        Some(lines) => DiffSelection::Lines(lines),
-        None => diff_symbol_fqns(root, spec)?,
-    };
-    let diff_secs = diff_started.elapsed().as_secs_f64();
-    let files: Vec<std::path::PathBuf> = diff
-        .paths()
-        .into_iter()
-        .filter(|p| p.ends_with(".rs"))
-        .map(std::path::PathBuf::from)
-        .collect();
-    if files.is_empty() {
-        tracing::info!("discovery: {diff_secs:.2}s diff analysis, no changed functions");
-        return Ok(Vec::new());
-    }
-    let opened = crate::bifrost::open_files(root, &files)?;
-    discover_with(&opened.workspace, root, filter, Some(diff), diff_secs)
+    discover(root, filter)
 }
 
 /// One function with a body, as discovery sees it before any filter that
@@ -163,21 +125,14 @@ pub struct FnDecl {
     pub original_body: String,
 }
 
-/// Every function with a body in the workspace, outside test regions and
+/// Every function with a body in the workspace, outside test code and
 /// test-like paths, in mutable (non proc-macro) packages.
 pub fn scan_workspace(root: &Path, filter: &DiscoverFilter) -> Result<Vec<FnDecl>> {
-    let opened = crate::bifrost::open_workspace(root)?;
-    scan_functions(&opened.workspace, root, filter, None, 0.0)
+    scan_functions(root, filter, None)
 }
 
-fn discover_with(
-    workspace: &WorkspaceAnalyzer,
-    root: &Path,
-    filter: &DiscoverFilter,
-    diff_fqns: Option<DiffSelection>,
-    diff_secs: f64,
-) -> Result<Vec<Mutant>> {
-    let fns = scan_functions(workspace, root, filter, diff_fqns, diff_secs)?;
+/// The built-in generator: one mutant per replacement of the return kind.
+fn expand(fns: Vec<FnDecl>) -> Result<Vec<Mutant>> {
     let mut mutants = Vec::new();
     for f in &fns {
         if f.skip || f.unsafe_fn || f.const_fn || f.boring_body {
@@ -217,128 +172,111 @@ fn discover_with(
     Ok(mutants)
 }
 
+/// `tests/` and `benches/` hold test code whatever their attributes say.
+fn is_test_like_path(rel: &str) -> bool {
+    rel.split('/')
+        .any(|part| part == "tests" || part == "benches")
+}
+
+/// The scope with every path canonicalized, so it compares with the
+/// canonical paths the module walk produces.
+fn canonical_scope(scope: MutableScope) -> MutableScope {
+    let canon = |p: PathBuf| p.canonicalize().unwrap_or(p);
+    MutableScope {
+        root_dir: canon(scope.root_dir),
+        root_file: canon(scope.root_file),
+        other_targets: scope.other_targets.into_iter().map(canon).collect(),
+        proc_macro: scope.proc_macro,
+    }
+}
+
 fn scan_functions(
-    workspace: &WorkspaceAnalyzer,
     root: &Path,
     filter: &DiscoverFilter,
-    diff_fqns: Option<DiffSelection>,
-    diff_secs: f64,
+    diff: Option<&DiffSelection>,
 ) -> Result<Vec<FnDecl>> {
     let meta = load_metadata(root)?;
     let globset = file_globset(&filter.files)?;
     let scan_started = std::time::Instant::now();
-
-    let analyzer = workspace.analyzer();
-    let root_abs = std::path::PathBuf::from(meta.workspace_root.as_str());
-    let mut scopes: std::collections::HashMap<String, Option<crate::cargo_cmd::MutableScope>> =
-        std::collections::HashMap::new();
+    let root_abs = PathBuf::from(meta.workspace_root.as_str());
+    let root_abs = root_abs.canonicalize().unwrap_or(root_abs);
     let mut skipped_proc_macro: BTreeSet<String> = BTreeSet::new();
 
     let mut fns = Vec::new();
-    for unit in analyzer.all_declarations() {
-        if unit.is_synthetic() {
-            continue;
-        }
-        if unit.kind() != CodeUnitType::Function {
-            continue;
-        }
-        let rel = crate::util::rel_slash(unit.source().rel_path());
-        if !rel.ends_with(".rs") {
-            continue;
-        }
-        // Under --in-diff only the changed files matter. Checking that first
-        // keeps the per-declaration queries below (test region, package,
-        // module scope) off every other function in the workspace: on
-        // itertools in a debug build they took 8 s per commit.
-        if let Some(diff) = &diff_fqns {
-            if !diff.touches_file(&rel) {
-                continue;
-            }
-        }
-        let lang = unit
-            .source()
-            .rel_path()
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(Language::from_extension)
-            .unwrap_or(Language::None);
-        if analyzer.in_test_region(&unit) || test_paths::is_test_like_path(&rel, lang) {
-            continue;
-        }
-        let Some(package) = package_for_path(&meta, &rel) else {
-            continue;
-        };
-        let scope = scopes
-            .entry(package.clone())
-            .or_insert_with(|| crate::cargo_cmd::mutable_scope(&meta, &package));
-        let Some(scope) = scope.as_ref() else {
-            continue;
-        };
-        if scope.proc_macro {
-            skipped_proc_macro.insert(package.clone());
-            continue;
-        }
-        if !scope.contains(&root_abs.join(&rel)) {
-            continue;
-        }
+    for pkg in meta.workspace_packages() {
+        let package = pkg.name.to_string();
         if !filter.packages.is_empty() && !filter.packages.iter().any(|p| p == &package) {
             continue;
         }
-        if let Some(gs) = &globset {
-            if !gs.is_match(&rel) {
+        let Some(scope) = mutable_scope(&meta, &package) else {
+            continue;
+        };
+        if scope.proc_macro {
+            skipped_proc_macro.insert(package);
+            continue;
+        }
+        let crate_name = pkg
+            .targets
+            .iter()
+            .find(|t| t.src_path.as_std_path() == scope.root_file)
+            .map(|t| t.name.replace('-', "_"))
+            .unwrap_or_else(|| package.replace('-', "_"));
+        let scope = canonical_scope(scope);
+        for file in scan_crate(&crate_name, &scope.root_file)? {
+            let Ok(rel) = file.path.strip_prefix(&root_abs) else {
+                continue;
+            };
+            let rel = rel_slash(rel);
+            if is_test_like_path(&rel) || !scope.contains(&file.path) {
                 continue;
             }
-        }
-        let fqn = unit.fq_name();
-        let Some(range) = analyzer.ranges_of(&unit).into_iter().next() else {
-            continue;
-        };
-        if let Some(diff) = &diff_fqns {
-            if !diff.selects(&rel, &fqn, range.start_line, range.end_line) {
-                continue;
+            if let Some(diff) = diff {
+                if !diff.touches_file(&rel) {
+                    continue;
+                }
+            }
+            if let Some(gs) = &globset {
+                if !gs.is_match(&rel) {
+                    continue;
+                }
+            }
+            for f in &file.functions {
+                if f.in_test {
+                    continue;
+                }
+                if let Some(diff) = diff {
+                    if !diff.selects(&rel, f.start_line, f.end_line) {
+                        continue;
+                    }
+                }
+                if f.body_end_byte > file.source.len() || f.body_start_byte >= f.body_end_byte {
+                    continue;
+                }
+                fns.push(FnDecl {
+                    package: package.clone(),
+                    path: rel.clone(),
+                    fqn: f.fqn.clone(),
+                    start_byte: f.start_byte,
+                    end_byte: f.end_byte,
+                    start_line: f.start_line,
+                    end_line: f.end_line,
+                    body_start_byte: f.body_start_byte,
+                    body_end_byte: f.body_end_byte,
+                    return_kind: classify_return(&f.sig.output),
+                    unsafe_fn: f.sig.unsafety.is_some(),
+                    const_fn: f.sig.constness.is_some(),
+                    skip: has_skip(&f.attrs),
+                    boring_body: boring_body(&f.block),
+                    original_body: file.source[f.body_start_byte..f.body_end_byte].to_string(),
+                });
             }
         }
-        let source = match unit.source().read_to_string() {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        if range.end_byte > source.len() || range.start_byte >= range.end_byte {
-            continue;
-        }
-        let snippet = &source[range.start_byte..range.end_byte];
-        let parsed = match parse_fn(snippet) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let body_start = range.start_byte + parsed.body_start;
-        let body_end = range.start_byte + parsed.body_end;
-        if body_end > source.len() || body_start >= body_end {
-            continue;
-        }
-        fns.push(FnDecl {
-            package: package.clone(),
-            path: rel.clone(),
-            fqn: fqn.clone(),
-            start_byte: range.start_byte,
-            end_byte: range.end_byte,
-            start_line: range.start_line,
-            end_line: range.end_line,
-            body_start_byte: body_start,
-            body_end_byte: body_end,
-            return_kind: parsed.kind,
-            unsafe_fn: parsed.unsafe_fn,
-            const_fn: parsed.const_fn,
-            skip: parsed.skip,
-            boring_body: parsed.boring_body,
-            original_body: source[body_start..body_end].to_string(),
-        });
     }
     fns.sort_by(|a, b| {
         (&a.package, &a.path, a.start_byte).cmp(&(&b.package, &b.path, b.start_byte))
     });
     tracing::info!(
-        "discovery: {:.2}s diff analysis, {:.2}s declaration scan, {} functions",
-        diff_secs,
+        "discovery: {:.2}s module walk, {} functions",
         scan_started.elapsed().as_secs_f64(),
         fns.len()
     );
@@ -400,19 +338,10 @@ fn file_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
     Ok(Some(b.build()?))
 }
 
-/// Which functions a diff selects.
-enum DiffSelection {
-    /// Bifrost's diff analysis: the edited and introduced symbols, by name,
-    /// and the files they are in.
-    Symbols {
-        fqns: BTreeSet<String>,
-        paths: BTreeSet<String>,
-    },
-    /// `git diff -U0`: per changed file, the lines of the checked-out version
-    /// that the diff touches. A function is selected when its line range
-    /// overlaps one of them, as cargo-mutants does for `--in-diff`.
-    Lines(BTreeMap<String, Vec<Hunk>>),
-}
+/// Which functions a diff selects: per changed file, the lines of the
+/// checked-out version that `git diff -U0` touches. A function is selected
+/// when its line range overlaps one of them, as cargo-mutants does.
+struct DiffSelection(BTreeMap<String, Vec<Hunk>>);
 
 /// One hunk of a `-U0` diff on the new side, in 1-based lines.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -433,35 +362,25 @@ impl Hunk {
 }
 
 impl DiffSelection {
-    fn paths(&self) -> BTreeSet<String> {
-        match self {
-            DiffSelection::Symbols { paths, .. } => paths.clone(),
-            DiffSelection::Lines(files) => files.keys().cloned().collect(),
-        }
-    }
-
     fn touches_file(&self, rel: &str) -> bool {
-        let rel = rel.trim_start_matches("./");
-        match self {
-            DiffSelection::Symbols { paths, .. } => paths.contains(rel),
-            DiffSelection::Lines(files) => files.contains_key(rel),
-        }
+        self.0.contains_key(rel.trim_start_matches("./"))
     }
 
-    fn selects(&self, rel: &str, fqn: &str, start_line: usize, end_line: usize) -> bool {
-        match self {
-            DiffSelection::Symbols { fqns, .. } => fqns.contains(fqn),
-            DiffSelection::Lines(files) => files
-                .get(rel.trim_start_matches("./"))
-                .is_some_and(|hunks| hunks.iter().any(|h| h.overlaps(start_line, end_line))),
-        }
+    fn selects(&self, rel: &str, start_line: usize, end_line: usize) -> bool {
+        self.0
+            .get(rel.trim_start_matches("./"))
+            .is_some_and(|hunks| hunks.iter().any(|h| h.overlaps(start_line, end_line)))
     }
 }
 
-/// The lines a diff touches in the checked-out files, or `None` when the
-/// diff's target is not what is checked out (its line numbers would then
-/// describe other text) or git cannot produce the diff.
-fn git_diff_lines(root: &Path, spec: &str) -> Result<Option<BTreeMap<String, Vec<Hunk>>>> {
+fn diff_lines(root: &Path, spec: &str) -> Result<DiffSelection> {
+    Ok(DiffSelection(git_diff_lines(root, spec)?))
+}
+
+/// The lines a diff touches in the checked-out files. The diff's target
+/// must be what is checked out, or its line numbers would describe other
+/// text.
+fn git_diff_lines(root: &Path, spec: &str) -> Result<BTreeMap<String, Vec<Hunk>>> {
     let target = spec.split_once("...").map(|(_, target)| target);
     let out = std::process::Command::new("git")
         .args([
@@ -479,11 +398,10 @@ fn git_diff_lines(root: &Path, spec: &str) -> Result<Option<BTreeMap<String, Vec
         .output()
         .context("git diff")?;
     if !out.status.success() {
-        tracing::warn!(
-            "git diff {spec} failed ({}); using Bifrost's diff analysis",
+        bail!(
+            "git diff {spec} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        return Ok(None);
     }
     let files = parse_unified_zero(&String::from_utf8_lossy(&out.stdout));
     if let Some(target) = target {
@@ -495,14 +413,14 @@ fn git_diff_lines(root: &Path, spec: &str) -> Result<Option<BTreeMap<String, Vec
                 .status()
                 .context("git diff --quiet")?;
             if !same.success() {
-                tracing::info!(
-                    "--in-diff target {target} is not what is checked out; using Bifrost's diff analysis"
+                bail!(
+                    "--in-diff {spec}: {target} is not what is checked out in {}; check it out first",
+                    root.display()
                 );
-                return Ok(None);
             }
         }
     }
-    Ok(Some(files))
+    Ok(files)
 }
 
 /// Parse `git diff -U0` output into new-side hunks per file. Deleted files
@@ -539,44 +457,6 @@ fn parse_unified_zero(diff: &str) -> BTreeMap<String, Vec<Hunk>> {
         files.entry(file.clone()).or_default().push(hunk);
     }
     files
-}
-
-fn diff_symbol_fqns(root: &Path, spec: &str) -> Result<DiffSelection> {
-    let params = if let Some((base, target)) = spec.split_once("...") {
-        AnalyzeDiffParams {
-            base: Some(base.to_string()),
-            target: Some(target.to_string()),
-            include_tests: false,
-            call_edges: DiffCallEdges::Omit,
-        }
-    } else {
-        AnalyzeDiffParams {
-            base: Some(spec.to_string()),
-            target: None,
-            include_tests: false,
-            call_edges: DiffCallEdges::Omit,
-        }
-    };
-    let result = analyze_diff_at_root(
-        root,
-        params,
-        &DiffAnalysisOptions::default(),
-        &CancellationToken::default(),
-    )
-    .map_err(|e| anyhow::anyhow!("analyze_diff: {e}"))?;
-    let mut fqns = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    let after = result
-        .patch_symbols
-        .edited
-        .into_iter()
-        .map(|e| e.after)
-        .chain(result.patch_symbols.introduced.into_iter().map(|i| i.after));
-    for symbol in after {
-        paths.insert(symbol.path.trim_start_matches("./").replace('\\', "/"));
-        fqns.insert(symbol.fqn);
-    }
-    Ok(DiffSelection::Symbols { fqns, paths })
 }
 
 struct ParsedFn {
