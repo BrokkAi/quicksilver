@@ -231,8 +231,13 @@ fn resolve_mod_file(name: &str, attrs: &[syn::Attribute], dirs: &Dirs) -> Option
         } else {
             &dirs.child_dir
         };
-        let p = base.join(p);
-        return p.is_file().then_some(p);
+        // Canonical, like the crate scope it is compared with: a `..` path
+        // into a directory shared by several crates (bifrost's
+        // `#[path = "../../../test-support/git.rs"]`) otherwise still
+        // `starts_with` the crate's source directory, so its functions
+        // became sites in every crate that includes it, and `git cat-file`
+        // rejected the unnormalized path.
+        return base.join(p).canonicalize().ok().filter(|p| p.is_file());
     }
     let flat = dirs.child_dir.join(format!("{name}.rs"));
     if flat.is_file() {
@@ -260,19 +265,37 @@ fn path_attr(attrs: &[syn::Attribute]) -> Option<String> {
     })
 }
 
-/// `#[cfg(test)]` or `#[cfg(all(test, ...))]`: compiled only for tests.
+/// A `cfg` whose predicate implies `test`, such as `#[cfg(test)]` or
+/// `#[cfg(all(feature = "x", test))]`: compiled only for tests.
 pub fn is_cfg_test(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
-        if !a.path().is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &a.meta else {
-            return false;
-        };
-        let tokens = list.tokens.to_string();
-        let tokens = tokens.replace(' ', "");
-        tokens == "test" || tokens.starts_with("all(test,") || tokens.ends_with(",test)")
+        a.path().is_ident("cfg")
+            && a.parse_args::<syn::Meta>()
+                .is_ok_and(|m| cfg_implies_test(&m))
     })
+}
+
+/// `test` holds whenever the predicate does: `test` itself, an `all` with
+/// such a member, or an `any` whose every member is one.
+fn cfg_implies_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(p) => p.is_ident("test"),
+        syn::Meta::List(list) => {
+            let Ok(args) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            ) else {
+                return false;
+            };
+            if list.path.is_ident("all") {
+                args.iter().any(cfg_implies_test)
+            } else if list.path.is_ident("any") {
+                !args.is_empty() && args.iter().all(cfg_implies_test)
+            } else {
+                false
+            }
+        }
+        syn::Meta::NameValue(_) => false,
+    }
 }
 
 /// `#[test]`, `#[tokio::test]`, `#[bench]` and the like.
@@ -496,6 +519,9 @@ mod tests {
              #[cfg(test)] fn helper() {}\n\
              #[cfg(all(test, feature = \"x\"))] fn helper2() {}\n\
              #[cfg(any(test, feature = \"x\"))] fn not_only_test() {}\n\
+             #[cfg(any(feature = \"x\", test))] fn not_only_test2() {}\n\
+             #[cfg(any(test, all(test, unix)))] fn helper3() {}\n\
+             #[cfg(not(test))] fn not_test() {}\n\
              #[cfg(test)] mod tests { pub fn h() {} mod more; }\n\
              #[cfg(test)] impl Foo { fn x(&self) {} }\n",
         );
@@ -507,7 +533,10 @@ mod tests {
                 ("k.Foo.x".into(), true),
                 ("k.helper".into(), true),
                 ("k.helper2".into(), true),
+                ("k.helper3".into(), true),
                 ("k.not_only_test".into(), false),
+                ("k.not_only_test2".into(), false),
+                ("k.not_test".into(), false),
                 ("k.prod".into(), false),
                 ("k.t1".into(), true),
                 ("k.t2".into(), true),
@@ -552,5 +581,26 @@ mod tests {
         let files = scan_crate("k", &root.join("src/lib.rs")).unwrap();
         assert_eq!(files.len(), 2);
         assert_eq!(fqns(&files), vec![("k.a.s".into(), false)]);
+    }
+
+    /// bifrost's crates include `../../../test-support/git.rs`; the scope
+    /// check and `git cat-file` both need the path without `..`.
+    #[test]
+    fn a_path_attribute_leaving_the_crate_resolves_to_a_normalized_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(
+            root,
+            "crates/k/src/lib.rs",
+            "#[path = \"../../../shared/git.rs\"] mod git;\n",
+        );
+        write(root, "shared/git.rs", "pub fn g() {}\n");
+        let files = scan_crate("k", &root.join("crates/k/src/lib.rs")).unwrap();
+        let shared = root.canonicalize().unwrap().join("shared/git.rs");
+        assert!(
+            files.iter().any(|f| f.path == shared),
+            "{:?}",
+            files.iter().map(|f| &f.path).collect::<Vec<_>>()
+        );
     }
 }
