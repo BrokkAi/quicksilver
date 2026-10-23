@@ -156,7 +156,14 @@ pub fn apply_build_env(cmd: &mut Command, cfg: &Config) {
     cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env_remove("SCCACHE");
     // Honour the target repo's rust-toolchain.toml, not the caller's pin.
+    // `cargo quicksilver` inherits rustup's and cargo's subcommand variables.
+    // With `CARGO` set and `RUSTUP_TOOLCHAIN` removed, mbx's cargo runs a
+    // bare `rustc`, which rustup resolves from each crate's directory:
+    // workspace crates got the repo's 1.99.1 and registry crates the default
+    // 1.96.1, and the build failed with E0514.
     cmd.env_remove("RUSTUP_TOOLCHAIN");
+    cmd.env_remove("RUSTUP_TOOLCHAIN_SOURCE");
+    cmd.env_remove("CARGO");
     cmd.env_remove("CARGO_TARGET_DIR");
     for (k, v) in &cfg.build_env {
         cmd.env(k, v);
