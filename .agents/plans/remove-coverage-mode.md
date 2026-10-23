@@ -44,6 +44,10 @@ The README is rewritten around the happy path: install, commit, `run` (or `run -
   Rationale: the owner pointed out that after `map` sites mode knows, for every function, whether any test enters it. Matching map sites to mutants by the site seed (package, path, name, body start) avoids depending on site id assignment order.
   Date/Author: 2026-10-23, Claude.
 
+- Decision: `estimate` does not build a map itself. It refuses to start without a map of HEAD and tells the user to run `cargo quicksilver map`.
+  Rationale: the owner asked for this not to be implicit (2026-10-23). A map build is a full schema build and recording run; a command should not start one as a side effect.
+  Date/Author: 2026-10-23, owner.
+
 - Decision: the coupling evidence's cache key becomes the commit hash of the main worktree.
   Rationale: it was the coverage index's source hash; the commit identifies the source exactly now that QS tests commits.
   Date/Author: 2026-10-23, Claude.
@@ -111,5 +115,7 @@ Plain edits; `git revert` restores the old mode.
     impl plan::TestSelector for MapSelector<'_> { .. }
 
     // src/exec/edited.rs
-    pub fn build_map_from(cfg: &Config, paths: &Paths, baseline: &BaselineReport, tests: Vec<TestInfo>) -> Result<SiteMap>;
-    pub fn map_for_head(cfg: &Config, paths: &Paths, baseline: &BaselineReport, tests: &[TestInfo]) -> Result<SiteMap>;
+    pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Result<SiteMap>;
+    pub fn map_at(paths: &Paths, commit: &str) -> Result<SiteMap>;   // loads only; errors with "run `cargo quicksilver map` first"
+
+Revision note (2026-10-23, later): `estimate` no longer builds a map when none exists; `exec::edited::map_for_head` became `map_at`, which only loads a map of the given commit or fails with the command to run.

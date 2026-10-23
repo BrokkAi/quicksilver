@@ -81,6 +81,7 @@ pub struct CommonOpts {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Sample mutation outcomes and extrapolate exhaustive-run wall clock.
+    /// Needs a map of HEAD from `cargo quicksilver map`.
     Estimate(EstimateArgs),
     /// Execute mutants with the schema engine.
     Run(RunArgs),

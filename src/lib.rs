@@ -383,13 +383,13 @@ fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
+    // Which functions any test enters, for every mutant, comes from the map
+    // of this commit. Check for it before the long preparation.
+    let map = exec::edited::map_at(&cfg.paths(), &worktree::head(&cfg.repo_root)?)?;
     let prepared = engine::prepare(cfg, args.skip_baseline, true)?;
     if !args.skip_baseline {
         let _ = engine::maybe_preflight(&prepared)?;
     }
-    // Which functions any test enters, for every mutant, from the map of
-    // this commit (built now if there is none).
-    let map = exec::edited::map_for_head(&prepared.cfg, &prepared.paths, &prepared.tests)?;
     let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
     eprintln!(
         "running sample of {} mutants through the pipeline",

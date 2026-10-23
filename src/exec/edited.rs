@@ -390,23 +390,18 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
     build_map_from(cfg, paths, tests)
 }
 
-/// The map of HEAD: the saved one when it was built at the commit the main
-/// worktree is on, otherwise a new one from `tests`. Building one leaves
-/// the identity-only schema source in the main worktree, so the worktree is
-/// checked out clean again for whatever runs next.
-pub fn map_for_head(cfg: &Config, paths: &Paths, tests: &[TestInfo]) -> Result<SiteMap> {
-    let main = paths.main_tree();
-    let head = crate::worktree::head(&main)?;
-    if let Some(map) = SiteMap::load(paths)? {
-        if map.commit == head {
-            info!("using the map built at {}", &head[..12.min(head.len())]);
-            return Ok(map);
-        }
+/// The saved map, when it was built at `commit`. Commands that need a map
+/// never build one themselves; the user runs `cargo quicksilver map`.
+pub fn map_at(paths: &Paths, commit: &str) -> Result<SiteMap> {
+    let short = &commit[..12.min(commit.len())];
+    match SiteMap::load(paths)? {
+        Some(map) if map.commit == commit => Ok(map),
+        Some(map) => bail!(
+            "the map was built at {}, not at HEAD ({short}); run `cargo quicksilver map` first",
+            &map.commit[..12.min(map.commit.len())]
+        ),
+        None => bail!("no map for this repository; run `cargo quicksilver map` first"),
     }
-    let map = build_map_from(cfg, paths, tests.to_vec())?;
-    let repo = crate::worktree::repo_of(&main)?;
-    crate::worktree::ensure(&repo, crate::worktree::MAIN, &head)?;
-    Ok(map)
 }
 
 /// [`build_map`] for a baseline that is already checked out and built, with
