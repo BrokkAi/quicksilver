@@ -63,59 +63,74 @@ fn edited_mutants_are_captured_built_and_judged() {
     };
     let reset = || fs::write(&lib, &original).unwrap();
     let run_build =
-        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path())).expect("build");
+        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path()), true).expect("build");
+    let capture_only = || build(&cfg, &paths, Some(repo.path()), false).expect("capture");
+    let by_fqn = |captured: &[EditedMutant], name: &str| {
+        captured
+            .iter()
+            .find(|m| m.fqns().ends_with(name))
+            .unwrap_or_else(|| panic!("{name} in {captured:?}"))
+            .clone()
+    };
 
-    // One mutant, two bodies: caught by add_works or greeting_works.
+    // Four functions edited at once: four mutants, one cargo invocation.
     edit("    a + b\n", "    a - b\n");
     edit("\"hello\".into()", "\"bye\".into()");
-    let report = run_build(true);
-    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
-    let two = report.captured.clone().expect("captured");
-    assert_eq!(two.edits.len(), 2, "{two:?}");
-    assert!(two.fqns().contains("add") && two.fqns().contains("greeting"));
-    assert!(
-        matches!(status_of(&report.results, &two), Status::Built { .. }),
-        "{:?}",
-        status_of(&report.results, &two)
-    );
-    reset();
-
-    // Capturing the same edit again is a duplicate, not a second mutant.
-    edit("    a + b\n", "    a - b\n");
-    edit("\"hello\".into()", "\"bye\".into()");
-    let report = run_build(true);
-    assert!(report.duplicate);
-    reset();
-
-    // A body that does not type-check is unviable with rustc's reason.
-    edit("    a + b\n", "    \"x\"\n");
-    let report = run_build(true);
-    let bad = report.captured.clone().expect("captured");
-    match status_of(&report.results, &bad) {
-        Status::Unviable { message } => assert!(message.contains("mismatched types"), "{message}"),
-        other => panic!("expected unviable: {other:?}"),
-    }
-    // The earlier mutant is rebuilt into the new generation and stays viable.
-    assert!(matches!(
-        status_of(&report.results, &two),
-        Status::Built { .. }
-    ));
-    reset();
-
     edit("    7\n", "    8\n");
-    let report = run_build(true);
-    let uncovered_m = report.captured.clone().expect("captured");
-    reset();
     edit(
         "pub fn always_ok() -> bool {\n    true\n",
         "pub fn always_ok() -> bool {\n    false\n",
     );
     let report = run_build(true);
-    let missed_m = report.captured.clone().expect("captured");
-    assert!(matches!(
-        status_of(&report.results, &missed_m),
-        Status::Built { .. }
-    ));
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    assert_eq!(report.captured.len(), 4, "{:?}", report.captured);
+    assert!(report.captured.iter().all(|m| m.edits.len() == 1));
+    assert_eq!(report.builds, 1, "one build for all four mutants");
+    let add_m = by_fqn(&report.captured, ".add");
+    let greeting_m = by_fqn(&report.captured, ".greeting");
+    let uncovered_m = by_fqn(&report.captured, ".uncovered");
+    let missed_m = by_fqn(&report.captured, ".always_ok");
+    for m in &report.captured {
+        assert!(
+            matches!(status_of(&report.results, m), Status::Built { .. }),
+            "{}: {:?}",
+            m.fqns(),
+            status_of(&report.results, m)
+        );
+    }
+    reset();
+
+    // Capturing the same edit again is a duplicate, not a second mutant.
+    edit("    a + b\n", "    a - b\n");
+    let report = capture_only();
+    assert_eq!(report.duplicates.len(), 1);
+    assert!(report.captured.is_empty());
+    reset();
+
+    // Two more mutants of `add` cannot share a checkout: capture one without
+    // compiling, reset, edit again, and build both at once. A body that does
+    // not type-check is unviable with rustc's reason; the rest still build.
+    edit("    a + b\n", "    a * b\n");
+    let report = capture_only();
+    assert_eq!(report.captured.len(), 1);
+    assert!(report.results.is_empty(), "capture does not compile");
+    let mul_m = report.captured[0].clone();
+    reset();
+    edit("    a + b\n", "    \"x\"\n");
+    let report = run_build(true);
+    let bad = report.captured[0].clone();
+    match status_of(&report.results, &bad) {
+        Status::Unviable { message } => assert!(message.contains("mismatched types"), "{message}"),
+        other => panic!("expected unviable: {other:?}"),
+    }
+    for m in [&mul_m, &add_m, &greeting_m, &uncovered_m, &missed_m] {
+        assert!(
+            matches!(status_of(&report.results, m), Status::Built { .. }),
+            "{} stays built: {:?}",
+            m.fqns(),
+            status_of(&report.results, m)
+        );
+    }
     reset();
 
     // Signature edits and test edits are rejected, naming the place.
@@ -130,7 +145,7 @@ fn edited_mutants_are_captured_built_and_judged() {
         "{}",
         report.rejected[0]
     );
-    assert!(report.captured.is_none());
+    assert!(report.captured.is_empty());
     reset();
     edit("assert_eq!(add(2, 3), 5)", "assert_eq!(add(2, 3), 6)");
     let report = run_build(true);
@@ -162,14 +177,18 @@ fn edited_mutants_are_captured_built_and_judged() {
             .unwrap_or_else(|| panic!("verdict for {}", m.id))
             .1
     };
-    let v = verdict(&two);
-    assert_eq!(v.kind, VerdictKind::Caught, "{v:?}");
-    assert!(
-        v.test
-            .as_deref()
-            .is_some_and(|t| t.ends_with("add_works") || t.ends_with("greeting_works")),
-        "{v:?}"
-    );
+    for (m, test_name) in [
+        (&add_m, "add_works"),
+        (&greeting_m, "greeting_works"),
+        (&mul_m, "add_works"),
+    ] {
+        let v = verdict(m);
+        assert_eq!(v.kind, VerdictKind::Caught, "{}: {v:?}", m.fqns());
+        assert!(
+            v.test.as_deref().is_some_and(|t| t.ends_with(test_name)),
+            "{v:?}"
+        );
+    }
     assert_eq!(verdict(&uncovered_m).kind, VerdictKind::NotCovered);
     let v = verdict(&missed_m);
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");

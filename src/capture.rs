@@ -371,7 +371,8 @@ pub fn mutant_id(edits: &[BodyEdit]) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Capture {
-    Mutant(EditedMutant),
+    /// One mutant per edited function.
+    Mutants(Vec<EditedMutant>),
     /// No tracked file differs from the map.
     Nothing,
     /// One message per problem.
@@ -379,7 +380,9 @@ pub enum Capture {
 }
 
 /// Compare the checkout with the files the map was built from and lift the
-/// changed bodies out. Original text comes from the map's commit.
+/// changed bodies out. Original text comes from the map's commit. Each
+/// edited function becomes its own mutant, so one round of edits and one
+/// build cover many mutants.
 pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
     let head = crate::worktree::head(checkout)?;
     if head != map.commit {
@@ -473,10 +476,17 @@ pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
         return Ok(Capture::Nothing);
     }
     edits.sort_by_key(|e| (e.path.clone(), e.site_id));
-    Ok(Capture::Mutant(EditedMutant {
-        id: mutant_id(&edits),
-        edits,
-    }))
+    let mutants = edits
+        .into_iter()
+        .map(|e| {
+            let one = vec![e];
+            EditedMutant {
+                id: mutant_id(&one),
+                edits: one,
+            }
+        })
+        .collect();
+    Ok(Capture::Mutants(mutants))
 }
 
 #[cfg(test)]

@@ -75,9 +75,10 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    This builds the workspace with a switch in every function and records
    which functions each test enters.
 
-2. **Edit function bodies** in your checkout. One mutant may change several
-   bodies, in several files. Only edits inside function bodies are accepted:
-   not signatures, not new items, not test code, not new files.
+2. **Edit function bodies** in your checkout, as many as you like, in any
+   files. Each edited function becomes its own mutant. Only edits inside
+   function bodies are accepted: not signatures, not new items, not test
+   code, not new files.
 
 3. **Build the mutant, then reset the checkout.**
 
@@ -86,18 +87,22 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    git checkout -- .
    ```
 
-   `build` captures your edits and compiles them in quicksilver's own copy;
-   your checkout is only read.
+   `build` captures your edits and compiles all of them in one build, in
+   quicksilver's own copy; your checkout is only read.
 
    ```
-   captured mutant e1a2853eb638848c from /src/clap: edits clap_builder.builder.arg.Arg.required
+   captured 1 mutant(s) from /src/clap
+     e1a2853eb638848c clap_builder.builder.arg.Arg.required
      COMPILED e1a2853eb638848c clap_builder.builder.arg.Arg.required
    ```
 
    A body that does not compile is reported as `UNVIABLE` with the compiler's
    message. An edit outside a body is rejected with its file and line.
 
-   Repeat steps 2 and 3 for as many mutants as you like.
+   Repeat steps 2 and 3 for as many mutants as you like. For a second
+   mutant of a function you already edited, `cargo quicksilver capture`
+   records the edits without compiling, so several rounds share one
+   `build`.
 
 4. **Test them all.**
 
@@ -107,7 +112,6 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
 
    ```
      CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by default_vals::default_ifs_arg_present_order
-     MISSED      669557f59202647f clap_builder.builder.value_parser.FalseyValueParser.parse_ref + clap_builder.util.str_to_bool.str_to_bool (1 tests passed: flags::non_bool_type_flag)
    ```
 
    Each mutant runs only the tests that enter the functions it changed.

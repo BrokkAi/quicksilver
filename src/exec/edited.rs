@@ -606,8 +606,10 @@ fn identity_gate_map(cfg: &Config, map: &SiteMap) -> Result<()> {
 }
 
 pub struct BuildReport {
-    pub captured: Option<EditedMutant>,
-    pub duplicate: bool,
+    /// Mutants this call captured (new ones only).
+    pub captured: Vec<EditedMutant>,
+    /// Mutants this call found already captured.
+    pub duplicates: Vec<EditedMutant>,
     pub rejected: Vec<String>,
     /// Every mutant in this build's set with its status afterwards.
     pub results: Vec<(EditedMutant, Status)>,
@@ -617,11 +619,17 @@ pub struct BuildReport {
     pub discarded_records: usize,
 }
 
-/// Capture the checkout's edits (unless `capture_from` is `None`), then
-/// compile every pending and untested mutant into a new generation of
-/// binaries. The checkout is only read; resetting it for the next edit is
-/// the caller's job (`git checkout -- .`).
-pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
+/// Capture the checkout's edits (unless `capture_from` is `None`) as one
+/// mutant per edited function; then, with `compile`, compile every pending
+/// and untested mutant into a new generation of binaries in one build. The
+/// checkout is only read; resetting it for the next edit is the caller's job
+/// (`git checkout -- .`).
+pub fn build(
+    cfg: &Config,
+    paths: &Paths,
+    capture_from: Option<&Path>,
+    compile: bool,
+) -> Result<BuildReport> {
     let started = Instant::now();
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
@@ -631,8 +639,8 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
         eprintln!("discarded {discarded_records} mutant(s) captured against an earlier map");
     }
     let mut report = BuildReport {
-        captured: None,
-        duplicate: false,
+        captured: Vec::new(),
+        duplicates: Vec::new(),
         rejected: Vec::new(),
         results: Vec::new(),
         generation: state.generation,
@@ -654,32 +662,39 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
                 return Ok(report);
             }
             Capture::Nothing => eprintln!("no edits in {}", checkout.display()),
-            Capture::Mutant(m) => {
-                if state.find(&m.id).is_some() {
-                    eprintln!(
-                        "the edits in {} are mutant {} (already captured; edits {})",
-                        checkout.display(),
-                        m.id,
-                        m.fqns()
-                    );
-                    report.duplicate = true;
-                } else {
-                    eprintln!(
-                        "captured mutant {} from {}: edits {}",
-                        m.id,
-                        checkout.display(),
-                        m.fqns()
-                    );
-                    state.records.push(Record {
-                        mutant: m.clone(),
-                        status: Status::Pending,
-                        captured_at: now_rfc3339(),
-                    });
+            Capture::Mutants(mutants) => {
+                for m in mutants {
+                    if state.find(&m.id).is_some() {
+                        report.duplicates.push(m);
+                    } else {
+                        state.records.push(Record {
+                            mutant: m.clone(),
+                            status: Status::Pending,
+                            captured_at: now_rfc3339(),
+                        });
+                        report.captured.push(m);
+                    }
                 }
-                report.captured = Some(m);
+                eprintln!(
+                    "captured {} mutant(s) from {}{}",
+                    report.captured.len(),
+                    checkout.display(),
+                    if report.duplicates.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} already captured)", report.duplicates.len())
+                    }
+                );
+                for m in &report.captured {
+                    eprintln!("  {} {}", m.id, m.fqns());
+                }
             }
         }
         state.save(paths)?;
+    }
+    if !compile {
+        report.secs = started.elapsed().as_secs_f64();
+        return Ok(report);
     }
 
     let set: Vec<EditedMutant> = state

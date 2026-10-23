@@ -48,6 +48,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
+        cli::Command::Capture => cmd_capture(&cli.common),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
     }
@@ -100,6 +101,7 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         &cfg,
         &paths,
         (!args.no_capture).then_some(checkout.as_path()),
+        true,
     )?;
     // The capture result and any rejection were printed by `build` before
     // it compiled anything.
@@ -138,6 +140,21 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&state)?)?;
     }
     Ok(if unviable > 0 { 1 } else { 0 })
+}
+
+fn cmd_capture(common: &cli::CommonOpts) -> Result<i32> {
+    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
+    let paths = cfg.paths();
+    paths.ensure()?;
+    let checkout = cfg.repo_root.clone();
+    let report = exec::edited::build(&cfg, &paths, Some(checkout.as_path()), false)?;
+    if !report.rejected.is_empty() {
+        return Ok(2);
+    }
+    eprintln!(
+        "next: reset the checkout (`git checkout -- .`) and edit again, or run `cargo quicksilver build`"
+    );
+    Ok(0)
 }
 
 fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {

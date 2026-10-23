@@ -95,9 +95,14 @@ pub enum Command {
     /// Build once with a switch at every function and record which
     /// functions each test enters. `build` and `test` use the result.
     Map(MapArgs),
-    /// Capture the edited function bodies in the checkout as one mutant and
-    /// compile every captured mutant into the schema binary.
+    /// Capture the edited function bodies in the checkout, one mutant per
+    /// edited function, and compile every captured mutant into the schema
+    /// binary in one build.
     Build(BuildArgs),
+    /// Capture the edited function bodies without compiling. Several
+    /// mutants of the same function cannot share one checkout, so capture
+    /// one, reset, edit again, and compile them all with one `build`.
+    Capture,
     /// Run each compiled mutant against the tests that enter its functions.
     Test(TestArgs),
     /// Remove QS's worktrees of this repository and its state, and tell mbx
