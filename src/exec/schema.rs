@@ -955,7 +955,7 @@ fn bisect_offenders(
     Ok(offenders)
 }
 
-fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
+pub(crate) fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
     let mut tests: Vec<TestInfo> = Vec::new();
     for p in planned {
         for t in &p.tests {
@@ -970,11 +970,11 @@ fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
 /// Smoke the schema binary. The union of selected tests for a crate sample
 /// on bifrost-core is ~10k reverse-dep tests; running them all serially
 /// with `--exact` is a full-suite gate, not a schema check.
-const NULL_GATE_TESTS: usize = 8;
+pub(crate) const NULL_GATE_TESTS: usize = 8;
 
 /// Schema binaries carry a per-call dispatch check in every instrumented
 /// function, so 3× the green duration is not enough budget.
-const SCHEMA_SLOWDOWN: f64 = 3.0;
+pub(crate) const SCHEMA_SLOWDOWN: f64 = 3.0;
 
 /// Budget for mutant runs. Coverage selection only has green durations from
 /// the baseline binary, so it pads them for the schema binary and keeps a
@@ -1005,7 +1005,7 @@ fn mutant_pool_policy(cfg: &Config) -> TestRunPolicy {
     }
 }
 
-fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
+pub(crate) fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
     tests.sort_by(|a, b| {
         a.duration_secs
             .partial_cmp(&b.duration_secs)
@@ -1016,7 +1016,7 @@ fn cheapest_tests(mut tests: Vec<TestInfo>, n: usize) -> Vec<TestInfo> {
     tests
 }
 
-fn null_schema_gate(
+pub(crate) fn null_schema_gate(
     cfg: &Config,
     run_dir: &Path,
     baseline: &Path,
@@ -1214,14 +1214,6 @@ fn stage_binaries(
     sites: &[Site],
     executables: &[crate::cargo_cmd::BuiltExe],
 ) -> Result<()> {
-    if let Some(parent) = run_dir.parent() {
-        fs::create_dir_all(parent)?;
-        crate::scratch::check_free_space(parent, cfg.max_scratch)?;
-    }
-    if run_dir.exists() {
-        let _ = fs::remove_dir_all(run_dir);
-    }
-    fs::create_dir_all(run_dir)?;
     let live: BTreeSet<&str> = sites
         .iter()
         .flat_map(|s| s.variants.iter().map(|v| v.mutant_id.as_str()))
@@ -1237,6 +1229,27 @@ fn stage_binaries(
             }
         }
     }
+    stage_tests(cfg, backend, target, run_dir, &tests, executables)
+}
+
+/// Copy the test binaries `tests` need from `target` into `run_dir` and
+/// write the manifest that names each test's binary and working directory.
+pub(crate) fn stage_tests(
+    cfg: &Config,
+    backend: &dyn CloneBackend,
+    target: &Path,
+    run_dir: &Path,
+    tests: &[&TestInfo],
+    executables: &[crate::cargo_cmd::BuiltExe],
+) -> Result<()> {
+    if let Some(parent) = run_dir.parent() {
+        fs::create_dir_all(parent)?;
+        crate::scratch::check_free_space(parent, cfg.max_scratch)?;
+    }
+    if run_dir.exists() {
+        let _ = fs::remove_dir_all(run_dir);
+    }
+    fs::create_dir_all(run_dir)?;
     let mut built: Vec<crate::cargo_cmd::BuiltExe> = executables.to_vec();
     if built.is_empty() {
         built.extend(
@@ -1324,7 +1337,7 @@ fn scan_test_exes(target: &Path) -> HashMap<String, PathBuf> {
     out
 }
 
-fn rebase_to_worker(path: &Path, baseline: &Path, worker: &Path) -> PathBuf {
+pub(crate) fn rebase_to_worker(path: &Path, baseline: &Path, worker: &Path) -> PathBuf {
     if let Ok(rel) = path.strip_prefix(worker) {
         return worker.join(rel);
     }
@@ -1337,7 +1350,7 @@ fn rebase_to_worker(path: &Path, baseline: &Path, worker: &Path) -> PathBuf {
 /// The first rendered rustc errors from a `--message-format=json` build.
 /// With JSON output, diagnostics are on stdout and stderr only has cargo's
 /// "could not compile" summary, so a stderr tail hides the actual error.
-fn compiler_errors(stdout: &[u8], stderr: &[u8]) -> String {
+pub(crate) fn compiler_errors(stdout: &[u8], stderr: &[u8]) -> String {
     let mut out = String::new();
     for line in stdout.split(|b| *b == b'\n') {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
@@ -1361,7 +1374,7 @@ fn compiler_errors(stdout: &[u8], stderr: &[u8]) -> String {
     out
 }
 
-fn tail_utf8(bytes: &[u8]) -> String {
+pub(crate) fn tail_utf8(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     let n = s.len().saturating_sub(4000);
     s[n..].to_string()

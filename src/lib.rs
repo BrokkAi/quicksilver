@@ -49,7 +49,185 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
         cli::Command::GraphProbe(args) => cmd_graph_probe(&cli.common, args),
+        cli::Command::Map(args) => cmd_map(&cli.common, args),
+        cli::Command::Build(args) => cmd_build(&cli.common, args),
+        cli::Command::Test(args) => cmd_test(&cli.common, args),
     }
+}
+
+fn cmd_map(common: &cli::CommonOpts, args: cli::MapArgs) -> Result<i32> {
+    let extras = ConfigExtras {
+        schema_max_rounds: args.schema_max_rounds,
+        identity_sample: args.identity_sample,
+        ..ConfigExtras::default()
+    };
+    let (cfg, _) = engine::config_from_cli(common, extras)?;
+    let paths = cfg.paths();
+    paths.ensure()?;
+    let (backend, _) = scratch::probe_and_select(&cfg)?;
+    scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
+    let map = exec::edited::build_map(&cfg, &paths, backend)?;
+    let entered: std::collections::BTreeSet<u32> = map.hits.values().flatten().copied().collect();
+    let green = map.hits.len();
+    eprintln!(
+        "map: {} sites ({} functions without a site), {} tests ({} green), {} sites entered by at least one test, {:.1}s",
+        map.sites.len(),
+        map.dropped.len(),
+        map.tests.len(),
+        green,
+        entered.len(),
+        map.map_secs
+    );
+    eprintln!(
+        "map written to {}",
+        sitemap::SiteMap::path(&paths).display()
+    );
+    eprintln!(
+        "next: edit function bodies in {}, then run `cargo quicksilver build`",
+        cfg.repo_root.display()
+    );
+    if let Some(path) = &cfg.json {
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&map)?)?;
+    }
+    Ok(0)
+}
+
+fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
+    let extras = ConfigExtras {
+        schema_max_rounds: args.schema_max_rounds,
+        ..ConfigExtras::default()
+    };
+    let (cfg, _) = engine::config_from_cli(common, extras)?;
+    let paths = cfg.paths();
+    paths.ensure()?;
+    let (backend, _) = scratch::probe_and_select(&cfg)?;
+    let checkout = cfg.repo_root.clone();
+    let report = exec::edited::build(
+        &cfg,
+        &paths,
+        backend,
+        (!args.no_capture).then_some(checkout.as_path()),
+        args.restore,
+    )?;
+    if report.discarded_records > 0 {
+        eprintln!(
+            "discarded {} mutant(s) captured against an earlier map",
+            report.discarded_records
+        );
+    }
+    if !report.rejected.is_empty() {
+        eprintln!("the edits in {} were not captured:", checkout.display());
+        for p in &report.rejected {
+            eprintln!("  {p}");
+        }
+        eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
+        return Ok(2);
+    }
+    match &report.captured {
+        Some(m) if report.duplicate => eprintln!(
+            "the edits in {} are mutant {} (already captured; edits {})",
+            checkout.display(),
+            m.id,
+            m.fqns()
+        ),
+        Some(m) => eprintln!(
+            "captured mutant {} from {}: edits {}",
+            m.id,
+            checkout.display(),
+            m.fqns()
+        ),
+        None if !args.no_capture => eprintln!("no edits in {}", checkout.display()),
+        None => {}
+    }
+    if report.results.is_empty() {
+        eprintln!("nothing to build");
+        return Ok(0);
+    }
+    let mut unviable = 0usize;
+    for (m, status) in &report.results {
+        match status {
+            exec::edited::Status::Built { .. } => eprintln!("  COMPILED {} {}", m.id, m.fqns()),
+            exec::edited::Status::Unviable { message } => {
+                unviable += 1;
+                eprintln!("  UNVIABLE {} {}", m.id, m.fqns());
+                for line in message.lines().take(30) {
+                    eprintln!("      {line}");
+                }
+            }
+            other => eprintln!("  {:?} {} {}", other, m.id, m.fqns()),
+        }
+    }
+    eprintln!(
+        "build: {} mutant(s) compiled, {} unviable (generation {}, {} cargo invocation(s), {:.1}s)",
+        report.results.len() - unviable,
+        unviable,
+        report.generation,
+        report.builds,
+        report.secs
+    );
+    eprintln!("next: run `cargo quicksilver test`");
+    if let Some(path) = &cfg.json {
+        let state = exec::edited::State::load(&paths)?;
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&state)?)?;
+    }
+    Ok(if unviable > 0 { 1 } else { 0 })
+}
+
+fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
+    let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
+    let paths = cfg.paths();
+    paths.ensure()?;
+    let results = exec::edited::test(&cfg, &paths, &args.mutants)?;
+    if results.is_empty() {
+        eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
+    }
+    for (m, v) in &results {
+        match v.kind {
+            VerdictKind::Caught => eprintln!(
+                "  CAUGHT      {} {} by {}{}",
+                m.id,
+                m.fqns(),
+                v.test.as_deref().unwrap_or("?"),
+                if v.message.is_some() { " (crash)" } else { "" }
+            ),
+            VerdictKind::Missed => eprintln!(
+                "  MISSED      {} {} ({} tests passed: {}{})",
+                m.id,
+                m.fqns(),
+                v.tests_run.len(),
+                v.tests_run
+                    .iter()
+                    .take(4)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if v.tests_run.len() > 4 { ", ..." } else { "" }
+            ),
+            VerdictKind::NotCovered => {
+                eprintln!(
+                    "  NOT_COVERED {} {} (no test enters these functions)",
+                    m.id,
+                    m.fqns()
+                )
+            }
+            VerdictKind::Timeout => eprintln!(
+                "  TIMEOUT     {} {} in {}",
+                m.id,
+                m.fqns(),
+                v.test.as_deref().unwrap_or("?")
+            ),
+            VerdictKind::Errored | VerdictKind::Unviable => eprintln!(
+                "  ERRORED     {} {} {}",
+                m.id,
+                m.fqns(),
+                v.message.as_deref().unwrap_or("")
+            ),
+        }
+    }
+    if let Some(path) = &cfg.json {
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&results)?)?;
+    }
+    Ok(0)
 }
 
 #[cfg(not(feature = "static-selection"))]

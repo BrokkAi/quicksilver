@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 
 pub mod build;
+pub mod edited;
 pub mod process;
 pub mod schema;
 pub mod test;

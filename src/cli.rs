@@ -127,6 +127,14 @@ pub enum Command {
     Probe(ProbeArgs),
     /// Compare impact-selected verdicts to full-suite verdicts.
     AuditSelection(AuditSelectionArgs),
+    /// Build once with a switch at every function and record which
+    /// functions each test enters. `build` and `test` use the result.
+    Map(MapArgs),
+    /// Capture the edited function bodies in the checkout as one mutant and
+    /// compile every captured mutant into the schema binary.
+    Build(BuildArgs),
+    /// Run each compiled mutant against the tests that enter its functions.
+    Test(TestArgs),
     /// Build Bifrost's usage graph and print static test selections.
     #[command(hide = true)]
     GraphProbe(GraphProbeArgs),
@@ -220,6 +228,38 @@ pub struct AuditSelectionArgs {
     pub sample_seed: u64,
     #[arg(long, hide = true)]
     pub skip_baseline: bool,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct MapArgs {
+    /// Isolation rebuilds that map rustc diagnostics back to sites.
+    #[arg(long, default_value_t = 5)]
+    pub schema_max_rounds: u32,
+    /// Sites to check with the identity variant active after recording.
+    /// 0 means every entered site.
+    #[arg(long, default_value_t = 8)]
+    pub identity_sample: usize,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct BuildArgs {
+    /// Compile what is pending without reading the checkout.
+    #[arg(long)]
+    pub no_capture: bool,
+    /// After capturing, reset every captured file to the baseline's version
+    /// so the next edit starts clean.
+    #[arg(long)]
+    pub restore: bool,
+    /// Isolation rebuilds that map rustc diagnostics back to variants.
+    #[arg(long, default_value_t = 5)]
+    pub schema_max_rounds: u32,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct TestArgs {
+    /// Only mutants whose id starts with this (repeatable).
+    #[arg(long = "mutant")]
+    pub mutants: Vec<String>,
 }
 
 #[derive(Args, Debug, Default)]
