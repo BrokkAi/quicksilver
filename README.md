@@ -107,6 +107,12 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    Repeat steps 2 and 3 for as many mutants as you like. A second mutant of
    a function you already edited needs its own round.
 
+   To write mutants in several checkouts at once (for example one worktree
+   per agent, all at the mapped commit), record each one with
+   `cargo quicksilver build --capture-only`, run from that checkout, then
+   compile them all with one `cargo quicksilver build --no-capture`. Run the
+   captures one at a time.
+
 4. **Test them all.**
 
    ```

@@ -639,13 +639,8 @@ pub struct BuildReport {
     pub discarded_records: usize,
 }
 
-/// Capture the checkout's edits (unless `capture_from` is `None`) as one
-/// mutant per edited function, then compile every pending and untested
-/// mutant into a new generation of binaries in one build. The checkout is
-/// only read; resetting it for the next edit is the caller's job
-/// (`git checkout -- .`).
-pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
-    let started = Instant::now();
+/// The map, the mutant state reconciled with it, and an empty report.
+fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;
@@ -653,7 +648,7 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
     if discarded_records > 0 {
         eprintln!("discarded {discarded_records} mutant(s) captured against an earlier map");
     }
-    let mut report = BuildReport {
+    let report = BuildReport {
         captured: Vec::new(),
         duplicates: Vec::new(),
         rejected: Vec::new(),
@@ -663,47 +658,83 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
         secs: 0.0,
         discarded_records,
     };
+    Ok((map, state, report))
+}
 
+/// Record the checkout's edits as pending mutants, one per edited function,
+/// without compiling. Several checkouts or patches can be captured in turn
+/// and then compiled in one `build`.
+pub fn capture_edits(paths: &Paths, checkout: &Path) -> Result<BuildReport> {
+    let started = Instant::now();
+    let (map, mut state, mut report) = load_for_build(paths)?;
+    capture_into(&map, &mut state, checkout, &mut report)?;
+    if report.rejected.is_empty() {
+        state.save(paths)?;
+    }
+    report.secs = started.elapsed().as_secs_f64();
+    Ok(report)
+}
+
+fn capture_into(
+    map: &SiteMap,
+    state: &mut State,
+    checkout: &Path,
+    report: &mut BuildReport,
+) -> Result<()> {
+    match capture(map, checkout)? {
+        Capture::Rejected(problems) => {
+            eprintln!("the edits in {} were not captured:", checkout.display());
+            for p in &problems {
+                eprintln!("  {p}");
+            }
+            eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
+            report.rejected = problems;
+        }
+        Capture::Nothing => eprintln!("no edits in {}", checkout.display()),
+        Capture::Mutants(mutants) => {
+            for m in mutants {
+                if state.find(&m.id).is_some() {
+                    report.duplicates.push(m);
+                } else {
+                    state.records.push(Record {
+                        mutant: m.clone(),
+                        status: Status::Pending,
+                        captured_at: now_rfc3339(),
+                    });
+                    report.captured.push(m);
+                }
+            }
+            eprintln!(
+                "captured {} mutant(s) from {}{}",
+                report.captured.len(),
+                checkout.display(),
+                if report.duplicates.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} already captured)", report.duplicates.len())
+                }
+            );
+            for m in &report.captured {
+                eprintln!("  {} {}", m.id, m.fqns());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Capture the checkout's edits (unless `capture_from` is `None`) as one
+/// mutant per edited function, then compile every pending and untested
+/// mutant into a new generation of binaries in one build. The checkout is
+/// only read; resetting it for the next edit is the caller's job
+/// (`git checkout -- .`).
+pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
+    let started = Instant::now();
+    let (map, mut state, mut report) = load_for_build(paths)?;
     if let Some(checkout) = capture_from {
-        match capture(&map, checkout)? {
-            Capture::Rejected(problems) => {
-                eprintln!("the edits in {} were not captured:", checkout.display());
-                for p in &problems {
-                    eprintln!("  {p}");
-                }
-                eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
-                report.rejected = problems;
-                report.secs = started.elapsed().as_secs_f64();
-                return Ok(report);
-            }
-            Capture::Nothing => eprintln!("no edits in {}", checkout.display()),
-            Capture::Mutants(mutants) => {
-                for m in mutants {
-                    if state.find(&m.id).is_some() {
-                        report.duplicates.push(m);
-                    } else {
-                        state.records.push(Record {
-                            mutant: m.clone(),
-                            status: Status::Pending,
-                            captured_at: now_rfc3339(),
-                        });
-                        report.captured.push(m);
-                    }
-                }
-                eprintln!(
-                    "captured {} mutant(s) from {}{}",
-                    report.captured.len(),
-                    checkout.display(),
-                    if report.duplicates.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" ({} already captured)", report.duplicates.len())
-                    }
-                );
-                for m in &report.captured {
-                    eprintln!("  {} {}", m.id, m.fqns());
-                }
-            }
+        capture_into(&map, &mut state, checkout, &mut report)?;
+        if !report.rejected.is_empty() {
+            report.secs = started.elapsed().as_secs_f64();
+            return Ok(report);
         }
         state.save(paths)?;
     }

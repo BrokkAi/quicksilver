@@ -1,7 +1,7 @@
 mod support;
 
 use cargo_quicksilver::capture::EditedMutant;
-use cargo_quicksilver::exec::edited::{build, build_map, test, Status};
+use cargo_quicksilver::exec::edited::{build, build_map, capture_edits, test, Status};
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 use std::path::Path;
@@ -115,11 +115,15 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(report.captured.is_empty());
     reset();
 
-    // A second mutant of `add` needs its own round. A body that does not
-    // type-check is unviable with rustc's reason; the rest still build.
+    // A second mutant of `add` needs its own round. Capturing it alone
+    // compiles nothing; the next build compiles it with the rest. A body
+    // that does not type-check is unviable with rustc's reason; the rest
+    // still build.
     edit("    a + b\n", "    a * b\n");
-    let report = run_build(true);
+    let report = capture_edits(&paths, repo.path()).expect("capture");
     assert_eq!(report.captured.len(), 1);
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert_eq!(report.builds, 0);
     let mul_m = report.captured[0].clone();
     reset();
     edit("    a + b\n", "    \"x\"\n");

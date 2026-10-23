@@ -203,8 +203,13 @@ pub struct MapArgs {
 #[derive(Args, Debug, Default)]
 pub struct BuildArgs {
     /// Compile what is pending without reading the checkout.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "capture_only")]
     pub no_capture: bool,
+    /// Record the checkout's edits as pending mutants and stop. Capture
+    /// several checkouts or patches in turn, then compile them all with one
+    /// `build --no-capture`.
+    #[arg(long)]
+    pub capture_only: bool,
     /// Isolation rebuilds that map rustc diagnostics back to variants.
     #[arg(long, default_value_t = 5)]
     pub schema_max_rounds: u32,

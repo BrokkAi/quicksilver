@@ -97,6 +97,10 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     let paths = cfg.paths();
     paths.ensure()?;
     let checkout = cfg.repo_root.clone();
+    if args.capture_only {
+        let report = exec::edited::capture_edits(&paths, &checkout)?;
+        return Ok(if report.rejected.is_empty() { 0 } else { 2 });
+    }
     let report = exec::edited::build(
         &cfg,
         &paths,
