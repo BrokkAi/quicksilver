@@ -96,22 +96,28 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    quicksilver's own copy; your checkout is only read.
 
    ```
-   captured 1 mutant(s) from /src/clap
      e1a2853eb638848c clap_builder.builder.arg.Arg.required
+   captured 1 mutant(s) from /src/clap
      COMPILED e1a2853eb638848c clap_builder.builder.arg.Arg.required
    ```
 
    A body that does not compile is reported as `UNVIABLE` with the compiler's
-   message. An edit outside a body is rejected with its file and line.
+   message. An edit outside a body rejects the round with its file and line;
+   `--skip-outside-bodies` drops such edits with a warning and keeps the rest.
 
    Repeat steps 2 and 3 for as many mutants as you like. A second mutant of
    a function you already edited needs its own round.
 
-   To write mutants in several checkouts at once (for example one worktree
-   per agent, all at the mapped commit), record each one with
-   `cargo quicksilver build --capture-only`, run from that checkout, then
-   compile them all with one `cargo quicksilver build --no-capture`. Run the
-   captures one at a time.
+   Several authors can work at once, for example one agent per worktree at
+   the mapped commit. Collect each one's edits as a patch (`git diff`) and
+   build them all at once, with no checkout to apply them to:
+
+   ```
+   cargo quicksilver build --patch lane1.patch --patch lane2.patch
+   ```
+
+   Each patch is captured on its own. Concurrent `build` and `test` runs
+   wait for each other.
 
 4. **Test them all.**
 

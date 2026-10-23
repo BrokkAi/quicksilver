@@ -1,7 +1,8 @@
 mod support;
 
+use cargo_quicksilver::capture::CaptureOptions;
 use cargo_quicksilver::capture::EditedMutant;
-use cargo_quicksilver::exec::edited::{build, build_map, capture_edits, test, Status};
+use cargo_quicksilver::exec::edited::{build, build_map, test, CaptureSources, Status};
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 use std::path::Path;
@@ -71,8 +72,26 @@ fn edited_mutants_are_captured_built_and_judged() {
         fs::write(&lib, text.replace(from, to)).unwrap();
     };
     let reset = || fs::write(&lib, &original).unwrap();
-    let run_build =
-        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path())).expect("build");
+    let build_with = |patches: Vec<std::path::PathBuf>, skip: bool| {
+        let sources = CaptureSources {
+            checkout: Some(repo.path().to_path_buf()),
+            patches,
+            options: CaptureOptions {
+                skip_outside_bodies: skip,
+            },
+        };
+        build(&cfg, &paths, &sources).expect("build")
+    };
+    let run_build = |_capture: bool| build_with(Vec::new(), false);
+    let git_diff = || {
+        let out = std::process::Command::new("git")
+            .args(["diff"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        out.stdout
+    };
     let by_fqn = |captured: &[EditedMutant], name: &str| {
         captured
             .iter()
@@ -115,20 +134,28 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(report.captured.is_empty());
     reset();
 
-    // A second mutant of `add` needs its own round. Capturing it alone
-    // compiles nothing; the next build compiles it with the rest. A body
-    // that does not type-check is unviable with rustc's reason; the rest
-    // still build.
+    // Two more mutants of `add` in one build: one from a patch (with no
+    // checkout to apply it to), one from the checkout. A body that does not
+    // type-check is unviable with rustc's reason; the rest still build.
     edit("    a + b\n", "    a * b\n");
-    let report = capture_edits(&paths, repo.path()).expect("capture");
-    assert_eq!(report.captured.len(), 1);
-    assert!(report.results.is_empty(), "{:?}", report.results);
-    assert_eq!(report.builds, 0);
-    let mul_m = report.captured[0].clone();
+    let patch = repo.path().join("../mul.patch");
+    fs::write(&patch, git_diff()).unwrap();
     reset();
     edit("    a + b\n", "    \"x\"\n");
-    let report = run_build(true);
-    let bad = report.captured[0].clone();
+    let report = build_with(vec![patch.clone()], false);
+    assert_eq!(report.captured.len(), 2, "{:?}", report.captured);
+    let mul_m = report
+        .captured
+        .iter()
+        .find(|m| m.edits[0].body.contains("a * b"))
+        .expect("the patch's mutant")
+        .clone();
+    let bad = report
+        .captured
+        .iter()
+        .find(|m| m.edits[0].body.contains("\"x\""))
+        .expect("the checkout's mutant")
+        .clone();
     match status_of(&report.results, &bad) {
         Status::Unviable { message } => assert!(message.contains("mismatched types"), "{message}"),
         other => panic!("expected unviable: {other:?}"),
@@ -141,6 +168,24 @@ fn edited_mutants_are_captured_built_and_judged() {
             status_of(&report.results, m)
         );
     }
+    reset();
+
+    // An edit outside any body rejects the round, unless edits outside
+    // bodies are skipped: then the body edit is kept and the comment dropped.
+    edit(
+        "pub fn flag() -> bool {\n    true\n",
+        "pub fn flag() -> bool {\n    false\n",
+    );
+    edit("pub fn flag()", "// a note an agent added\npub fn flag()");
+    let report = run_build(true);
+    assert!(!report.rejected.is_empty());
+    assert!(report.captured.is_empty());
+    let report = build_with(Vec::new(), true);
+    assert!(report.rejected.is_empty(), "{:?}", report.rejected);
+    assert_eq!(report.dropped.len(), 1, "{:?}", report.dropped);
+    assert_eq!(report.captured.len(), 1, "{:?}", report.captured);
+    let flag_m = report.captured[0].clone();
+    assert!(flag_m.fqns().ends_with(".flag"), "{flag_m:?}");
     reset();
 
     // Signature edits and test edits are rejected, naming the place.
@@ -191,6 +236,7 @@ fn edited_mutants_are_captured_built_and_judged() {
         (&add_m, "add_works"),
         (&greeting_m, "greeting_works"),
         (&mul_m, "add_works"),
+        (&flag_m, "flag_is_true"),
     ] {
         let v = verdict(m);
         assert_eq!(v.kind, VerdictKind::Caught, "{}: {v:?}", m.fqns());

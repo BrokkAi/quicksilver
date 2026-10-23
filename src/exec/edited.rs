@@ -6,7 +6,9 @@
 //! sites they touch, and rebuilds the same worker incrementally. `test` runs
 //! each compiled mutant against the tests that entered its sites.
 
-use crate::capture::{capture, Capture, EditedMutant};
+use crate::capture::{
+    capture_checkout, capture_patch, CaptureOptions, CaptureOutcome, EditedMutant,
+};
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, BuiltExe};
 use crate::config::Config;
 use crate::exec::schema::{
@@ -77,6 +79,37 @@ pub struct State {
     /// Bumped by every `build` that compiles something.
     pub generation: u32,
     pub records: Vec<Record>,
+}
+
+/// An exclusive lock on the mutant state, held by `build` and `test` for
+/// their whole run, so that captures from parallel authors queue instead of
+/// overwriting each other's records.
+pub struct StateLock {
+    _file: std::fs::File,
+}
+
+impl StateLock {
+    pub fn acquire(paths: &Paths) -> Result<StateLock> {
+        use std::os::unix::io::AsRawFd;
+        std::fs::create_dir_all(&paths.state)?;
+        let path = paths.state.join("edited.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("open {}", path.display()))?;
+        let fd = file.as_raw_fd();
+        // SAFETY: flock on a descriptor this function owns.
+        if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            eprintln!("waiting for another `build` or `test` of this repository to finish");
+            if unsafe { libc::flock(fd, libc::LOCK_EX) } != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .with_context(|| format!("lock {}", path.display()));
+            }
+        }
+        Ok(StateLock { _file: file })
+    }
 }
 
 impl State {
@@ -614,6 +647,8 @@ pub struct BuildReport {
     /// Mutants this call found already captured.
     pub duplicates: Vec<EditedMutant>,
     pub rejected: Vec<String>,
+    /// Edits dropped under `--skip-outside-bodies`.
+    pub dropped: Vec<String>,
     /// Every mutant in this build's set with its status afterwards.
     pub results: Vec<(EditedMutant, Status)>,
     pub generation: u32,
@@ -635,6 +670,7 @@ fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
         captured: Vec::new(),
         duplicates: Vec::new(),
         rejected: Vec::new(),
+        dropped: Vec::new(),
         results: Vec::new(),
         generation: state.generation,
         builds: 0,
@@ -644,81 +680,100 @@ fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
     Ok((map, state, report))
 }
 
-/// Record the checkout's edits as pending mutants, one per edited function,
-/// without compiling. Several checkouts or patches can be captured in turn
-/// and then compiled in one `build`.
-pub fn capture_edits(paths: &Paths, checkout: &Path) -> Result<BuildReport> {
-    let started = Instant::now();
-    let (map, mut state, mut report) = load_for_build(paths)?;
-    capture_into(&map, &mut state, checkout, &mut report)?;
-    if report.rejected.is_empty() {
-        state.save(paths)?;
-    }
-    report.secs = started.elapsed().as_secs_f64();
-    Ok(report)
+/// Where `build` takes edits from: the checkout, patch files, or neither
+/// (compile what is pending).
+#[derive(Debug, Clone, Default)]
+pub struct CaptureSources {
+    pub checkout: Option<PathBuf>,
+    pub patches: Vec<PathBuf>,
+    pub options: CaptureOptions,
 }
 
-fn capture_into(
-    map: &SiteMap,
+/// Record one capture's mutants as pending, and print what happened.
+/// Returns false when the capture was rejected.
+fn record_capture(
     state: &mut State,
-    checkout: &Path,
+    source: &str,
+    outcome: CaptureOutcome,
     report: &mut BuildReport,
-) -> Result<()> {
-    match capture(map, checkout)? {
-        Capture::Rejected(problems) => {
-            eprintln!("the edits in {} were not captured:", checkout.display());
-            for p in &problems {
-                eprintln!("  {p}");
-            }
-            eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
-            report.rejected = problems;
+) -> bool {
+    for d in &outcome.dropped {
+        eprintln!("  dropped: {d}");
+    }
+    report.dropped.extend(outcome.dropped.iter().cloned());
+    if !outcome.problems.is_empty() {
+        eprintln!("the edits in {source} were not captured:");
+        for p in &outcome.problems {
+            eprintln!("  {p}");
         }
-        Capture::Nothing => eprintln!("no edits in {}", checkout.display()),
-        Capture::Mutants(mutants) => {
-            for m in mutants {
-                if state.find(&m.id).is_some() {
-                    report.duplicates.push(m);
-                } else {
-                    state.records.push(Record {
-                        mutant: m.clone(),
-                        status: Status::Pending,
-                        captured_at: now_rfc3339(),
-                    });
-                    report.captured.push(m);
-                }
-            }
-            eprintln!(
-                "captured {} mutant(s) from {}{}",
-                report.captured.len(),
-                checkout.display(),
-                if report.duplicates.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({} already captured)", report.duplicates.len())
-                }
-            );
-            for m in &report.captured {
-                eprintln!("  {} {}", m.id, m.fqns());
-            }
+        eprintln!("a mutant may only change function bodies outside test code; fix the edits (or pass --skip-outside-bodies) and build again");
+        report.rejected.extend(outcome.problems);
+        return false;
+    }
+    let (mut new, mut dup) = (0usize, 0usize);
+    for m in outcome.mutants {
+        if state.find(&m.id).is_some() {
+            dup += 1;
+            report.duplicates.push(m);
+        } else {
+            new += 1;
+            eprintln!("  {} {}", m.id, m.fqns());
+            state.records.push(Record {
+                mutant: m.clone(),
+                status: Status::Pending,
+                captured_at: now_rfc3339(),
+            });
+            report.captured.push(m);
         }
     }
-    Ok(())
+    if new + dup == 0 {
+        eprintln!("no edits in {source}");
+    } else {
+        eprintln!(
+            "captured {new} mutant(s) from {source}{}",
+            if dup == 0 {
+                String::new()
+            } else {
+                format!(" ({dup} already captured)")
+            }
+        );
+    }
+    true
 }
 
-/// Capture the checkout's edits (unless `capture_from` is `None`) as one
-/// mutant per edited function, then compile every pending and untested
-/// mutant into a new generation of binaries in one build. The checkout is
-/// only read; resetting it for the next edit is the caller's job
-/// (`git checkout -- .`).
-pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result<BuildReport> {
+/// Capture edits from `sources` as one mutant per edited function, then
+/// compile every pending and untested mutant into a new generation of
+/// binaries in one build. A rejected capture records nothing and compiles
+/// nothing. The checkout is only read; resetting it for the next edit is the
+/// caller's job (`git checkout -- .`).
+pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<BuildReport> {
     let started = Instant::now();
+    let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(paths)?;
-    if let Some(checkout) = capture_from {
-        capture_into(&map, &mut state, checkout, &mut report)?;
-        if !report.rejected.is_empty() {
-            report.secs = started.elapsed().as_secs_f64();
-            return Ok(report);
-        }
+    let mut ok = true;
+    if let Some(checkout) = &sources.checkout {
+        let outcome = capture_checkout(&map, checkout, sources.options)?;
+        ok &= record_capture(
+            &mut state,
+            &checkout.display().to_string(),
+            outcome,
+            &mut report,
+        );
+    }
+    for patch in &sources.patches {
+        let outcome = capture_patch(&map, &cfg.repo_root, patch, sources.options)?;
+        ok &= record_capture(
+            &mut state,
+            &patch.display().to_string(),
+            outcome,
+            &mut report,
+        );
+    }
+    if !ok {
+        report.secs = started.elapsed().as_secs_f64();
+        return Ok(report);
+    }
+    if sources.checkout.is_some() || !sources.patches.is_empty() {
         state.save(paths)?;
     }
 
@@ -922,6 +977,7 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
 pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedMutant, Verdict)>> {
+    let _lock = StateLock::acquire(paths)?;
     let map = SiteMap::load(paths)?
         .context("no map in this scratch session; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;

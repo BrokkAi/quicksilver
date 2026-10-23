@@ -10,6 +10,7 @@ pub mod estimate;
 pub mod exec;
 pub mod higher_order;
 pub mod index;
+pub mod linediff;
 pub mod outcome;
 pub mod plan;
 pub mod progress;
@@ -96,16 +97,14 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let paths = cfg.paths();
     paths.ensure()?;
-    let checkout = cfg.repo_root.clone();
-    if args.capture_only {
-        let report = exec::edited::capture_edits(&paths, &checkout)?;
-        return Ok(if report.rejected.is_empty() { 0 } else { 2 });
-    }
-    let report = exec::edited::build(
-        &cfg,
-        &paths,
-        (!args.no_capture).then_some(checkout.as_path()),
-    )?;
+    let sources = exec::edited::CaptureSources {
+        checkout: (!args.no_capture && args.patches.is_empty()).then(|| cfg.repo_root.clone()),
+        patches: args.patches.clone(),
+        options: capture::CaptureOptions {
+            skip_outside_bodies: args.skip_outside_bodies,
+        },
+    };
+    let report = exec::edited::build(&cfg, &paths, &sources)?;
     // The capture result and any rejection were printed by `build` before
     // it compiled anything.
     if !report.rejected.is_empty() {

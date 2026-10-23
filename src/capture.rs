@@ -369,24 +369,38 @@ pub fn mutant_id(edits: &[BodyEdit]) -> String {
     crate::util::hex(&h.finalize())[..16].to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Capture {
+/// How lenient a capture is.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CaptureOptions {
+    /// Drop edits outside function bodies (and added, removed or
+    /// untracked-function files) with a warning, instead of rejecting the
+    /// whole round.
+    pub skip_outside_bodies: bool,
+}
+
+/// What one capture found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CaptureOutcome {
     /// One mutant per edited function.
-    Mutants(Vec<EditedMutant>),
-    /// No tracked file differs from the map.
-    Nothing,
-    /// One message per problem.
-    Rejected(Vec<String>),
+    pub mutants: Vec<EditedMutant>,
+    /// Problems that reject the round; when non-empty, `mutants` is empty.
+    pub problems: Vec<String>,
+    /// Edits dropped under `skip_outside_bodies`, one message each.
+    pub dropped: Vec<String>,
 }
 
 /// Compare the checkout with the files the map was built from and lift the
 /// changed bodies out. Original text comes from the map's commit. Each
 /// edited function becomes its own mutant, so one round of edits and one
 /// build cover many mutants.
-pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
+pub fn capture_checkout(
+    map: &SiteMap,
+    checkout: &Path,
+    opts: CaptureOptions,
+) -> Result<CaptureOutcome> {
     let head = crate::worktree::head(checkout)?;
     if head != map.commit {
-        return Ok(Capture::Rejected(vec![format!(
+        return Ok(rejected(vec![format!(
             "HEAD is {} but the map was built at {}; run `cargo quicksilver map` again",
             &head[..12.min(head.len())],
             &map.commit[..12.min(map.commit.len())]
@@ -394,11 +408,15 @@ pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
     }
     let now = tracked_file_hashes(checkout)?;
     let mut problems = Vec::new();
-    let mut changed: Vec<&String> = Vec::new();
+    let mut files = Vec::new();
     for (rel, hash) in &now {
         match map.files.get(rel) {
             Some(was) if was == hash => {}
-            Some(_) => changed.push(rel),
+            Some(_) => {
+                let edited = std::fs::read_to_string(checkout.join(rel))
+                    .with_context(|| format!("read checkout {rel}"))?;
+                files.push((rel.clone(), edited));
+            }
             None => problems.push(format!(
                 "`{rel}` was added; a mutant may only change function bodies"
             )),
@@ -411,6 +429,161 @@ pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
             ));
         }
     }
+    capture_files(map, checkout, files, problems, opts)
+}
+
+/// Capture the edits of a patch against the map's commit, with no checkout
+/// to apply it to or reset. Paths in the patch are relative to the
+/// repository's top level, as `git diff` writes them (`a/` and `b/`
+/// prefixes are stripped).
+pub fn capture_patch(
+    map: &SiteMap,
+    repo_dir: &Path,
+    patch: &Path,
+    opts: CaptureOptions,
+) -> Result<CaptureOutcome> {
+    let text = std::fs::read_to_string(patch)
+        .with_context(|| format!("read patch {}", patch.display()))?;
+    let mut problems = Vec::new();
+    let mut touched = Vec::new();
+    for f in patch_files(&text) {
+        match (&f.old, &f.new) {
+            (None, Some(new)) => problems.push(format!(
+                "`{new}` is added by the patch; a mutant may only change function bodies"
+            )),
+            (Some(old), None) => problems.push(format!(
+                "`{old}` is removed by the patch; a mutant may only change function bodies"
+            )),
+            (Some(old), Some(new)) if old != new => problems.push(format!(
+                "`{old}` is renamed to `{new}` by the patch; a mutant may only change function bodies"
+            )),
+            (Some(old), Some(_)) => touched.push(old.clone()),
+            (None, None) => {}
+        }
+    }
+    if touched.is_empty() && problems.is_empty() {
+        return Ok(rejected(vec![format!(
+            "{} changes no file",
+            patch.display()
+        )]));
+    }
+    // Apply the patch in a scratch directory holding the original files, so
+    // nothing in the repository changes. The ceiling keeps git from treating
+    // the directory as part of an enclosing repository.
+    let scratch = std::env::temp_dir().join(format!(
+        "qs-patch-{}-{}",
+        std::process::id(),
+        crate::sitemap::random_id()
+    ));
+    std::fs::create_dir_all(&scratch)?;
+    let result = (|| -> Result<CaptureOutcome> {
+        for top in &touched {
+            let dest = scratch.join(top);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, crate::worktree::show(repo_dir, &map.commit, top)?)?;
+        }
+        let patch_abs = patch.canonicalize().unwrap_or_else(|_| patch.to_path_buf());
+        let out = std::process::Command::new("git")
+            .args(["apply", "--whitespace=nowarn", "-p1"])
+            .arg(&patch_abs)
+            .current_dir(&scratch)
+            .env(
+                "GIT_CEILING_DIRECTORIES",
+                scratch.parent().unwrap_or(&scratch),
+            )
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .context("git apply")?;
+        if !out.status.success() {
+            return Ok(rejected(vec![format!(
+                "{} does not apply at the map's commit {}: {}",
+                patch.display(),
+                &map.commit[..12.min(map.commit.len())],
+                String::from_utf8_lossy(&out.stderr).trim()
+            )]));
+        }
+        let mut problems = problems.clone();
+        let mut files = Vec::new();
+        for top in &touched {
+            let Some(rel) = top.strip_prefix(map.prefix.as_str()) else {
+                problems.push(format!(
+                    "`{top}` is outside the mapped workspace `{}`",
+                    map.prefix
+                ));
+                continue;
+            };
+            let edited = std::fs::read_to_string(scratch.join(top))
+                .with_context(|| format!("read patched {top}"))?;
+            files.push((rel.to_string(), edited));
+        }
+        capture_files(map, repo_dir, files, problems, opts)
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+fn rejected(problems: Vec<String>) -> CaptureOutcome {
+    CaptureOutcome {
+        problems,
+        ..CaptureOutcome::default()
+    }
+}
+
+/// A file a patch touches: its old and new paths, `None` for /dev/null.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PatchFile {
+    old: Option<String>,
+    new: Option<String>,
+}
+
+/// The files a unified diff touches, from its `---`/`+++` headers.
+fn patch_files(text: &str) -> Vec<PatchFile> {
+    let path = |raw: &str| -> Option<String> {
+        let raw = raw.split('\t').next().unwrap_or(raw).trim();
+        if raw == "/dev/null" {
+            return None;
+        }
+        Some(
+            raw.strip_prefix("a/")
+                .or_else(|| raw.strip_prefix("b/"))
+                .unwrap_or(raw)
+                .to_string(),
+        )
+    };
+    let mut out = Vec::new();
+    let mut old: Option<Option<String>> = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            old = Some(path(rest));
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            if let Some(old) = old.take() {
+                out.push(PatchFile {
+                    old,
+                    new: path(rest),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// Capture edited file contents (workspace-relative path, edited text).
+/// `problems` carries what the caller already found; under
+/// `skip_outside_bodies` they become dropped edits instead.
+fn capture_files(
+    map: &SiteMap,
+    git_dir: &Path,
+    files: Vec<(String, String)>,
+    mut problems: Vec<String>,
+    opts: CaptureOptions,
+) -> Result<CaptureOutcome> {
+    let mut dropped = Vec::new();
+    if opts.skip_outside_bodies {
+        dropped.append(&mut problems);
+    }
     let mut by_file: BTreeMap<&str, Vec<BodyRange>> = BTreeMap::new();
     for s in &map.sites {
         by_file.entry(s.path.as_str()).or_default().push(BodyRange {
@@ -421,59 +594,87 @@ pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
         });
     }
     let mut edits = Vec::new();
-    for rel in changed {
+    for (rel, edited) in files {
         let Some(ranges) = by_file.get(rel.as_str()) else {
-            let dropped: Vec<&str> = map
+            let without_site: Vec<&str> = map
                 .dropped
                 .iter()
-                .filter(|(path, _, _)| path == rel)
+                .filter(|(path, _, _)| *path == rel)
                 .map(|(_, fqn, _)| fqn.as_str())
                 .collect();
-            if dropped.is_empty() {
-                problems.push(format!(
+            let why = if without_site.is_empty() {
+                format!(
                     "`{rel}` changed; it has no mutable function (test code and files without function bodies are never mutated)"
-                ));
+                )
             } else {
-                problems.push(format!(
+                format!(
                     "`{rel}` changed; its functions have no mutation site ({}); see `dropped` in the map for why",
-                    dropped.join(", ")
-                ));
+                    without_site.join(", ")
+                )
+            };
+            if opts.skip_outside_bodies {
+                dropped.push(why);
+            } else {
+                problems.push(why);
             }
             continue;
         };
         let original = String::from_utf8(crate::worktree::show(
-            checkout,
+            git_dir,
             &map.commit,
             &format!("{}{rel}", map.prefix),
         )?)
         .with_context(|| format!("{rel} at {} is not UTF-8", map.commit))?;
-        let edited = std::fs::read_to_string(checkout.join(rel))
-            .with_context(|| format!("read checkout {rel}"))?;
-        match split_bodies(&original, &edited, ranges) {
-            Ok(bodies) => {
-                for (site_id, body) in bodies {
-                    let site = map
-                        .sites
+        let bodies = match split_bodies(&original, &edited, ranges) {
+            Ok(bodies) => bodies,
+            Err(Rejection::BadRanges(why)) => {
+                problems.push(format!("`{rel}`: {}", Rejection::BadRanges(why)));
+                continue;
+            }
+            Err(why) if !opts.skip_outside_bodies => {
+                problems.push(format!("`{rel}`: {why}"));
+                continue;
+            }
+            Err(_) => {
+                let (kept, lines_dropped) = keep_body_hunks(&original, &edited, ranges);
+                dropped.push(format!(
+                    "`{rel}`: dropped the edits outside function bodies at line(s) {} of the edited file",
+                    lines_dropped
                         .iter()
-                        .find(|s| s.site_id == site_id)
-                        .expect("site from the same map");
-                    edits.push(BodyEdit {
-                        site_id,
-                        package: site.package.clone(),
-                        path: site.path.clone(),
-                        fqn: site.fqn.clone(),
-                        body,
-                    });
+                        .map(usize::to_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                match split_bodies(&original, &kept, ranges) {
+                    Ok(bodies) => bodies,
+                    Err(why) => {
+                        problems.push(format!("`{rel}`: {why}"));
+                        continue;
+                    }
                 }
             }
-            Err(why) => problems.push(format!("`{rel}`: {why}")),
+        };
+        for (site_id, body) in bodies {
+            let site = map
+                .sites
+                .iter()
+                .find(|s| s.site_id == site_id)
+                .expect("site from the same map");
+            edits.push(BodyEdit {
+                site_id,
+                package: site.package.clone(),
+                path: site.path.clone(),
+                fqn: site.fqn.clone(),
+                body,
+            });
         }
     }
     if !problems.is_empty() {
-        return Ok(Capture::Rejected(problems));
-    }
-    if edits.is_empty() {
-        return Ok(Capture::Nothing);
+        return Ok(CaptureOutcome {
+            mutants: Vec::new(),
+            problems,
+            dropped,
+        });
     }
     edits.sort_by_key(|e| (e.path.clone(), e.site_id));
     let mutants = edits
@@ -486,7 +687,37 @@ pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
             }
         })
         .collect();
-    Ok(Capture::Mutants(mutants))
+    Ok(CaptureOutcome {
+        mutants,
+        problems,
+        dropped,
+    })
+}
+
+/// `edited` with every change outside the function bodies undone: each
+/// line hunk is kept when applying it alone to `original` still splits into
+/// bodies, so a hunk survives exactly when `build` would accept it by
+/// itself. Returns the result and the first edited line of each dropped
+/// hunk (1-based).
+pub fn keep_body_hunks(original: &str, edited: &str, ranges: &[BodyRange]) -> (String, Vec<usize>) {
+    let hunks = crate::linediff::diff(
+        &crate::linediff::lines(original),
+        &crate::linediff::lines(edited),
+    );
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+    for i in 0..hunks.len() {
+        let alone = crate::linediff::apply(original, edited, &hunks, &[i]);
+        if split_bodies(original, &alone, ranges).is_ok() {
+            kept.push(i);
+        } else {
+            dropped.push(hunks[i].b.start + 1);
+        }
+    }
+    (
+        crate::linediff::apply(original, edited, &hunks, &kept),
+        dropped,
+    )
 }
 
 #[cfg(test)]
@@ -651,6 +882,67 @@ mod tests {
             split_bodies(SRC, SRC, &r),
             Err(Rejection::BadRanges(_))
         ));
+    }
+
+    #[test]
+    fn edits_outside_bodies_are_dropped_hunk_by_hunk() {
+        // A body edit in `add`, a doc comment added above `one`, and a body
+        // edit in `Thing::name`.
+        let edited = SRC
+            .replace("    a + b\n", "    a - b\n")
+            .replace("pub fn one()", "/// added\npub fn one()")
+            .replace("format!(\"{}\", self.n)", "String::new()");
+        assert!(split_bodies(SRC, &edited, &ranges()).is_err());
+        let (kept, dropped) = keep_body_hunks(SRC, &edited, &ranges());
+        assert_eq!(
+            dropped,
+            vec![6],
+            "the doc comment's line in the edited file"
+        );
+        let bodies = split_bodies(SRC, &kept, &ranges()).expect("kept edits split");
+        assert_eq!(
+            bodies,
+            vec![
+                (3, "{\n    a - b\n}".into()),
+                (11, "{\n        String::new()\n    }".into()),
+            ]
+        );
+        // A one-line function whose signature and body change on one line
+        // cannot be separated, so that edit goes as a whole.
+        let edited = SRC.replace(
+            "pub fn one() -> u32 { 1 }",
+            "pub fn one(x: u8) -> u32 { 2 }",
+        );
+        let (kept, dropped) = keep_body_hunks(SRC, &edited, &ranges());
+        assert_eq!(kept, SRC);
+        assert_eq!(dropped, vec![6]);
+    }
+
+    #[test]
+    fn patch_headers_name_old_and_new_files() {
+        let patch = "diff --git a/src/lib.rs b/src/lib.rs\n\
+--- a/src/lib.rs\n\
++++ b/src/lib.rs\n\
+@@ -1 +1 @@\n\
+-x\n\
++y\n\
+--- /dev/null\n\
++++ b/src/new.rs\t2026-10-23\n\
+@@ -0,0 +1 @@\n\
++z\n";
+        assert_eq!(
+            patch_files(patch),
+            vec![
+                PatchFile {
+                    old: Some("src/lib.rs".into()),
+                    new: Some("src/lib.rs".into())
+                },
+                PatchFile {
+                    old: None,
+                    new: Some("src/new.rs".into())
+                },
+            ]
+        );
     }
 
     #[test]
