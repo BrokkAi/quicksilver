@@ -5,9 +5,10 @@ use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +95,28 @@ static CONFIRM_LOCK: Mutex<()> = Mutex::new(());
 
 fn confirm_lock() -> std::sync::MutexGuard<'static, ()> {
     CONFIRM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Null-run durations that timeout calibration measured in this process, by
+/// test id. Baseline timings come from an unloaded nextest run, so under a
+/// full test pool a test can overrun its budget with no mutant at all. Once
+/// calibrated, a test keeps that duration for every later mutant: on bifrost
+/// one test was calibrated 55 times in one run and 136 first passes timed
+/// out only because of their budget.
+static CALIBRATED: LazyLock<Mutex<HashMap<String, f64>>> = LazyLock::new(Default::default);
+
+fn calibrated_secs(t: &ResolvedTest) -> Option<f64> {
+    CALIBRATED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&t.id)
+        .copied()
+}
+
+/// What a passing run of `t` is expected to take: its baseline duration, or
+/// its calibrated one when that is longer.
+fn expected_secs(t: &ResolvedTest) -> f64 {
+    calibrated_secs(t).map_or(t.duration_secs, |c| c.max(t.duration_secs))
 }
 
 /// Cap on the stderr tail copied into an `Outcome` message. The capture
@@ -475,7 +498,7 @@ where
     let mut observations = Vec::new();
     let mut decisive: Option<Outcome> = None;
     for t in tests {
-        let budget = test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
+        let budget = test_timeout_scaled(expected_secs(t), policy.floor, policy.slowdown);
         let (first, first_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
         if first == RunStatus::Passed {
             observations.push(observation(t, TestVerdict::Passed, first_secs));
@@ -705,33 +728,49 @@ where
     // Only the calibration can take minutes; the re-run that follows is
     // budgeted from it, so it runs without the lock. Holding the lock across
     // both made N hanging mutants cost N full re-runs in series.
-    let calibration = policy.floor.max(Duration::from_secs(120));
-    let (null, null_secs, null_err) = {
-        let _guard = confirm_lock();
-        run(&spec_for(t, calibration, &[], true))?
+    let null_secs = match calibrated_secs(t) {
+        Some(secs) => {
+            tracing::info!(
+                "confirm {}: null run calibrated earlier in {secs:.2}s",
+                t.name
+            );
+            secs
+        }
+        None => {
+            let calibration = policy.floor.max(Duration::from_secs(120));
+            let (null, null_secs, null_err) = {
+                let _guard = confirm_lock();
+                run(&spec_for(t, calibration, &[], true))?
+            };
+            tracing::info!(
+                "confirm {}: null calibration {:?} in {:.2}s (budget {:.1}s)",
+                t.name,
+                null,
+                null_secs.as_secs_f64(),
+                calibration.as_secs_f64()
+            );
+            if null != RunStatus::Passed {
+                tracing::info!(
+                    "confirm {}: infra-skip ({:?} with no mutant active at {:.1}s budget); next test",
+                    t.name,
+                    null,
+                    calibration.as_secs_f64()
+                );
+                return Ok(Step::Skip(InfraSkip {
+                    test: t.name.clone(),
+                    code: status_code(null),
+                    stderr: tail(&null_err, MESSAGE_TAIL),
+                }));
+            }
+            let secs = null_secs.as_secs_f64();
+            CALIBRATED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(t.id.clone(), secs);
+            secs
+        }
     };
-    tracing::info!(
-        "confirm {}: null calibration {:?} in {:.2}s (budget {:.1}s)",
-        t.name,
-        null,
-        null_secs.as_secs_f64(),
-        calibration.as_secs_f64()
-    );
-    if null != RunStatus::Passed {
-        tracing::info!(
-            "confirm {}: infra-skip ({:?} with no mutant active at {:.1}s budget); next test",
-            t.name,
-            null,
-            calibration.as_secs_f64()
-        );
-        return Ok(Step::Skip(InfraSkip {
-            test: t.name.clone(),
-            code: status_code(null),
-            stderr: tail(&null_err, MESSAGE_TAIL),
-        }));
-    }
-    let budget =
-        duration_from_secs((null_secs.as_secs_f64() * 3.0).max(policy.floor.as_secs_f64()));
+    let budget = duration_from_secs((null_secs * 3.0).max(policy.floor.as_secs_f64()));
     let (again, again_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
     tracing::info!(
         "confirm {}: re-run with mutant {:?} in {:.2}s (calibrated budget {:.1}s)",
@@ -745,7 +784,7 @@ where
             tracing::info!(
                 "confirm {}: TIMEOUT attributed to mutant (null passed in {:.2}s)",
                 t.name,
-                null_secs.as_secs_f64()
+                null_secs
             );
             Ok(Step::Done(Outcome::timeout(
                 planned.mutant.clone(),
@@ -771,7 +810,7 @@ where
                 "{} ({}) on the calibrated re-run; it passed without the mutant in {:.2}s; test {}",
                 crate::types::CRASH_PREFIX,
                 crate::types::describe_exit(code),
-                null_secs.as_secs_f64(),
+                null_secs,
                 t.name
             );
             tracing::info!(
@@ -1136,7 +1175,7 @@ mod tests {
     fn confirm_timeout_with_fast_null_and_second_timeout_is_a_timeout() {
         let (outcome, seen) = drive(
             true,
-            &fake_tests(&["t1"]),
+            &fake_tests(&["timeout-rerun"]),
             &[
                 (RunStatus::Timeout, 30.0, ""),
                 (RunStatus::Passed, 12.0, ""),
@@ -1159,7 +1198,7 @@ mod tests {
         // as a signal, code None).
         let (outcome, seen) = drive(
             true,
-            &fake_tests(&["t1"]),
+            &fake_tests(&["timeout-crash"]),
             &[
                 (RunStatus::Timeout, 30.0, ""),
                 (RunStatus::Passed, 0.5, ""),
@@ -1177,7 +1216,7 @@ mod tests {
     fn confirm_timeout_with_null_timeout_is_infra_skip() {
         let (outcome, seen) = drive(
             true,
-            &fake_tests(&["t1"]),
+            &fake_tests(&["timeout-null"]),
             &[
                 (RunStatus::Timeout, 30.0, ""),
                 (RunStatus::Timeout, 120.0, ""),
@@ -1194,7 +1233,7 @@ mod tests {
     fn confirm_timeout_calibrated_pass_moves_on_to_the_next_test() {
         let (outcome, seen) = drive(
             true,
-            &fake_tests(&["t1", "t2"]),
+            &fake_tests(&["timeout-pass", "t2"]),
             &[
                 (RunStatus::Timeout, 30.0, ""),
                 (RunStatus::Passed, 12.0, ""),
@@ -1205,6 +1244,45 @@ mod tests {
         assert_eq!(outcome.kind, VerdictKind::Missed);
         assert_eq!(seen.len(), 4);
         assert_eq!(seen[3].test_name, "t2");
+    }
+
+    /// A test whose baseline budget is too tight under load is calibrated
+    /// once; later mutants get a first-pass budget from the calibrated
+    /// duration and skip the calibration run.
+    #[test]
+    fn a_calibrated_test_keeps_its_duration_for_later_mutants() {
+        let tests = fake_tests(&["calibrated-once"]);
+        let (outcome, seen) = drive(
+            true,
+            &tests,
+            &[
+                (RunStatus::Timeout, 30.0, ""),
+                (RunStatus::Passed, 40.0, ""),
+                (RunStatus::Passed, 41.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Missed);
+        assert_eq!(seen[1].timeout, Duration::from_secs(120), "calibration");
+
+        // 3 x 40s x slowdown 3 = 360s, instead of the 30s floor.
+        let (outcome, seen) = drive(true, &tests, &[(RunStatus::Passed, 41.0, "")]);
+        assert_eq!(outcome.kind, VerdictKind::Missed);
+        assert_eq!(seen[0].timeout, Duration::from_secs(360));
+
+        // A real hang still times out, and is confirmed without recalibrating:
+        // the re-run is budgeted from the stored 40s.
+        let (outcome, seen) = drive(
+            true,
+            &tests,
+            &[
+                (RunStatus::Timeout, 360.0, ""),
+                (RunStatus::Timeout, 120.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Timeout);
+        assert_eq!(seen.len(), 2, "no second calibration");
+        assert_eq!(seen[1].timeout, Duration::from_secs(120));
+        assert!(has_mutant(&seen[1]));
     }
 
     #[test]
