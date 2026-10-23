@@ -20,7 +20,7 @@ use crate::schema::{
     disable_sites, inject_runtime, lookup_variant, parse_compiler_error_spans, qs_mutant_env,
     qs_mutants_env, restore_files, snapshot_sources, Site,
 };
-use crate::scratch::{ensure_worker, CloneBackend};
+use crate::scratch::{ensure_worker, remove_extra_workers};
 use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo, VerdictKind};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -53,7 +53,6 @@ struct SchemaReady {
 pub fn execute(
     cfg: &Config,
     paths: &Paths,
-    backend: Arc<dyn CloneBackend>,
     plan: Plan,
     cancel: Arc<AtomicBool>,
     limit: usize,
@@ -124,7 +123,6 @@ pub fn execute(
             let job_rx = job_rx.clone();
             let ready_tx = ready_tx.clone();
             let out_tx = out_tx.clone();
-            let backend = Arc::clone(&backend);
             let cfg = Arc::clone(&cfg);
             let paths = Arc::clone(&paths);
             let cancel = Arc::clone(&cancel);
@@ -138,7 +136,7 @@ pub fn execute(
                     }
                     let w = match &worker {
                         Some(w) => w.clone(),
-                        None => match ensure_worker(backend.as_ref(), &paths, slot) {
+                        None => match ensure_worker(&paths, slot) {
                             Ok(w) => {
                                 worker = Some(w.clone());
                                 w
@@ -162,7 +160,6 @@ pub fn execute(
                     match run_crate(
                         &cfg,
                         &paths,
-                        backend.as_ref(),
                         &w,
                         &package,
                         planned,
@@ -247,6 +244,7 @@ pub fn execute(
     });
 
     pb.finish_and_clear();
+    remove_extra_workers(&paths);
     let mut evidence_rows = coupling_rows.lock().unwrap().clone();
     let triage = if cfg.triage {
         let (report, rows) =
@@ -511,7 +509,6 @@ fn row_from_run(
 fn run_crate(
     cfg: &Config,
     paths: &Paths,
-    backend: &dyn CloneBackend,
     worker: &Path,
     package: &str,
     planned: Vec<PlannedMutant>,
@@ -615,7 +612,6 @@ fn run_crate(
         let run_dir = paths.runs.join("schema").join(format!("{package}-{bi}"));
         stage_binaries(
             cfg,
-            backend,
             &target,
             &run_dir,
             &planned,
@@ -1199,7 +1195,6 @@ fn identity_gate(
 
 fn stage_binaries(
     cfg: &Config,
-    backend: &dyn CloneBackend,
     target: &Path,
     run_dir: &Path,
     planned: &[PlannedMutant],
@@ -1221,14 +1216,13 @@ fn stage_binaries(
             }
         }
     }
-    stage_tests(cfg, backend, target, run_dir, &tests, executables)
+    stage_tests(cfg, target, run_dir, &tests, executables)
 }
 
 /// Copy the test binaries `tests` need from `target` into `run_dir` and
 /// write the manifest that names each test's binary and working directory.
 pub(crate) fn stage_tests(
     cfg: &Config,
-    backend: &dyn CloneBackend,
     target: &Path,
     run_dir: &Path,
     tests: &[&TestInfo],
@@ -1264,11 +1258,10 @@ pub(crate) fn stage_tests(
             None => {
                 let dest_name = format!("bin{}", staged.len());
                 let dest = run_dir.join(&dest_name);
-                backend.clone_file(&src, &dest).or_else(|_| {
-                    fs::copy(&src, &dest)
-                        .map(|_| ())
-                        .context("copy test binary")
-                })?;
+                // A copy, not a link into `target/`: mbx may collect the
+                // managed target, and later builds rewrite it.
+                reflink_copy::reflink_or_copy(&src, &dest)
+                    .with_context(|| format!("stage {} -> {}", src.display(), dest.display()))?;
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
@@ -1300,7 +1293,7 @@ pub(crate) fn stage_tests(
 
 fn scan_test_exes(target: &Path) -> HashMap<String, PathBuf> {
     let mut out = HashMap::new();
-    for profile in ["quicksilver", "debug", "dev"] {
+    for profile in ["debug"] {
         let deps = target.join(profile).join("deps");
         let Ok(rd) = fs::read_dir(&deps) else {
             continue;

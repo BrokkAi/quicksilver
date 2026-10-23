@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 1;
+pub const MAP_VERSION: u32 = 2;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -37,6 +37,12 @@ pub struct SiteMap {
     /// Random per `map` run. The mutant state records which map it was built
     /// against, so a new map invalidates old `Built` records.
     pub map_id: String,
+    /// The commit the map was built from. QS's worktree is checked out there,
+    /// and original file text comes from it.
+    pub commit: String,
+    /// The workspace's path below the repository top level, empty or ending
+    /// in `/`; git paths are `<prefix><path>`.
+    pub prefix: String,
     pub repo_root: PathBuf,
     /// Every tracked file of the checkout and its SHA-256 when the map was
     /// made. `build` compares the checkout against this.
@@ -296,6 +302,8 @@ mod tests {
         let map = SiteMap {
             version: MAP_VERSION,
             map_id: "x".into(),
+            commit: String::new(),
+            prefix: String::new(),
             repo_root: PathBuf::new(),
             files: BTreeMap::new(),
             sites: Vec::new(),

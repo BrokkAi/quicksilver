@@ -6,27 +6,6 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub const DEFAULT_SCRATCH_ROOT: &str = "/nfs/morannon/nvme/quicksilver";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum CloneBackendKind {
-    Auto,
-    Reflink,
-    ZfsClone,
-    Copy,
-}
-
-impl CloneBackendKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Reflink => "reflink",
-            Self::ZfsClone => "zfs-clone",
-            Self::Copy => "copy",
-        }
-    }
-}
-
 /// Where each mutant's tests come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum TestSelection {
@@ -41,10 +20,6 @@ pub enum TestSelection {
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
-    #[serde(rename = "scratch-root")]
-    pub scratch_root: Option<PathBuf>,
-    #[serde(rename = "clone-backend")]
-    pub clone_backend: Option<String>,
     #[serde(rename = "build-jobs")]
     pub build_jobs: Option<usize>,
     #[serde(rename = "test-jobs")]
@@ -53,12 +28,6 @@ pub struct FileConfig {
     pub index_jobs: Option<usize>,
     #[serde(rename = "cm-jobs")]
     pub cm_jobs: Option<usize>,
-    #[serde(rename = "allow-copy")]
-    pub allow_copy: Option<bool>,
-    #[serde(rename = "zfs-remote")]
-    pub zfs_remote: Option<String>,
-    #[serde(rename = "zfs-dataset")]
-    pub zfs_dataset: Option<String>,
     #[serde(rename = "build-env", default)]
     pub build_env: BTreeMap<String, String>,
 }
@@ -67,14 +36,16 @@ pub struct FileConfig {
 pub struct Config {
     pub repo_root: PathBuf,
     pub test_selection: TestSelection,
-    pub scratch_root: PathBuf,
-    pub clone_backend: CloneBackendKind,
+    /// `<git common dir>/quicksilver`: where QS's worktrees live.
+    pub worktree_root: PathBuf,
+    /// The workspace's path below the repository top level (`git rev-parse
+    /// --show-prefix`), empty or ending in `/`.
+    pub prefix: String,
     pub build_jobs: usize,
     pub test_jobs: usize,
     pub index_jobs: usize,
     /// Comparison baseline width for cargo-mutants (J_cm). Not the QS build pool.
     pub cm_jobs: usize,
-    pub allow_copy: bool,
     pub max_build_memory_frac: f64,
     pub max_scratch: Option<u64>,
     pub packages: Vec<String>,
@@ -91,8 +62,6 @@ pub struct Config {
     pub timeout_floor: Duration,
     pub strict_source_isolation: bool,
     pub build_env: BTreeMap<String, String>,
-    pub zfs_remote: Option<String>,
-    pub zfs_dataset: Option<String>,
     pub quiet: bool,
     pub schema_max_rounds: u32,
     /// 0 means one batch per crate (no split).
@@ -107,7 +76,7 @@ pub struct Config {
 
 impl Config {
     pub fn paths(&self) -> Paths {
-        Paths::for_session(&self.scratch_root, &self.repo_root)
+        Paths::for_tree(&self.worktree_root, &self.prefix, &self.repo_root)
     }
 
     pub fn load_file(repo_root: &Path) -> Result<FileConfig> {
@@ -137,26 +106,7 @@ pub fn merge_config(
     cli: &crate::cli::CommonOpts,
     extras: ConfigExtras,
 ) -> Result<Config> {
-    let scratch_root = cli
-        .scratch_root
-        .clone()
-        .or(file.scratch_root)
-        .or_else(|| std::env::var_os("QS_SCRATCH_ROOT").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_SCRATCH_ROOT));
-
-    let clone_backend = if let Some(b) = &cli.clone_backend {
-        *b
-    } else if let Some(s) = &file.clone_backend {
-        match s.as_str() {
-            "auto" => CloneBackendKind::Auto,
-            "reflink" => CloneBackendKind::Reflink,
-            "zfs-clone" => CloneBackendKind::ZfsClone,
-            "copy" => CloneBackendKind::Copy,
-            other => anyhow::bail!("unknown clone-backend {other}"),
-        }
-    } else {
-        CloneBackendKind::Auto
-    };
+    let repo = crate::worktree::repo_of(&repo_root)?;
 
     let max_build_memory_frac = cli
         .max_build_memory
@@ -188,13 +138,12 @@ pub fn merge_config(
     Ok(Config {
         repo_root,
         test_selection: cli.test_selection,
-        scratch_root,
-        clone_backend,
+        worktree_root: crate::worktree::root(&repo),
+        prefix: repo.prefix,
         build_jobs: build_jobs.max(1),
         test_jobs: test_jobs.max(1),
         index_jobs: index_jobs.max(1),
         cm_jobs: cm_jobs.max(1),
-        allow_copy: cli.allow_copy || file.allow_copy.unwrap_or(false),
         max_build_memory_frac,
         max_scratch: cli.max_scratch,
         packages: extras.packages,
@@ -211,16 +160,6 @@ pub fn merge_config(
         timeout_floor: Duration::from_millis(extras.timeout_floor_ms),
         strict_source_isolation: extras.strict_source_isolation,
         build_env,
-        zfs_remote: cli
-            .zfs_remote
-            .clone()
-            .or(file.zfs_remote)
-            .or_else(|| std::env::var("QS_ZFS_REMOTE").ok()),
-        zfs_dataset: cli
-            .zfs_dataset
-            .clone()
-            .or(file.zfs_dataset)
-            .or_else(|| std::env::var("QS_ZFS_DATASET").ok()),
         quiet: extras.quiet,
         schema_max_rounds: if extras.schema_max_rounds == 0 {
             5

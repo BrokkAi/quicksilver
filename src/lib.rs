@@ -19,6 +19,7 @@ pub mod scratch;
 pub mod sitemap;
 pub mod types;
 pub mod util;
+pub mod worktree;
 
 use anyhow::Result;
 use config::ConfigExtras;
@@ -40,7 +41,6 @@ pub fn init_tracing() {
 pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     init_tracing();
     match cli.command {
-        cli::Command::Probe(args) => cmd_probe(&cli.common, args),
         cli::Command::List(_) => cmd_list(&cli.common),
         cli::Command::Index(_) => cmd_index(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
@@ -49,6 +49,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
+        cli::Command::Clean => cmd_clean(&cli.common),
     }
 }
 
@@ -60,10 +61,7 @@ fn cmd_map(common: &cli::CommonOpts, args: cli::MapArgs) -> Result<i32> {
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let paths = cfg.paths();
-    paths.ensure()?;
-    let (backend, _) = scratch::probe_and_select(&cfg)?;
-    scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
-    let map = exec::edited::build_map(&cfg, &paths, backend)?;
+    let map = exec::edited::build_map(&cfg, &paths)?;
     let entered: std::collections::BTreeSet<u32> = map.hits.values().flatten().copied().collect();
     let green = map.hits.len();
     eprintln!(
@@ -97,12 +95,10 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, extras)?;
     let paths = cfg.paths();
     paths.ensure()?;
-    let (backend, _) = scratch::probe_and_select(&cfg)?;
     let checkout = cfg.repo_root.clone();
     let report = exec::edited::build(
         &cfg,
         &paths,
-        backend,
         (!args.no_capture).then_some(checkout.as_path()),
         args.restore,
     )?;
@@ -227,14 +223,36 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     Ok(0)
 }
 
-fn cmd_probe(common: &cli::CommonOpts, args: cli::ProbeArgs) -> Result<i32> {
+fn cmd_clean(common: &cli::CommonOpts) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
-    std::fs::create_dir_all(&cfg.scratch_root)?;
-    let report = scratch::probe(&cfg.scratch_root, cfg.clone_backend, cfg.allow_copy)?;
-    println!("{}", scratch::format_probe(&report));
-    if args.with_rebuild {
-        let prepared = engine::prepare(cfg, false, false)?;
-        let _ = engine::maybe_preflight(&prepared)?;
+    let repo = worktree::repo_of(&cfg.repo_root)?;
+    let ours = worktree::list_ours(&repo)?;
+    if ours.is_empty() {
+        eprintln!("no QS worktrees for {}", repo.toplevel.display());
+    }
+    for tree in &ours {
+        worktree::remove(&repo, tree);
+        eprintln!("removed {}", tree.display());
+    }
+    let root = worktree::root(&repo);
+    // Also forget trees that were deleted by hand; mbx's own collection is
+    // not something to rely on.
+    match std::process::Command::new("mbx")
+        .arg("clean")
+        .arg("--under")
+        .arg(&root)
+        .output()
+    {
+        Ok(out) if !out.status.success() => tracing::warn!(
+            "mbx clean --under {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(err) => tracing::warn!("mbx clean --under {}: {err}", root.display()),
+        _ => {}
+    }
+    if root.exists() {
+        let _ = std::fs::remove_dir_all(&root);
     }
     Ok(0)
 }
@@ -379,14 +397,8 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         prepared.cfg.build_jobs,
     );
     let cancel = engine::install_ctrlc();
-    let full_exec = crate::exec::schema::execute(
-        &prepared.cfg,
-        &prepared.paths,
-        std::sync::Arc::clone(&prepared.backend),
-        full_plan,
-        cancel,
-        0,
-    )?;
+    let full_exec =
+        crate::exec::schema::execute(&prepared.cfg, &prepared.paths, full_plan, cancel, 0)?;
     let report = crate::report::audit_compare(&selected, &full_exec.outcomes);
     crate::report::print_audit(&report);
     if let Some(path) = &prepared.cfg.json {

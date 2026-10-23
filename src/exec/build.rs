@@ -73,7 +73,7 @@ pub(crate) fn resolve_binary(
     }
     if let Some(key) = &exact_name {
         // cargo uses the profile dir name
-        for dir in ["quicksilver", "debug", "dev"] {
+        for dir in ["debug"] {
             let p = target_dir.join(dir).join("deps").join(key);
             if p.is_file() {
                 return Ok(p);

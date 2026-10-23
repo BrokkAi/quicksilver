@@ -1,4 +1,3 @@
-use crate::config::CloneBackendKind;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -17,14 +16,6 @@ pub struct Cli {
 
 #[derive(Args, Debug, Clone)]
 pub struct CommonOpts {
-    /// Scratch filesystem that supports CoW clones.
-    #[arg(long, global = true)]
-    pub scratch_root: Option<PathBuf>,
-
-    /// Clone mechanism. `auto` probes and refuses to silently copy.
-    #[arg(long, global = true, value_enum)]
-    pub clone_backend: Option<CloneBackendKind>,
-
     #[arg(long, global = true)]
     pub build_jobs: Option<usize>,
 
@@ -75,10 +66,6 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub resume: bool,
 
-    /// Permit the non-CoW fallback (loudly).
-    #[arg(long, global = true)]
-    pub allow_copy: bool,
-
     /// Cross-machine sharding, locality-preserving slices (`K/N`).
     #[arg(long, global = true)]
     pub shard: Option<String>,
@@ -91,7 +78,7 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub max_build_memory: Option<String>,
 
-    /// Abort if free space on the scratch filesystem falls below this many bytes.
+    /// Abort if free space where QS keeps its state falls below this many bytes.
     #[arg(long, global = true)]
     pub max_scratch: Option<u64>,
 
@@ -106,12 +93,6 @@ pub struct CommonOpts {
     /// Hold the build slot until selected tests finish, so tests never see a later mutant's source.
     #[arg(long, global = true)]
     pub strict_source_isolation: bool,
-
-    #[arg(long, global = true)]
-    pub zfs_remote: Option<String>,
-
-    #[arg(long, global = true)]
-    pub zfs_dataset: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -124,8 +105,6 @@ pub enum Command {
     List(ListArgs),
     /// Build or refresh the coverage index.
     Index(IndexArgs),
-    /// Clone-backend and build-environment diagnostics.
-    Probe(ProbeArgs),
     /// Compare impact-selected verdicts to full-suite verdicts.
     AuditSelection(AuditSelectionArgs),
     /// Build once with a switch at every function and record which
@@ -136,6 +115,9 @@ pub enum Command {
     Build(BuildArgs),
     /// Run each compiled mutant against the tests that enter its functions.
     Test(TestArgs),
+    /// Remove QS's worktrees of this repository and its state, and tell mbx
+    /// their build output is no longer needed.
+    Clean,
 }
 
 #[derive(Args, Debug)]
@@ -253,13 +235,6 @@ pub struct ListArgs {
 
 #[derive(Args, Debug, Default)]
 pub struct IndexArgs {}
-
-#[derive(Args, Debug, Default)]
-pub struct ProbeArgs {
-    /// Also materialize a tiny clone of the current repo and time an incremental rebuild.
-    #[arg(long)]
-    pub with_rebuild: bool,
-}
 
 pub fn parse_cli() -> Cli {
     let mut args: Vec<String> = std::env::args().collect();

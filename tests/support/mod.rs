@@ -85,19 +85,21 @@ pub fn setup_fixture(name: &str) -> tempfile::TempDir {
     tmp
 }
 
-pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Config {
-    use cargo_quicksilver::config::{CloneBackendKind, Config};
+/// A config for the repository at `repo`. QS's worktrees and state live in
+/// `<repo>/.git/quicksilver`, so they go away with the temporary repository.
+pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
+    use cargo_quicksilver::config::Config;
     use std::collections::BTreeMap;
+    let git = cargo_quicksilver::worktree::repo_of(repo).expect("fixture is a git repository");
     Config {
         repo_root: repo.to_path_buf(),
         test_selection: Default::default(),
-        scratch_root: scratch.to_path_buf(),
-        clone_backend: CloneBackendKind::Copy,
+        worktree_root: cargo_quicksilver::worktree::root(&git),
+        prefix: git.prefix,
         build_jobs: 2,
         test_jobs: 4,
         index_jobs: 4,
         cm_jobs: 8,
-        allow_copy: true,
         max_build_memory_frac: 0.7,
         max_scratch: None,
         packages: Vec::new(),
@@ -114,8 +116,6 @@ pub fn scratch_cfg(repo: &Path, scratch: &Path) -> cargo_quicksilver::config::Co
         timeout_floor: std::time::Duration::from_millis(800),
         strict_source_isolation: false,
         build_env: BTreeMap::new(),
-        zfs_remote: None,
-        zfs_dataset: None,
         quiet: true,
         schema_max_rounds: 5,
         schema_batch_size: 0,

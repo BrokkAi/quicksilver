@@ -5,7 +5,7 @@ use crate::discover::DiscoverFilter;
 use crate::estimate::{self, EstimateReport};
 use crate::index::{self, CoverageIndex};
 use crate::plan::{self, Plan};
-use crate::scratch::{self, CloneBackend};
+use crate::scratch;
 use crate::types::{BaselineReport, Mutant, Outcome, Paths};
 use anyhow::Result;
 use std::path::PathBuf;
@@ -82,8 +82,6 @@ pub fn default_index_scope(explicit: Option<&str>, mutants: &[Mutant]) -> Option
 pub struct Prepared {
     pub cfg: Config,
     pub paths: Paths,
-    pub backend: Arc<dyn CloneBackend>,
-    pub probe: scratch::ProbeReport,
     pub baseline: BaselineReport,
     pub mutants: Vec<Mutant>,
     pub index: CoverageIndex,
@@ -103,17 +101,13 @@ impl Prepared {
 
 pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
     let paths = cfg.paths();
-    paths.ensure()?;
-    let (backend, probe) = scratch::probe_and_select(&cfg)?;
-    eprintln!("{}", scratch::format_probe(&probe));
-    scratch::check_free_space(&cfg.scratch_root, cfg.max_scratch)?;
-
     let baseline = if cfg.test_selection == TestSelection::Sites && !skip_baseline && !for_estimate
     {
         crate::baseline::prepare_baseline_reusing_timings(&cfg, &paths)?
     } else {
         prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
     };
+    scratch::check_free_space(&paths.session, cfg.max_scratch)?;
 
     let sites = cfg.test_selection == TestSelection::Sites;
     // Listing tests runs cargo (building the tests when the baseline build
@@ -227,8 +221,6 @@ pub fn prepare(mut cfg: Config, skip_baseline: bool, for_estimate: bool) -> Resu
     Ok(Prepared {
         cfg,
         paths,
-        backend,
-        probe,
         baseline,
         mutants,
         index,
@@ -263,14 +255,8 @@ pub fn run_schema_detailed(
     } else {
         prepared.plan.clone()
     };
-    let mut exec = crate::exec::schema::execute(
-        &prepared.cfg,
-        &prepared.paths,
-        Arc::clone(&prepared.backend),
-        plan,
-        cancel,
-        limit,
-    )?;
+    let mut exec =
+        crate::exec::schema::execute(&prepared.cfg, &prepared.paths, plan, cancel, limit)?;
     let rows = std::mem::take(&mut exec.coupling_rows);
     exec.coupling = Some(crate::coupling::merge_and_save(
         &prepared.paths,

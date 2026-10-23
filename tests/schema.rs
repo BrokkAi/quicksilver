@@ -11,11 +11,8 @@ fn tools_ok() -> bool {
         && cargo_quicksilver::util::find_llvm_tool("llvm-profdata", &support::fixture_src()).is_ok()
 }
 
-fn schema_cfg(
-    repo: &std::path::Path,
-    scratch: &std::path::Path,
-) -> cargo_quicksilver::config::Config {
-    let mut cfg = support::scratch_cfg(repo, scratch);
+fn schema_cfg(repo: &std::path::Path) -> cargo_quicksilver::config::Config {
+    let mut cfg = support::cfg_for(repo);
     cfg.packages = vec!["tiny_schema".into()];
     cfg.index_scope = Some("tiny_schema".into());
     cfg.identity_sample = 0;
@@ -87,7 +84,7 @@ fn schema_gates_and_differential_self_consistent() {
     }
     let repo = support::setup_tiny();
     let scratch = tempfile::tempdir().unwrap();
-    let cfg = schema_cfg(repo.path(), scratch.path());
+    let cfg = schema_cfg(repo.path());
     let prepared = prepare(cfg, false, false).expect("prepare tiny_schema");
 
     let (v2, cargo_invocations) = run_schema(&prepared, 0, None).expect("schema run");
@@ -155,9 +152,9 @@ fn schema_gates_and_differential_self_consistent() {
         .expect("write reference report");
 
     // Fresh state, same scratch so the coverage index and baseline are cached.
-    // `resume` is false in `scratch_cfg`, so run two decides every mutant again
+    // `resume` is false in `cfg_for`, so run two decides every mutant again
     // rather than reading back run one's outcomes.jsonl.
-    let cfg2 = schema_cfg(repo.path(), scratch.path());
+    let cfg2 = schema_cfg(repo.path());
     assert!(!cfg2.resume, "run two must not resume run one's verdicts");
     let prepared2 = prepare(cfg2, false, false).expect("prepare schema again");
     let (v2b, _) = run_schema(&prepared2, 0, None).expect("second schema run");

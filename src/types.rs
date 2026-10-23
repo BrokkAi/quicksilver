@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Stable mutant identity: hash of (package, path, fqn, replacement).
@@ -214,15 +214,19 @@ pub struct Paths {
 }
 
 impl Paths {
-    pub fn for_session(scratch_root: &std::path::Path, repo_root: &std::path::Path) -> Self {
-        let hash = crate::util::repo_hash(repo_root);
-        let session = scratch_root.join(hash);
+    /// The layout of QS's trees for a workspace at `prefix` below the top
+    /// level of a repository whose QS worktrees live in `worktree_root`:
+    /// `main/<prefix>` is the baseline and first worker, `main/.quicksilver`
+    /// holds QS's state, and extra workers are siblings of `main`.
+    pub fn for_tree(worktree_root: &Path, prefix: &str, repo_root: &Path) -> Self {
+        let main = worktree_root.join(crate::worktree::MAIN);
+        let session = main.join(crate::worktree::STATE_DIR);
         Self {
             repo_root: repo_root.to_path_buf(),
-            baseline: session.join("baseline"),
-            baseline_cov: session.join("baseline-cov"),
+            baseline: main.join(prefix.trim_end_matches('/')),
+            baseline_cov: session.join("cov-target"),
             index: session.join("index"),
-            workers: session.join("workers"),
+            workers: worktree_root.to_path_buf(),
             runs: session.join(std::env::var("QS_RUNS_SUBDIR").unwrap_or_else(|_| "runs".into())),
             state: session
                 .join(std::env::var("QS_STATE_SUBDIR").unwrap_or_else(|_| "state".into())),
@@ -230,14 +234,22 @@ impl Paths {
         }
     }
 
-    pub fn ensure(&self) -> std::io::Result<()> {
-        for p in [
-            &self.session,
-            &self.index,
-            &self.workers,
-            &self.runs,
-            &self.state,
-        ] {
+    /// The main worktree's top level.
+    pub fn main_tree(&self) -> PathBuf {
+        self.workers.join(crate::worktree::MAIN)
+    }
+
+    /// Create the state directories. The main worktree must exist: a state
+    /// directory created first would make `git worktree add` refuse the path.
+    pub fn ensure(&self) -> anyhow::Result<()> {
+        let main = self.main_tree();
+        anyhow::ensure!(
+            main.join(".git").exists(),
+            "QS has no worktree at {} yet; run `cargo quicksilver map` or `run` first",
+            main.display()
+        );
+        crate::worktree::state_dir(&main)?;
+        for p in [&self.index, &self.runs, &self.state] {
             std::fs::create_dir_all(p)?;
         }
         Ok(())

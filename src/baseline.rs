@@ -1,6 +1,6 @@
 use crate::cargo_cmd::{
-    apply_build_env, cargo_profile_args, count_compiling_units, crate_root_source,
-    dump_metadata_json, load_metadata, nextest_available, write_nextest_config, BuildResult,
+    apply_build_env, count_compiling_units, crate_root_source, dump_metadata_json, load_metadata,
+    nextest_available, write_nextest_config, BuildResult,
 };
 use crate::config::Config;
 use crate::discover::{apply_mutant, restore_file};
@@ -12,28 +12,25 @@ use std::process::Stdio;
 use std::time::{Instant, SystemTime};
 use tracing::info;
 
-pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_metadata::Metadata> {
+/// Check out the checkout's HEAD in QS's main worktree (creating it the
+/// first time) and create the state directories. The checkout must have no
+/// uncommitted changes to tracked files: QS tests the commit.
+pub fn checkout_main(cfg: &Config, paths: &Paths) -> Result<String> {
+    crate::worktree::require_mbx()?;
+    let commit = crate::worktree::require_committed(&cfg.repo_root)?;
+    let repo = crate::worktree::repo_of(&cfg.repo_root)?;
+    let main = crate::worktree::ensure(&repo, crate::worktree::MAIN, &commit)?;
+    info!(
+        "worktree {} at {}",
+        main.display(),
+        &commit[..12.min(commit.len())]
+    );
     paths.ensure()?;
-    if !paths.baseline.join("Cargo.toml").is_file() {
-        info!("materializing baseline from {}", cfg.repo_root.display());
-        crate::scratch::materialize_baseline(&cfg.repo_root, &paths.baseline)?;
-    } else {
-        let sync = crate::scratch::sync_baseline(&cfg.repo_root, &paths.baseline)?;
-        if sync.copied + sync.removed > 0 || sync.git_refreshed {
-            info!(
-                "synced baseline from {}: {} files copied, {} removed{}",
-                cfg.repo_root.display(),
-                sync.copied,
-                sync.removed,
-                if sync.git_refreshed {
-                    ", .git refreshed"
-                } else {
-                    ""
-                }
-            );
-        }
-    }
-    crate::scratch::write_quicksilver_cargo_config(&paths.baseline)?;
+    Ok(commit)
+}
+
+pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_metadata::Metadata> {
+    checkout_main(cfg, paths)?;
     let meta = load_metadata(&paths.baseline)?;
     dump_metadata_json(paths, &meta)?;
     Ok(meta)
@@ -50,7 +47,6 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         bail!("cargo nextest is required. Install it with: cargo install cargo-nextest");
     }
     let config_path = write_nextest_config(&paths.index)?;
-    let target = paths.baseline.join("target");
     let meta = load_metadata(&paths.baseline)?;
     let mut last_tests = Vec::new();
     let mut last_failed_ids = Vec::new();
@@ -63,7 +59,6 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         );
         let mut cmd = crate::cargo_cmd::cargo_command();
         cmd.current_dir(&paths.baseline);
-        cmd.env("CARGO_TARGET_DIR", &target);
         apply_build_env(&mut cmd, cfg, false);
         cmd.args(["nextest", "run"]);
         cmd.args(crate::cargo_cmd::nextest_profile_args());
@@ -288,17 +283,14 @@ fn touch(path: &Path) -> Result<()> {
 
 /// Mutate one throwaway function, rebuild, count how many units recompiled.
 pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -> Result<u64> {
-    let target = paths.baseline.join("target");
     let original = apply_mutant(&paths.baseline, mutant)?;
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
-    cmd.env("CARGO_TARGET_DIR", &target);
     apply_build_env(&mut cmd, cfg, false);
     // Workspace `cargo build --tests`, not `-p mutant.package`. A source-hashing
     // build script (BIFROST_BUILD_IDENTITY) relinks a *different* crate; scoping
     // to the mutant package misses the cascade this preflight exists to catch.
     cmd.args(["build", "--tests", "-v"]);
-    cmd.args(cargo_profile_args());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let output = cmd.output().context("preflight rebuild")?;

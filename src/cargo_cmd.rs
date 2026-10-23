@@ -1,6 +1,5 @@
 use crate::config::Config;
 use crate::types::Paths;
-use crate::util::fast_linker;
 use anyhow::{bail, Context, Result};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -8,30 +7,19 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-pub const PROFILE: &str = "quicksilver";
+/// The nextest profile QS writes into its own nextest config file. Builds
+/// use Cargo's ordinary dev and test profiles, so they share mbx cache
+/// entries with the user's own builds.
+pub const NEXTEST_PROFILE: &str = "quicksilver";
 
-/// `cargo --config ...` must come *before* the subcommand.
+/// Cargo, run through mbx: `mbx <subcommand> ...`. mbx rejects options
+/// before the subcommand, so callers add everything after it.
 pub fn cargo_command() -> Command {
-    let mut cmd = Command::new("cargo");
-    cmd.arg("--config")
-        .arg(r#"profile.quicksilver.inherits="dev""#);
-    cmd.arg("--config").arg("profile.quicksilver.debug=0");
-    cmd.arg("--config")
-        .arg("profile.quicksilver.incremental=true");
-    cmd
-}
-
-pub fn cargo_profile_args() -> Vec<String> {
-    vec!["--profile".into(), PROFILE.into()]
+    Command::new("mbx")
 }
 
 pub fn nextest_profile_args() -> Vec<String> {
-    vec![
-        "--profile".into(),
-        PROFILE.into(),
-        "--cargo-profile".into(),
-        PROFILE.into(),
-    ]
+    vec!["--profile".into(), NEXTEST_PROFILE.into()]
 }
 
 /// Which crates' tests the green suite / unscoped cargo should run.
@@ -176,36 +164,54 @@ pub fn package_specs(root: Option<&Path>, packages: &[String]) -> Vec<String> {
         .collect()
 }
 
-pub fn rustflags(coverage: bool) -> String {
-    let mut parts = Vec::new();
-    if coverage {
-        parts.push("-C instrument-coverage".to_string());
+/// The caller's `RUSTFLAGS` plus LLVM coverage instrumentation, with the
+/// workspace root remapped away so coverage names files by their
+/// workspace-relative path. Without the remap, a crate mbx restores from a
+/// build in another checkout reports that checkout's absolute paths.
+pub fn coverage_rustflags(ws_root: Option<&Path>) -> String {
+    let mut flags = std::env::var("RUSTFLAGS").unwrap_or_default();
+    let mut push = |flag: String| {
+        if !flags.is_empty() {
+            flags.push(' ');
+        }
+        flags.push_str(&flag);
+    };
+    push("-C instrument-coverage".into());
+    if let Some(root) = ws_root {
+        let mut roots = vec![root.to_path_buf()];
+        if let Ok(canon) = root.canonicalize() {
+            if canon != root {
+                roots.push(canon);
+            }
+        }
+        for r in roots {
+            push(format!("--remap-path-prefix={}/=", r.display()));
+        }
     }
-    if let Some(linker) = fast_linker() {
-        parts.push(format!("-C link-arg=-fuse-ld={linker}"));
-    }
-    parts.join(" ")
+    flags
 }
 
+/// The environment of every QS build. Ordinary builds keep the caller's
+/// flags and let mbx manage the tree's `target/`: identical invocations share
+/// mbx's cache with the user's own builds, and mbx gives the crates QS edits
+/// private incremental state. QS no longer forces `CARGO_INCREMENTAL`, which
+/// made mbx bypass its cache. The LLVM coverage build keeps its own flags and
+/// the target directory its caller set.
 pub fn apply_build_env(cmd: &mut Command, cfg: &Config, coverage: bool) {
     cmd.env_remove("RUSTC_WRAPPER");
     cmd.env_remove("RUSTC_WORKSPACE_WRAPPER");
     cmd.env_remove("SCCACHE");
     // Honour the target repo's rust-toolchain.toml, not the caller's pin.
     cmd.env_remove("RUSTUP_TOOLCHAIN");
-    cmd.env("CARGO_INCREMENTAL", "1");
-    cmd.env("RUSTFLAGS", rustflags(coverage));
+    if coverage {
+        let root = cmd.get_current_dir().map(Path::to_path_buf);
+        cmd.env("RUSTFLAGS", coverage_rustflags(root.as_deref()));
+    } else {
+        cmd.env_remove("CARGO_TARGET_DIR");
+    }
     for (k, v) in &cfg.build_env {
         cmd.env(k, v);
     }
-}
-
-pub fn cargo_in<'a>(root: &'a Path, target_dir: &'a Path, cfg: &'a Config) -> Command {
-    let mut cmd = cargo_command();
-    cmd.current_dir(root);
-    cmd.env("CARGO_TARGET_DIR", target_dir);
-    apply_build_env(&mut cmd, cfg, false);
-    cmd
 }
 
 pub fn load_metadata(root: &Path) -> Result<Metadata> {
@@ -352,10 +358,11 @@ pub fn build_tests(
 ) -> Result<BuildResult> {
     let mut cmd = cargo_command();
     cmd.current_dir(root);
-    cmd.env("CARGO_TARGET_DIR", target_dir);
+    if coverage {
+        cmd.env("CARGO_TARGET_DIR", target_dir);
+    }
     apply_build_env(&mut cmd, cfg, coverage);
     cmd.arg("build").arg("--tests");
-    cmd.args(cargo_profile_args());
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
     // package pays startup + lock + fingerprint 2–4× on the compile-bound path.
     // Empty means the whole workspace — cargo-mutants pays for everything, and
@@ -419,10 +426,11 @@ pub fn build_tests_captured(
 ) -> Result<CapturedBuild> {
     let mut cmd = cargo_command();
     cmd.current_dir(root);
-    cmd.env("CARGO_TARGET_DIR", target_dir);
+    if coverage {
+        cmd.env("CARGO_TARGET_DIR", target_dir);
+    }
     apply_build_env(&mut cmd, cfg, coverage);
     cmd.arg("build").arg("--tests");
-    cmd.args(cargo_profile_args());
     if packages.is_empty() {
         cmd.arg("--workspace");
     } else {

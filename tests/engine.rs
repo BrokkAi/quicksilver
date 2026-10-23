@@ -93,7 +93,7 @@ fn coverage_caught_missed_notcovered_timeout() {
     }
     let repo = support::setup_tiny();
     let scratch = tempfile::tempdir().unwrap();
-    let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+    let mut cfg = support::cfg_for(repo.path());
     cfg.timeout_floor = std::time::Duration::from_millis(800);
     let mut prepared = prepare(cfg, false, false).expect("prepare");
 
@@ -237,8 +237,7 @@ fn scoped_index_does_not_file_other_crates_as_not_covered() {
         return;
     }
     let repo = support::setup_tiny();
-    let scratch = tempfile::tempdir().unwrap();
-    let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+    let mut cfg = support::cfg_for(repo.path());
     cfg.index_scope = Some("tiny_a".into());
     let prepared = prepare(cfg, false, false).expect("prepare");
     assert!(
@@ -322,8 +321,7 @@ fn site_selection_matches_coverage_selection() {
     }
     let repo = support::setup_tiny();
     let run = |selection: cargo_quicksilver::config::TestSelection| {
-        let scratch = tempfile::tempdir().unwrap();
-        let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+        let mut cfg = support::cfg_for(repo.path());
         cfg.timeout_floor = std::time::Duration::from_millis(800);
         cfg.identity_sample = 0;
         cfg.test_selection = selection;
@@ -342,10 +340,12 @@ fn site_selection_matches_coverage_selection() {
                 )
             })
             .collect();
-        (verdicts, paths.baseline_cov.exists(), scratch)
+        (verdicts, paths.baseline_cov.exists())
     };
-    let (coverage, _, _keep_a) = run(cargo_quicksilver::config::TestSelection::Coverage);
-    let (sites, instrumented, _keep_b) = run(cargo_quicksilver::config::TestSelection::Sites);
+    // Both runs share the repository's worktree and state, so sites goes
+    // first: it must not leave a coverage build behind.
+    let (sites, instrumented) = run(cargo_quicksilver::config::TestSelection::Sites);
+    let (coverage, _) = run(cargo_quicksilver::config::TestSelection::Coverage);
     assert!(!instrumented, "sites selection must not build baseline-cov");
     assert_eq!(coverage.len(), sites.len(), "same mutants in both runs");
     let diffs: Vec<_> = coverage
@@ -382,8 +382,7 @@ fn a_child_process_built_from_the_workspace_sees_the_mutant() {
         return;
     }
     let repo = support::setup_fixture("child");
-    let scratch = tempfile::tempdir().unwrap();
-    let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+    let mut cfg = support::cfg_for(repo.path());
     // The first run in a tree compiles the example; later runs only start it.
     cfg.timeout_floor = std::time::Duration::from_secs(60);
     cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
@@ -410,9 +409,9 @@ fn preflight_count_is_reused_until_a_build_script_or_manifest_changes() {
     use cargo_quicksilver::baseline::{cached_preflight, preflight_key, save_preflight};
     let repo = support::setup_tiny();
     let root = repo.path();
-    let scratch = tempfile::tempdir().unwrap();
-    let paths = support::scratch_cfg(root, scratch.path()).paths();
-    paths.ensure().unwrap();
+    let cfg = support::cfg_for(root);
+    let paths = cfg.paths();
+    cargo_quicksilver::baseline::checkout_main(&cfg, &paths).unwrap();
 
     let before = preflight_key(root).unwrap();
     assert_eq!(before, preflight_key(root).unwrap(), "key must be stable");
@@ -445,9 +444,8 @@ fn sites_mode_reuses_baseline_timings_within_a_session() {
         return;
     }
     let repo = support::setup_tiny();
-    let scratch = tempfile::tempdir().unwrap();
     let cfg = || {
-        let mut cfg = support::scratch_cfg(repo.path(), scratch.path());
+        let mut cfg = support::cfg_for(repo.path());
         cfg.test_selection = cargo_quicksilver::config::TestSelection::Sites;
         cfg
     };

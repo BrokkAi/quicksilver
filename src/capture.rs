@@ -379,8 +379,16 @@ pub enum Capture {
 }
 
 /// Compare the checkout with the files the map was built from and lift the
-/// changed bodies out. `baseline` is the scratch copy the map was built from.
-pub fn capture(map: &SiteMap, baseline: &Path, checkout: &Path) -> Result<Capture> {
+/// changed bodies out. Original text comes from the map's commit.
+pub fn capture(map: &SiteMap, checkout: &Path) -> Result<Capture> {
+    let head = crate::worktree::head(checkout)?;
+    if head != map.commit {
+        return Ok(Capture::Rejected(vec![format!(
+            "HEAD is {} but the map was built at {}; run `cargo quicksilver map` again",
+            &head[..12.min(head.len())],
+            &map.commit[..12.min(map.commit.len())]
+        )]));
+    }
     let now = tracked_file_hashes(checkout)?;
     let mut problems = Vec::new();
     let mut changed: Vec<&String> = Vec::new();
@@ -430,8 +438,12 @@ pub fn capture(map: &SiteMap, baseline: &Path, checkout: &Path) -> Result<Captur
             }
             continue;
         };
-        let original = std::fs::read_to_string(baseline.join(rel))
-            .with_context(|| format!("read baseline {rel}"))?;
+        let original = String::from_utf8(crate::worktree::show(
+            checkout,
+            &map.commit,
+            &format!("{}{rel}", map.prefix),
+        )?)
+        .with_context(|| format!("{rel} at {} is not UTF-8", map.commit))?;
         let edited = std::fs::read_to_string(checkout.join(rel))
             .with_context(|| format!("read checkout {rel}"))?;
         match split_bodies(&original, &edited, ranges) {

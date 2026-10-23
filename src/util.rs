@@ -40,13 +40,6 @@ pub fn mem_total_bytes() -> Option<u64> {
     None
 }
 
-pub fn repo_hash(root: &Path) -> String {
-    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    let mut h = Sha256::new();
-    h.update(canon.to_string_lossy().as_bytes());
-    hex(&h.finalize())[..16].to_string()
-}
-
 pub fn hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -83,16 +76,6 @@ pub fn which(name: &str) -> Option<PathBuf> {
         }
     }
     None
-}
-
-pub fn fast_linker() -> Option<&'static str> {
-    if which("mold").is_some() {
-        Some("mold")
-    } else if which("ld.lld").is_some() || which("lld").is_some() {
-        Some("lld")
-    } else {
-        None
-    }
 }
 
 /// `rustc` as a cargo child in `cwd` would see it: that directory's

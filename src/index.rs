@@ -1,6 +1,6 @@
 use crate::cargo_cmd::{
-    apply_build_env, apply_package_select, cargo_profile_args, covering_seeds, load_metadata,
-    package_dir_rel, package_select, relative_to_target, reverse_dependents,
+    apply_build_env, apply_package_select, covering_seeds, load_metadata, package_dir_rel,
+    package_select, relative_to_target, reverse_dependents,
 };
 use crate::config::Config;
 use crate::exec::process::{run_command_timeout, WaitResult};
@@ -186,7 +186,6 @@ fn build_index(
     cmd.env("CARGO_TARGET_DIR", &paths.baseline_cov);
     apply_build_env(&mut cmd, cfg, true);
     cmd.arg("build").arg("--tests");
-    cmd.args(cargo_profile_args());
     apply_package_select(&mut cmd, &package_select(cfg, &meta));
     cmd.stdout(Stdio::inherit());
     cmd.stderr(Stdio::inherit());
@@ -569,7 +568,7 @@ fn run_union_coverage(
                             drop(done);
                             drop(passed);
                             if let Err(err) = crate::scratch::check_free_space(
-                                &cfg.scratch_root,
+                                &paths.session,
                                 Some(8 * (1 << 30)),
                             ) {
                                 errors.lock().unwrap().push(format!("disk: {err:#}"));
@@ -659,8 +658,6 @@ fn write_stage_a_runner_metadata(
         "binaries-only",
         "--message-format",
         "json",
-        "--cargo-profile",
-        crate::cargo_cmd::PROFILE,
     ]);
     apply_package_select(&mut list, &package_select(cfg, meta));
     let out = list
@@ -721,7 +718,7 @@ fn run_stage_a_shard(
     cmd.args(["nextest", "run"]);
     // Nextest profile only. --cargo-profile would pull cargo (and its lock)
     // back in; binaries-metadata is how we overlap partitions.
-    cmd.arg("--profile").arg(crate::cargo_cmd::PROFILE);
+    cmd.arg("--profile").arg(crate::cargo_cmd::NEXTEST_PROFILE);
     cmd.arg("--config-file").arg(&config_path);
     cmd.arg("--binaries-metadata").arg(binaries_meta);
     cmd.arg("--cargo-metadata").arg(cargo_meta);
@@ -1014,9 +1011,10 @@ fn llvm_cov_export(
     for b in binaries {
         export.arg("--object").arg(b);
     }
-    for s in sources {
-        export.arg("--sources").arg(s);
-    }
+    // No `--sources` filter: the instrumented build remaps the workspace root
+    // away (`coverage_rustflags`), so reports name workspace files by
+    // relative path, which llvm-cov's absolute-path filter would drop. The
+    // files are matched below instead.
     let out = export.output().context("llvm-cov export")?;
     if !out.status.success() {
         bail!(
@@ -1024,7 +1022,26 @@ fn llvm_cov_export(
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    Ok(parse_lcov(&String::from_utf8_lossy(&out.stdout), ws_root))
+    let ws_canon = ws_root
+        .canonicalize()
+        .unwrap_or_else(|_| ws_root.to_path_buf());
+    let wanted = if sources.is_empty() {
+        rs_files_under(ws_root)
+    } else {
+        sources.to_vec()
+    };
+    let known: BTreeSet<String> = wanted
+        .iter()
+        .filter_map(|p| {
+            let p = p.canonicalize().unwrap_or_else(|_| p.clone());
+            p.strip_prefix(&ws_canon).ok().map(crate::util::rel_slash)
+        })
+        .collect();
+    Ok(parse_lcov(
+        &String::from_utf8_lossy(&out.stdout),
+        ws_root,
+        &known,
+    ))
 }
 
 fn invert_tests(
@@ -1226,13 +1243,19 @@ fn index_one_test(
     hits
 }
 
-pub fn parse_lcov(text: &str, ws_root: &Path) -> HashMap<String, Vec<u32>> {
+/// Line hits per workspace-relative file, for the files in `known` (all
+/// files when it is empty).
+pub fn parse_lcov(
+    text: &str,
+    ws_root: &Path,
+    known: &BTreeSet<String>,
+) -> HashMap<String, Vec<u32>> {
     let mut out: HashMap<String, Vec<u32>> = HashMap::new();
     let mut current: Option<String> = None;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("SF:") {
             let p = PathBuf::from(rest.trim());
-            current = normalize_source(&p, ws_root);
+            current = normalize_source(&p, ws_root, known);
         } else if line.starts_with("end_of_record") {
             current = None;
         } else if let Some(rest) = line.strip_prefix("DA:") {
@@ -1257,14 +1280,23 @@ pub fn parse_lcov(text: &str, ws_root: &Path) -> HashMap<String, Vec<u32>> {
     out
 }
 
-fn normalize_source(path: &Path, ws_root: &Path) -> Option<String> {
-    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let rel = canon.strip_prefix(ws_root).ok()?;
-    let s = crate::util::rel_slash(rel);
-    if s.contains("/.cargo/registry/") {
+/// The workspace-relative path of a coverage report's source file. The
+/// instrumented build remaps the workspace root away, so workspace files
+/// arrive relative; an absolute path counts only when it is under `ws_root`.
+/// A path dependency outside the workspace, or a crate restored from another
+/// checkout without the remap, is dropped rather than guessed at.
+fn normalize_source(path: &Path, ws_root: &Path, known: &BTreeSet<String>) -> Option<String> {
+    let text = crate::util::rel_slash(path);
+    if text.contains("/.cargo/registry/") || text.contains("/.cargo/git/") {
         return None;
     }
-    Some(s)
+    let rel = if path.is_relative() {
+        text.trim_start_matches("./").to_string()
+    } else {
+        let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        crate::util::rel_slash(canon.strip_prefix(ws_root).ok()?)
+    };
+    (known.is_empty() || known.contains(&rel)).then_some(rel)
 }
 
 pub fn list_tests(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
@@ -1286,10 +1318,11 @@ fn list_tests_in(
     let meta = load_metadata(&paths.baseline)?;
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
-    cmd.env("CARGO_TARGET_DIR", target_dir);
+    if coverage {
+        cmd.env("CARGO_TARGET_DIR", target_dir);
+    }
     apply_build_env(&mut cmd, cfg, coverage);
     cmd.args(["nextest", "list", "--message-format", "json"]);
-    cmd.args(["--cargo-profile", crate::cargo_cmd::PROFILE]);
     apply_package_select(&mut cmd, &package_select(cfg, &meta));
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
@@ -1409,23 +1442,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lcov_parses_hits() {
+    fn lcov_takes_relative_and_in_workspace_paths_and_drops_the_rest() {
+        // crate_a was built with the workspace root remapped away; crate_b
+        // without; /elsewhere is a path dependency outside the workspace.
         let lcov = "\
-SF:/ws/src/lib.rs
+SF:crate_a/src/lib.rs
 DA:1,0
 DA:2,3
 DA:5,1
 end_of_record
+SF:/ws/crate_b/src/lib.rs
+DA:4,2
+end_of_record
+SF:/elsewhere/other/src/lib.rs
+DA:9,9
+end_of_record
+SF:/home/u/.cargo/registry/src/x/lib.rs
+DA:1,1
+end_of_record
 ";
-        // normalize_source needs a real prefix; use parse without canonicalize by
-        // feeding a relative SF that strip_prefix will fail on — instead test the
-        // DA collection with a fake root that matches.
-        let tmp = Path::new("/ws");
-        let map = parse_lcov(lcov, tmp);
-        // canonicalize of /ws/src/lib.rs likely fails, so the file may be dropped.
-        // Direct unit of DA parsing: if SF can't be normalized, map is empty.
-        // That's OK — the engine always has a real workspace root.
-        let _ = map;
+        let known: BTreeSet<String> = ["crate_a/src/lib.rs", "crate_b/src/lib.rs", "src/lib.rs"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let map = parse_lcov(lcov, Path::new("/ws"), &known);
+        assert_eq!(map.get("crate_a/src/lib.rs"), Some(&vec![2, 5]));
+        assert_eq!(map.get("crate_b/src/lib.rs"), Some(&vec![4]));
+        assert_eq!(
+            map.len(),
+            2,
+            "outside paths and registry sources are dropped: {map:?}"
+        );
     }
 
     fn testinfo(id: &str, binary_id: &str, name: &str, dur: f64) -> TestInfo {

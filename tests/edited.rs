@@ -5,7 +5,6 @@ use cargo_quicksilver::exec::edited::{build, build_map, test, Status};
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 
 /// The whole loop on the `tiny` fixture: map once, then capture, build and
 /// test mutants written as edits to the checkout.
@@ -16,13 +15,10 @@ fn edited_mutants_are_captured_built_and_judged() {
         return;
     }
     let repo = support::setup_tiny();
-    let scratch = tempfile::tempdir().unwrap();
-    let cfg = support::scratch_cfg(repo.path(), scratch.path());
+    let cfg = support::cfg_for(repo.path());
     let paths = cfg.paths();
-    paths.ensure().unwrap();
-    let (backend, _) = cargo_quicksilver::scratch::probe_and_select(&cfg).unwrap();
 
-    let map = build_map(&cfg, &paths, Arc::clone(&backend)).expect("map");
+    let map = build_map(&cfg, &paths).expect("map");
     let site = |fqn: &str| {
         map.sites
             .iter()
@@ -66,16 +62,8 @@ fn edited_mutants_are_captured_built_and_judged() {
         fs::write(&lib, text.replace(from, to)).unwrap();
     };
     let reset = || fs::write(&lib, &original).unwrap();
-    let run_build = |capture: bool| {
-        build(
-            &cfg,
-            &paths,
-            Arc::clone(&backend),
-            capture.then_some(repo.path()),
-            false,
-        )
-        .expect("build")
-    };
+    let run_build =
+        |capture: bool| build(&cfg, &paths, capture.then_some(repo.path()), false).expect("build");
 
     // One mutant, two bodies: caught by add_works or greeting_works.
     edit("    a + b\n", "    a - b\n");

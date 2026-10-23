@@ -20,7 +20,6 @@ use crate::schema::{
     apply_schema_to_tree, attribute_spans, disable_attributed, disable_sites, inject_runtime,
     parse_compiler_error_spans, qs_mutant_env, qs_mutants_env, restore_files, Site, SiteVariant,
 };
-use crate::scratch::CloneBackend;
 use crate::sitemap::{sites_from_functions, tracked_file_hashes, MapSite, SiteMap};
 use crate::types::{Mutant, Paths, PlannedMutant, TestInfo, VerdictKind};
 use anyhow::{bail, Context, Result};
@@ -28,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -127,10 +126,13 @@ fn now_rfc3339() -> String {
     humantime::format_rfc3339_seconds(std::time::SystemTime::now()).to_string()
 }
 
-/// The originals of every file a site or crate root lives in, read from the
-/// baseline copy, keyed by repository-relative path.
+/// The committed text of every file a site or crate root lives in, keyed by
+/// workspace-relative path. The worktree itself may hold schema source, so
+/// the originals come from git.
 fn read_originals(
-    paths: &Paths,
+    tree: &Path,
+    commit: &str,
+    prefix: &str,
     map_sites: &[MapSite],
     crate_roots: &BTreeMap<String, String>,
 ) -> Result<HashMap<String, Vec<u8>>> {
@@ -138,11 +140,8 @@ fn read_originals(
     files.extend(crate_roots.values().map(String::as_str));
     let mut out = HashMap::new();
     for rel in files {
-        let p = paths.baseline.join(rel);
-        out.insert(
-            rel.to_string(),
-            std::fs::read(&p).with_context(|| format!("read {}", p.display()))?,
-        );
+        let bytes = crate::worktree::show(tree, commit, &format!("{prefix}{rel}"))?;
+        out.insert(rel.to_string(), bytes);
     }
     Ok(out)
 }
@@ -379,7 +378,7 @@ fn all_tests_planned(map_tests: &[TestInfo]) -> PlannedMutant {
 
 /// Build the map: baseline, sites, one workspace build with identity-only
 /// prologues, staged binaries, gates, and the recording run.
-pub fn build_map(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>) -> Result<SiteMap> {
+pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
     let started = Instant::now();
     let baseline = crate::baseline::prepare_baseline(cfg, paths, false, false)?;
     let mut index = crate::index::CoverageIndex {
@@ -418,8 +417,9 @@ pub fn build_map(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>) ->
         crate_roots.insert(pkg.to_string(), rel);
     }
 
-    let worker = crate::scratch::ensure_worker(backend.as_ref(), paths, 0)?;
-    let originals = read_originals(paths, &map_sites, &crate_roots)?;
+    let worker = crate::scratch::ensure_worker(paths, 0)?;
+    let commit = crate::worktree::head(&worker)?;
+    let originals = read_originals(&worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
     let sites: Vec<Site> = map_sites.iter().map(identity_site).collect();
     let isolated = isolate_all(cfg, &worker, &originals, &crate_roots, sites)?;
     let kept: BTreeSet<u32> = isolated.sites.iter().map(|s| s.site_id).collect();
@@ -444,7 +444,6 @@ pub fn build_map(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>) ->
     let test_refs: Vec<&TestInfo> = index.tests.iter().collect();
     stage_tests(
         cfg,
-        backend.as_ref(),
         &worker.join("target"),
         &run_dir,
         &test_refs,
@@ -492,6 +491,8 @@ pub fn build_map(cfg: &Config, paths: &Paths, backend: Arc<dyn CloneBackend>) ->
     let map = SiteMap {
         version: crate::sitemap::MAP_VERSION,
         map_id: crate::sitemap::random_id(),
+        commit: commit.clone(),
+        prefix: cfg.prefix.clone(),
         repo_root: cfg.repo_root.clone(),
         files,
         sites: map_sites,
@@ -585,7 +586,6 @@ pub struct BuildReport {
 pub fn build(
     cfg: &Config,
     paths: &Paths,
-    backend: Arc<dyn CloneBackend>,
     capture_from: Option<&Path>,
     restore: bool,
 ) -> Result<BuildReport> {
@@ -606,7 +606,7 @@ pub fn build(
     };
 
     if let Some(checkout) = capture_from {
-        match capture(&map, &paths.baseline, checkout)? {
+        match capture(&map, checkout)? {
             Capture::Rejected(problems) => {
                 report.rejected = problems;
                 report.secs = started.elapsed().as_secs_f64();
@@ -626,7 +626,12 @@ pub fn build(
                 if restore {
                     let files: BTreeSet<&str> = m.edits.iter().map(|e| e.path.as_str()).collect();
                     for rel in files {
-                        std::fs::copy(paths.baseline.join(rel), checkout.join(rel))
+                        let original = crate::worktree::show(
+                            checkout,
+                            &map.commit,
+                            &format!("{}{rel}", map.prefix),
+                        )?;
+                        std::fs::write(checkout.join(rel), original)
                             .with_context(|| format!("restore {rel}"))?;
                     }
                 }
@@ -687,7 +692,13 @@ pub fn build(
         .flat_map(|m| m.edits.iter().map(|e| e.site_id))
         .collect();
 
-    let originals = read_originals(paths, &map.sites, &map.crate_roots)?;
+    let originals = read_originals(
+        &map.worker,
+        &map.commit,
+        &map.prefix,
+        &map.sites,
+        &map.crate_roots,
+    )?;
     let all_sites: Vec<Site> = sites.into_values().collect();
     let isolated = isolate_all(cfg, &map.worker, &originals, &map.crate_roots, all_sites)?;
     report.builds = isolated.builds;
@@ -722,7 +733,6 @@ pub fn build(
     let union_refs: Vec<&TestInfo> = union.iter().collect();
     stage_tests(
         cfg,
-        backend.as_ref(),
         &map.worker.join("target"),
         &run_dir,
         &union_refs,
