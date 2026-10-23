@@ -481,6 +481,8 @@ pub struct CompilerSpan {
     pub byte_end: usize,
     pub is_primary: bool,
     pub message: String,
+    /// rustc's rendered text of the whole diagnostic the span belongs to.
+    pub rendered: String,
 }
 
 pub fn parse_compiler_error_spans(stdout: &[u8]) -> Vec<CompilerSpan> {
@@ -496,13 +498,14 @@ pub fn parse_compiler_error_spans(stdout: &[u8]) -> Vec<CompilerSpan> {
             continue;
         }
         if let Some(msg) = v.get("message") {
-            collect_spans(msg, &mut out);
+            let rendered = msg.get("rendered").and_then(|r| r.as_str()).unwrap_or("");
+            collect_spans(msg, rendered, &mut out);
         }
     }
     out
 }
 
-fn collect_spans(msg: &serde_json::Value, out: &mut Vec<CompilerSpan>) {
+fn collect_spans(msg: &serde_json::Value, rendered: &str, out: &mut Vec<CompilerSpan>) {
     let level = msg.get("level").and_then(|l| l.as_str()).unwrap_or("");
     let message = msg
         .get("message")
@@ -530,13 +533,14 @@ fn collect_spans(msg: &serde_json::Value, out: &mut Vec<CompilerSpan>) {
                     byte_end,
                     is_primary,
                     message: message.clone(),
+                    rendered: rendered.to_string(),
                 });
             }
         }
     }
     if let Some(children) = msg.get("children").and_then(|c| c.as_array()) {
         for c in children {
-            collect_spans(c, out);
+            collect_spans(c, rendered, out);
         }
     }
 }
@@ -545,6 +549,10 @@ fn collect_spans(msg: &serde_json::Value, out: &mut Vec<CompilerSpan>) {
 pub struct Attributed {
     pub variant_ids: BTreeSet<String>,
     pub site_ids: BTreeSet<u32>,
+    /// The rendered diagnostics that hit each variant or site, so an
+    /// unviable mutant reports its own error, not the build's first one.
+    pub variant_reasons: BTreeMap<String, BTreeSet<String>>,
+    pub site_reasons: BTreeMap<u32, BTreeSet<String>>,
 }
 
 impl Attributed {
@@ -569,9 +577,17 @@ pub fn attribute_spans(
         if let Some(hit) = hit_for_span(applied, sp, worker) {
             match hit {
                 SpanHit::Variant(id) => {
+                    attr.variant_reasons
+                        .entry(id.clone())
+                        .or_default()
+                        .insert(sp.rendered.clone());
                     attr.variant_ids.insert(id);
                 }
                 SpanHit::Site(id) => {
+                    attr.site_reasons
+                        .entry(id)
+                        .or_default()
+                        .insert(sp.rendered.clone());
                     attr.site_ids.insert(id);
                 }
             }
@@ -643,7 +659,12 @@ pub fn disable_attributed(sites: &mut Vec<Site>, attr: &Attributed) -> Vec<(Stri
             for v in &site.variants {
                 out.push((
                     v.mutant_id.clone(),
-                    format!("site {:#010x} ({})", site.site_id, site.fqn),
+                    format!(
+                        "site {:#010x} ({}){}",
+                        site.site_id,
+                        site.fqn,
+                        reasons_suffix(attr.site_reasons.get(&site.site_id))
+                    ),
                 ));
             }
             return false;
@@ -652,7 +673,12 @@ pub fn disable_attributed(sites: &mut Vec<Site>, attr: &Attributed) -> Vec<(Stri
             if attr.variant_ids.contains(&v.mutant_id) {
                 out.push((
                     v.mutant_id.clone(),
-                    format!("site {:#010x} variant {}", site.site_id, v.index),
+                    format!(
+                        "site {:#010x} variant {}{}",
+                        site.site_id,
+                        v.index,
+                        reasons_suffix(attr.variant_reasons.get(&v.mutant_id))
+                    ),
                 ));
                 false
             } else {
@@ -664,10 +690,19 @@ pub fn disable_attributed(sites: &mut Vec<Site>, attr: &Attributed) -> Vec<(Stri
     out
 }
 
+fn reasons_suffix(reasons: Option<&BTreeSet<String>>) -> String {
+    reasons
+        .into_iter()
+        .flatten()
+        .filter(|r| !r.is_empty())
+        .map(|r| format!("\n{}", r.trim_end()))
+        .collect()
+}
+
 pub fn disable_sites(sites: &mut Vec<Site>, ids: &BTreeSet<u32>) -> Vec<(String, String)> {
     let attr = Attributed {
-        variant_ids: BTreeSet::new(),
         site_ids: ids.clone(),
+        ..Attributed::default()
     };
     disable_attributed(sites, &attr)
 }
@@ -907,10 +942,18 @@ mod tests {
             byte_end: v.end.saturating_sub(1).max(v.start + 1),
             is_primary: true,
             message: "E0277".into(),
+            rendered: "error[E0277]: in the arm".into(),
         }];
         let attr = attribute_spans(&applied, &spans, Path::new("/worker"));
         assert!(attr.variant_ids.contains(&v.mutant_id), "{attr:?}");
         assert!(attr.site_ids.is_empty());
+        let mut sites = sites;
+        let disabled = disable_attributed(&mut sites, &attr);
+        assert_eq!(disabled.len(), 1, "{disabled:?}");
+        assert!(
+            disabled[0].1.ends_with("\nerror[E0277]: in the arm"),
+            "the variant's own diagnostic: {disabled:?}"
+        );
     }
 
     #[test]

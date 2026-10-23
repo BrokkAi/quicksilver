@@ -265,17 +265,10 @@ fn isolate_all(
         }
         let spans = parse_compiler_error_spans(&built.stdout);
         let attr = attribute_spans(&applied, &spans, worker);
-        let rendered = compiler_errors(&built.stdout, &built.stderr);
         if !attr.is_empty() && round <= max_rounds {
             let disabled = disable_attributed(&mut sites, &attr);
             for (id, why) in disabled {
-                unviable.push((
-                    id,
-                    format!(
-                        "rustc (round {round}): {why}\n{}",
-                        first_error_for(&rendered, 1200)
-                    ),
-                ));
+                unviable.push((id, format!("rustc (round {round}): {why}")));
             }
             let after: BTreeSet<u32> = sites.iter().map(|s| s.site_id).collect();
             dropped_sites.extend(before.difference(&after).copied());
@@ -302,16 +295,6 @@ fn isolate_all(
         }
         dropped_sites.extend(offenders);
     }
-}
-
-fn first_error_for(rendered: &str, max: usize) -> String {
-    let s = rendered.trim();
-    let end = s
-        .char_indices()
-        .map(|(i, _)| i)
-        .find(|i| *i >= max)
-        .unwrap_or(s.len());
-    s[..end].to_string()
 }
 
 fn bisect_all(
