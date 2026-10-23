@@ -57,11 +57,7 @@ pub fn test_packages(cfg: &Config, meta: &Metadata) -> Vec<String> {
     test_packages_from(&cfg.packages, cfg.reverse_dependents, meta)
 }
 
-pub fn test_packages_from(
-    packages: &[String],
-    reverse: bool,
-    meta: &Metadata,
-) -> Vec<String> {
+pub fn test_packages_from(packages: &[String], reverse: bool, meta: &Metadata) -> Vec<String> {
     if reverse {
         reverse_dependents(meta, packages).into_iter().collect()
     } else {
@@ -592,7 +588,10 @@ mod tests {
         let a = ["tiny_a".to_string()];
         assert_eq!(test_packages_from(&a, false, &meta), a.to_vec());
         let with_dependents = test_packages_from(&a, true, &meta);
-        assert!(with_dependents.contains(&"tiny_b".to_string()), "{with_dependents:?}");
+        assert!(
+            with_dependents.contains(&"tiny_b".to_string()),
+            "{with_dependents:?}"
+        );
     }
 
     #[test]

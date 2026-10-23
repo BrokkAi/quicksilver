@@ -2,8 +2,8 @@
 //! suite's durations attached to it.
 
 use crate::cargo_cmd::{
-    apply_build_env, apply_package_select, load_metadata, package_dir_rel, test_packages,
-    relative_to_target,
+    apply_build_env, apply_package_select, load_metadata, package_dir_rel, relative_to_target,
+    test_packages,
 };
 use crate::config::Config;
 use crate::types::{Paths, TestInfo};
