@@ -12,6 +12,7 @@ pub mod higher_order;
 pub mod index;
 pub mod outcome;
 pub mod plan;
+pub mod progress;
 pub mod report;
 pub mod scan;
 pub mod schema;
@@ -100,35 +101,10 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         &paths,
         (!args.no_capture).then_some(checkout.as_path()),
     )?;
-    if report.discarded_records > 0 {
-        eprintln!(
-            "discarded {} mutant(s) captured against an earlier map",
-            report.discarded_records
-        );
-    }
+    // The capture result and any rejection were printed by `build` before
+    // it compiled anything.
     if !report.rejected.is_empty() {
-        eprintln!("the edits in {} were not captured:", checkout.display());
-        for p in &report.rejected {
-            eprintln!("  {p}");
-        }
-        eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
         return Ok(2);
-    }
-    match &report.captured {
-        Some(m) if report.duplicate => eprintln!(
-            "the edits in {} are mutant {} (already captured; edits {})",
-            checkout.display(),
-            m.id,
-            m.fqns()
-        ),
-        Some(m) => eprintln!(
-            "captured mutant {} from {}: edits {}",
-            m.id,
-            checkout.display(),
-            m.fqns()
-        ),
-        None if !args.no_capture => eprintln!("no edits in {}", checkout.display()),
-        None => {}
     }
     if report.results.is_empty() {
         eprintln!("nothing to build");
@@ -171,49 +147,6 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     let results = exec::edited::test(&cfg, &paths, &args.mutants)?;
     if results.is_empty() {
         eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
-    }
-    for (m, v) in &results {
-        match v.kind {
-            VerdictKind::Caught => eprintln!(
-                "  CAUGHT      {} {} by {}{}",
-                m.id,
-                m.fqns(),
-                v.test.as_deref().unwrap_or("?"),
-                if v.message.is_some() { " (crash)" } else { "" }
-            ),
-            VerdictKind::Missed => eprintln!(
-                "  MISSED      {} {} ({} tests passed: {}{})",
-                m.id,
-                m.fqns(),
-                v.tests_run.len(),
-                v.tests_run
-                    .iter()
-                    .take(4)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                if v.tests_run.len() > 4 { ", ..." } else { "" }
-            ),
-            VerdictKind::NotCovered => {
-                eprintln!(
-                    "  NOT_COVERED {} {} (no test enters these functions)",
-                    m.id,
-                    m.fqns()
-                )
-            }
-            VerdictKind::Timeout => eprintln!(
-                "  TIMEOUT     {} {} in {}",
-                m.id,
-                m.fqns(),
-                v.test.as_deref().unwrap_or("?")
-            ),
-            VerdictKind::Errored | VerdictKind::Unviable => eprintln!(
-                "  ERRORED     {} {} {}",
-                m.id,
-                m.fqns(),
-                v.message.as_deref().unwrap_or("")
-            ),
-        }
     }
     if let Some(path) = &cfg.json {
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&results)?)?;

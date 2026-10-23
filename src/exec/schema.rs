@@ -24,7 +24,6 @@ use crate::scratch::{ensure_worker, remove_extra_workers};
 use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo, VerdictKind};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
-use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -117,7 +116,7 @@ pub fn execute(
 
     let cfg = Arc::new(cfg.clone());
     let paths = Arc::new(paths.clone());
-    let pb = progress_bar(n_mutants as u64, cfg.quiet);
+    let progress = crate::progress::Progress::new("run", Some(n_mutants as u64), cfg.quiet);
 
     std::thread::scope(|scope| {
         for slot in 0..cfg.build_jobs.max(1) {
@@ -239,13 +238,17 @@ pub fn execute(
         let collected = Arc::new(Mutex::new(Vec::<Outcome>::new()));
         while let Ok(o) = out_rx.recv() {
             let _ = append_outcome(&jsonl, &o);
-            pb.inc(1);
+            progress.inc(1);
             collected.lock().unwrap().push(o);
         }
         outcomes.extend(collected.lock().unwrap().clone());
     });
 
-    pb.finish_and_clear();
+    progress.finish(&format!(
+        "decided {} mutant(s) in {:.1}s",
+        progress.done(),
+        progress.elapsed_secs()
+    ));
     remove_extra_workers(&paths);
     let mut evidence_rows = coupling_rows.lock().unwrap().clone();
     let triage = if cfg.triage {
@@ -712,7 +715,7 @@ fn cargo_build(
     cargo_invocations: &AtomicU64,
 ) -> Result<CapturedBuild> {
     cargo_invocations.fetch_add(1, Ordering::SeqCst);
-    build_tests_captured(worker, target, cfg, packages)
+    build_tests_captured(worker, target, cfg, packages, None)
 }
 
 /// Attribution rounds compile only `mutated`. The prologue never changes a
@@ -1087,8 +1090,14 @@ fn record_sites(
         slowdown: SCHEMA_SLOWDOWN,
         confirm: false,
     };
-    let recording =
-        crate::exec::test::record_site_hits(&union, run_dir, baseline, &policy, cfg.test_jobs)?;
+    let recording = crate::exec::test::record_site_hits(
+        &union,
+        run_dir,
+        baseline,
+        &policy,
+        cfg.test_jobs,
+        None,
+    )?;
     let site_ids: BTreeSet<u32> = sites.iter().map(|s| s.site_id).collect();
     let entered: BTreeSet<u32> = recording
         .sites_by_test
@@ -1367,20 +1376,6 @@ pub(crate) fn tail_utf8(bytes: &[u8]) -> String {
     let s = String::from_utf8_lossy(bytes);
     let n = s.len().saturating_sub(4000);
     s[n..].to_string()
-}
-
-fn progress_bar(n: u64, quiet: bool) -> ProgressBar {
-    if quiet || n == 0 {
-        return ProgressBar::hidden();
-    }
-    let pb = ProgressBar::new(n);
-    let _ = pb.set_style(
-        ProgressStyle::with_template(
-            "{bar:40.cyan/blue} {pos}/{len} {msg} elapsed {elapsed_precise} eta {eta}",
-        )
-        .unwrap_or_else(|_| ProgressStyle::default_bar()),
-    );
-    pb
 }
 
 #[cfg(test)]

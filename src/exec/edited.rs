@@ -203,7 +203,19 @@ fn build_workspace(
     builds: &AtomicU64,
 ) -> Result<crate::cargo_cmd::CapturedBuild> {
     builds.fetch_add(1, Ordering::SeqCst);
-    build_tests_captured(worker, target, cfg, &[])
+    let progress = crate::progress::Progress::new("compiling", None, cfg.quiet);
+    let built = build_tests_captured(worker, target, cfg, &[], Some(&progress))?;
+    progress.finish(&format!(
+        "compiled {} crate(s) in {:.1}s{}",
+        progress.done(),
+        progress.elapsed_secs(),
+        if built.success {
+            ""
+        } else {
+            "; the build failed"
+        }
+    ));
+    Ok(built)
 }
 
 /// `isolate` from the per-crate executor, over every crate at once: build
@@ -470,13 +482,21 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
     let planned = all_tests_planned(&listed);
     null_schema_gate(cfg, &run_dir, &worker, std::slice::from_ref(&planned))?;
 
+    let progress =
+        crate::progress::Progress::new("recording", Some(listed.len() as u64), cfg.quiet);
     let recording = record_site_hits(
         &planned,
         &run_dir,
         &worker,
         &recording_policy(cfg),
         cfg.test_jobs,
+        Some(&progress),
     )?;
+    progress.finish(&format!(
+        "recorded {} tests in {:.1}s",
+        listed.len(),
+        progress.elapsed_secs()
+    ));
     let site_ids: BTreeSet<u32> = map_sites.iter().map(|s| s.site_id).collect();
     let mut hits: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     for (test, sites) in &recording.sites_by_test {
@@ -607,6 +627,9 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
         .context("no map for this repository; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;
     let discarded_records = state.reconcile(&map);
+    if discarded_records > 0 {
+        eprintln!("discarded {discarded_records} mutant(s) captured against an earlier map");
+    }
     let mut report = BuildReport {
         captured: None,
         duplicate: false,
@@ -621,15 +644,32 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
     if let Some(checkout) = capture_from {
         match capture(&map, checkout)? {
             Capture::Rejected(problems) => {
+                eprintln!("the edits in {} were not captured:", checkout.display());
+                for p in &problems {
+                    eprintln!("  {p}");
+                }
+                eprintln!("a mutant may only change function bodies outside test code; reset the checkout and edit again");
                 report.rejected = problems;
                 report.secs = started.elapsed().as_secs_f64();
                 return Ok(report);
             }
-            Capture::Nothing => {}
+            Capture::Nothing => eprintln!("no edits in {}", checkout.display()),
             Capture::Mutant(m) => {
                 if state.find(&m.id).is_some() {
+                    eprintln!(
+                        "the edits in {} are mutant {} (already captured; edits {})",
+                        checkout.display(),
+                        m.id,
+                        m.fqns()
+                    );
                     report.duplicate = true;
                 } else {
+                    eprintln!(
+                        "captured mutant {} from {}: edits {}",
+                        m.id,
+                        checkout.display(),
+                        m.fqns()
+                    );
                     state.records.push(Record {
                         mutant: m.clone(),
                         status: Status::Pending,
@@ -652,6 +692,10 @@ pub fn build(cfg: &Config, paths: &Paths, capture_from: Option<&Path>) -> Result
         report.secs = started.elapsed().as_secs_f64();
         return Ok(report);
     }
+    eprintln!(
+        "building {} mutant(s) not yet tested into the schema binary",
+        set.len()
+    );
 
     if !map.worker.join("Cargo.toml").is_file() {
         bail!(
@@ -785,6 +829,49 @@ fn verdict_from(
     }
 }
 
+/// One line per verdict, as `test` prints them while it runs.
+pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
+    match v.kind {
+        VerdictKind::Caught => format!(
+            "  CAUGHT      {} {} by {}{}",
+            m.id,
+            m.fqns(),
+            v.test.as_deref().unwrap_or("?"),
+            if v.message.is_some() { " (crash)" } else { "" }
+        ),
+        VerdictKind::Missed => format!(
+            "  MISSED      {} {} ({} tests passed: {}{})",
+            m.id,
+            m.fqns(),
+            v.tests_run.len(),
+            v.tests_run
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
+            if v.tests_run.len() > 4 { ", ..." } else { "" }
+        ),
+        VerdictKind::NotCovered => format!(
+            "  NOT_COVERED {} {} (no test enters these functions)",
+            m.id,
+            m.fqns()
+        ),
+        VerdictKind::Timeout => format!(
+            "  TIMEOUT     {} {} in {}",
+            m.id,
+            m.fqns(),
+            v.test.as_deref().unwrap_or("?")
+        ),
+        VerdictKind::Errored | VerdictKind::Unviable => format!(
+            "  ERRORED     {} {} {}",
+            m.id,
+            m.fqns(),
+            v.message.as_deref().unwrap_or("")
+        ),
+    }
+}
+
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
 pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedMutant, Verdict)>> {
@@ -827,6 +914,7 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(EditedMutant, Verdict)>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let progress = crate::progress::Progress::new("testing", Some(set.len() as u64), cfg.quiet);
     std::thread::scope(|scope| {
         for _ in 0..cfg.test_jobs.max(1).min(set.len()) {
             scope.spawn(|| loop {
@@ -875,11 +963,24 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
                         }
                     }
                 };
+                progress.println(&verdict_line(m, &verdict));
+                progress.inc(1);
                 results.lock().unwrap().push((m.clone(), verdict));
             });
         }
     });
     let mut results = results.into_inner().unwrap();
+    let count = |k: VerdictKind| results.iter().filter(|(_, v)| v.kind == k).count();
+    progress.finish(&format!(
+        "tested {} mutant(s) in {:.1}s: {} caught, {} missed, {} not covered, {} timeout, {} errored",
+        results.len(),
+        progress.elapsed_secs(),
+        count(VerdictKind::Caught),
+        count(VerdictKind::Missed),
+        count(VerdictKind::NotCovered),
+        count(VerdictKind::Timeout),
+        count(VerdictKind::Errored)
+    ));
     results.sort_by(|a, b| a.0.id.cmp(&b.0.id));
     for (m, v) in &results {
         if let Some(r) = state.records.iter_mut().find(|r| r.mutant.id == m.id) {

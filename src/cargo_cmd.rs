@@ -362,11 +362,16 @@ pub struct CapturedBuild {
     pub executables: Vec<BuiltExe>,
 }
 
+/// `cargo build --tests --message-format=json`, capturing the JSON. With
+/// `progress`, cargo's stderr is read as it arrives: each `Compiling` line
+/// advances the progress and names the crate, and mbx's summary lines are
+/// shown, so a long build is not silent.
 pub fn build_tests_captured(
     root: &Path,
     target_dir: &Path,
     cfg: &Config,
     packages: &[String],
+    progress: Option<&crate::progress::Progress>,
 ) -> Result<CapturedBuild> {
     let mut cmd = cargo_command();
     cmd.current_dir(root);
@@ -383,16 +388,51 @@ pub fn build_tests_captured(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let start = Instant::now();
-    let output = cmd
-        .output()
-        .context("cargo build --tests --message-format=json")?;
+    let (status, stdout, stderr) = match progress {
+        None => {
+            let output = cmd
+                .output()
+                .context("cargo build --tests --message-format=json")?;
+            (output.status, output.stdout, output.stderr)
+        }
+        Some(progress) => {
+            use std::io::{BufRead, Read};
+            let mut child = cmd
+                .spawn()
+                .context("cargo build --tests --message-format=json")?;
+            let err = child.stderr.take().context("cargo stderr")?;
+            let mut out = child.stdout.take().context("cargo stdout")?;
+            let stderr = std::thread::scope(|scope| {
+                let reader = scope.spawn(move || {
+                    let mut kept = Vec::new();
+                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                        let trimmed = line.trim_start();
+                        if let Some(rest) = trimmed.strip_prefix("Compiling ") {
+                            progress.set_message(rest.split_whitespace().next().unwrap_or(rest));
+                            progress.inc(1);
+                        } else if trimmed.starts_with("mbx[") {
+                            progress.println(trimmed);
+                        }
+                        kept.extend_from_slice(line.as_bytes());
+                        kept.push(b'\n');
+                    }
+                    kept
+                });
+                let mut stdout = Vec::new();
+                let _ = out.read_to_end(&mut stdout);
+                (stdout, reader.join().unwrap_or_default())
+            });
+            let status = child.wait().context("wait for cargo build")?;
+            (status, stderr.0, stderr.1)
+        }
+    };
     let secs = start.elapsed().as_secs_f64();
-    let executables = parse_executables(&output.stdout, target_dir);
+    let executables = parse_executables(&stdout, target_dir);
     Ok(CapturedBuild {
-        success: output.status.success(),
+        success: status.success(),
         secs,
-        stdout: output.stdout,
-        stderr: output.stderr,
+        stdout,
+        stderr,
         executables,
     })
 }

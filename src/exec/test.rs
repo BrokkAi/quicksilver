@@ -210,12 +210,13 @@ pub fn record_site_hits(
     tree_root: &Path,
     policy: &TestRunPolicy,
     jobs: usize,
+    progress: Option<&crate::progress::Progress>,
 ) -> Result<SiteRecording> {
     let tests = resolve_tests(planned_union, run_dir, tree_root)?;
     let dir = run_dir.join("site-hits");
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir)?;
-    Ok(record_all(&tests, &dir, policy, jobs))
+    Ok(record_all(&tests, &dir, policy, jobs, progress))
 }
 
 /// A recording run that times out gets one more run with this many times
@@ -224,11 +225,13 @@ pub fn record_site_hits(
 /// retry finds them built. A test still timing out is not green.
 const RECORD_RETRY_FACTOR: u32 = 4;
 
+/// `progress`, when given, advances once per test of the first pass.
 fn record_all(
     tests: &[ResolvedTest],
     dir: &Path,
     policy: &TestRunPolicy,
     jobs: usize,
+    progress: Option<&crate::progress::Progress>,
 ) -> SiteRecording {
     let started = Instant::now();
     let budget =
@@ -238,19 +241,23 @@ fn record_all(
         .enumerate()
         .map(|(i, t)| (i, budget(t)))
         .collect();
-    let mut results = record_pass(tests, &all, dir, jobs);
+    let mut results = record_pass(tests, &all, dir, jobs, progress);
     let retry: Vec<(usize, Duration)> = results
         .iter()
         .filter(|(_, r)| matches!(r, Err(RecordFailure::TimedOut(_))))
         .map(|(i, _)| (*i, budget(&tests[*i]) * RECORD_RETRY_FACTOR))
         .collect();
     if !retry.is_empty() {
-        tracing::info!(
+        let note = format!(
             "site recording: {} tests timed out; running them once more with {}x the budget",
             retry.len(),
             RECORD_RETRY_FACTOR
         );
-        for (i, again) in record_pass(tests, &retry, dir, jobs) {
+        match progress {
+            Some(p) => p.println(&note),
+            None => tracing::info!("{note}"),
+        }
+        for (i, again) in record_pass(tests, &retry, dir, jobs, None) {
             if let Some(slot) = results.iter_mut().find(|(j, _)| *j == i) {
                 slot.1 = again;
             }
@@ -285,6 +292,7 @@ fn record_pass(
     runs: &[(usize, Duration)],
     dir: &Path,
     jobs: usize,
+    progress: Option<&crate::progress::Progress>,
 ) -> Vec<(usize, RecordResult)> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let results: Mutex<Vec<(usize, RecordResult)>> = Mutex::new(Vec::with_capacity(runs.len()));
@@ -297,6 +305,9 @@ fn record_pass(
                 };
                 let result = record_one(&tests[i], i, dir, timeout);
                 results.lock().unwrap().push((i, result));
+                if let Some(p) = progress {
+                    p.inc(1);
+                }
             });
         }
     });
@@ -1000,7 +1011,7 @@ mod tests {
             slowdown: 1.0,
             confirm: false,
         };
-        let recording = record_all(&tests, &hits, &policy, 2);
+        let recording = record_all(&tests, &hits, &policy, 2, None);
         assert!(
             recording.sites_by_test.contains_key("bin::slow_once"),
             "{recording:?}"
