@@ -916,12 +916,42 @@ fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
     Ok((map, state, report))
 }
 
+/// An explicit patch and optional file of notes for only that patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PatchSource {
+    pub patch: PathBuf,
+    pub intents: Option<PathBuf>,
+}
+
+impl From<PathBuf> for PatchSource {
+    fn from(patch: PathBuf) -> Self {
+        Self {
+            patch,
+            intents: None,
+        }
+    }
+}
+
+impl std::str::FromStr for PatchSource {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        Ok(match value.rsplit_once('=') {
+            Some((patch, intents)) => Self {
+                patch: patch.into(),
+                intents: Some(intents.into()),
+            },
+            None => PathBuf::from(value).into(),
+        })
+    }
+}
+
 /// Where `build` takes edits from: the checkout, patch files, or neither
 /// (compile what is pending).
 #[derive(Debug, Clone, Default)]
 pub struct CaptureSources {
     pub checkout: Option<PathBuf>,
-    pub patches: Vec<PathBuf>,
+    pub patches: Vec<PatchSource>,
     pub options: CaptureOptions,
     /// Author's notes by full function name or `path:line`, applied to the
     /// mutants this build captures (see `capture::attach_intents`).
@@ -968,7 +998,26 @@ fn record_capture(
 ) {
     let (mut new, mut dup) = (0usize, 0usize);
     for m in outcome.mutants {
-        if state.find(&m.id).is_some() {
+        if let Some(kept) = state.records.iter_mut().find(|r| r.mutant.id == m.id) {
+            if let Some(note) = &m.intent {
+                match &kept.mutant.intent {
+                    None => {
+                        kept.mutant.intent = Some(note.clone());
+                        // Keep the report in step with a duplicate from a later source.
+                        if let Some(captured) = report.captured.iter_mut().find(|c| c.id == m.id) {
+                            captured.intent = Some(note.clone());
+                        }
+                        eprintln!(
+                            "  {} from {source}: added duplicate's note to kept mutant",
+                            m.id
+                        );
+                    }
+                    Some(existing) if existing != note => {
+                        eprintln!("  {} from {source}: kept existing note instead of duplicate's different note", m.id);
+                    }
+                    Some(_) => {}
+                }
+            }
             dup += 1;
             report.duplicates.push(m);
         } else {
@@ -1011,8 +1060,8 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         captures.push((checkout.display().to_string(), outcome));
     }
     for patch in &sources.patches {
-        let outcome = capture_patch(&map, &cfg.repo_root, patch, sources.options)?;
-        captures.push((patch.display().to_string(), outcome));
+        let outcome = capture_patch(&map, &cfg.repo_root, &patch.patch, sources.options)?;
+        captures.push((patch.patch.display().to_string(), outcome));
     }
     let mut ok = true;
     for (source, outcome) in &captures {
@@ -1058,6 +1107,44 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
                 *m = it.next().expect("same count");
             }
         }
+    }
+    let mut overrides = 0usize;
+    let offset = usize::from(sources.checkout.is_some());
+    let functions: Vec<_> = map
+        .sites
+        .iter()
+        .map(|s| (s.fqn.as_str(), s.path.as_str(), (s.start_line, s.end_line)))
+        .collect();
+    for (patch, (source, outcome)) in sources.patches.iter().zip(captures.iter_mut().skip(offset)) {
+        let Some(path) = &patch.intents else { continue };
+        let intents = read_intents(path)?;
+        let mut scoped = outcome.mutants.clone();
+        for m in &mut scoped {
+            m.intent = None;
+        }
+        let spans: Vec<_> = scoped
+            .iter()
+            .map(|m| {
+                m.edits
+                    .first()
+                    .and_then(|e| map.site(e.site_id))
+                    .map_or((0, 0), |s| (s.start_line, s.end_line))
+            })
+            .collect();
+        for warning in
+            crate::capture::attach_intents(&mut scoped, &spans, &intents, &map.prefix, &functions)
+        {
+            eprintln!("  {source}: {warning}");
+        }
+        for (kept, local) in outcome.mutants.iter_mut().zip(scoped) {
+            if local.intent.is_some() {
+                overrides += usize::from(kept.intent.is_some());
+                kept.intent = local.intent;
+            }
+        }
+    }
+    if overrides > 0 {
+        eprintln!("{overrides} per-patch intent(s) took precedence over global intents");
     }
     let captured_any = !captures.is_empty();
     for (source, outcome) in captures {
@@ -1619,6 +1706,54 @@ pub fn test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn duplicate_notes_fill_missing_notes_and_keep_the_first_note() {
+        let mut state = State::default();
+        let mut report = BuildReport {
+            captured: vec![],
+            duplicates: vec![],
+            rejected: vec![],
+            dropped: vec![],
+            results: vec![],
+            generation: 0,
+            builds: 0,
+            secs: 0.0,
+            discarded_records: 0,
+        };
+        for note in [None, Some("first note"), Some("different note")] {
+            record_capture(
+                &mut state,
+                "lane.patch",
+                CaptureOutcome {
+                    mutants: vec![EditedMutant {
+                        id: "same".into(),
+                        edits: vec![],
+                        intent: note.map(str::to_owned),
+                    }],
+                    ..CaptureOutcome::default()
+                },
+                &mut report,
+            );
+        }
+        assert_eq!(state.records.len(), 1);
+        assert_eq!(
+            state.records[0].mutant.intent.as_deref(),
+            Some("first note")
+        );
+        assert_eq!(report.captured[0].intent.as_deref(), Some("first note"));
+        assert_eq!(report.duplicates.len(), 2);
+    }
+
+    #[test]
+    fn patch_source_splits_at_last_equals_only() {
+        let plain: super::PatchSource = "lane.patch".parse().unwrap();
+        assert_eq!(plain.patch, std::path::PathBuf::from("lane.patch"));
+        assert_eq!(plain.intents, None);
+        let scoped: super::PatchSource = "lane=2.patch=notes.json".parse().unwrap();
+        assert_eq!(scoped.patch, std::path::PathBuf::from("lane=2.patch"));
+        assert_eq!(scoped.intents, Some("notes.json".into()));
+    }
+
     use super::*;
     use crate::types::{Mutant, Outcome, TestObservation, TestVerdict};
 

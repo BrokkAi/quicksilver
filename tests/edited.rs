@@ -181,7 +181,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     let build_full = |patches: Vec<std::path::PathBuf>, skip: bool, intents: &[(&str, &str)]| {
         let sources = CaptureSources {
             checkout: Some(repo.path().to_path_buf()),
-            patches,
+            patches: patches.into_iter().map(Into::into).collect(),
             options: CaptureOptions {
                 skip_outside_bodies: skip,
             },
@@ -382,9 +382,41 @@ fn edited_mutants_are_captured_built_and_judged() {
 
     // Capturing the same edit again is a duplicate, not a second mutant.
     edit("    a + b\n", "    a - b\n");
-    let report = run_build(true);
-    assert_eq!(report.duplicates.len(), 1);
+    edit("\"hello\".into()", "\"bye\".into()");
+    let report = build_full(
+        Vec::new(),
+        false,
+        &[
+            (
+                "tiny_a.add",
+                "a different note that must not replace the first",
+            ),
+            ("tiny_a.greeting", "uses the wrong greeting"),
+        ],
+    );
+    assert_eq!(report.duplicates.len(), 2);
     assert!(report.captured.is_empty());
+    let kept_add = by_fqn(
+        &report
+            .results
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect::<Vec<_>>(),
+        ".add",
+    );
+    let kept_greeting = by_fqn(
+        &report
+            .results
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect::<Vec<_>>(),
+        ".greeting",
+    );
+    assert_eq!(kept_add.intent, add_m.intent);
+    assert_eq!(
+        kept_greeting.intent.as_deref(),
+        Some("uses the wrong greeting")
+    );
     reset();
 
     // Two more mutants of `add` in one build: one from a patch (with no
@@ -395,7 +427,33 @@ fn edited_mutants_are_captured_built_and_judged() {
     fs::write(&patch, git_diff()).unwrap();
     reset();
     edit("    a + b\n", "    \"x\"\n");
-    let report = build_with(vec![patch.clone()], false);
+    let bad_patch = repo.path().join("../bad.patch");
+    fs::write(&bad_patch, git_diff()).unwrap();
+    reset();
+    let mul_notes = repo.path().join("../mul-notes.json");
+    let bad_notes = repo.path().join("../bad-notes.json");
+    fs::write(
+        &mul_notes,
+        r#"{"tiny_a.add":"multiplies instead of adding"}"#,
+    )
+    .unwrap();
+    fs::write(
+        &bad_notes,
+        r#"{"crate_a/src/lib.rs:2":"returns text instead of a number"}"#,
+    )
+    .unwrap();
+    let sources = CaptureSources {
+        patches: vec![
+            format!("{}={}", patch.display(), mul_notes.display())
+                .parse()
+                .unwrap(),
+            format!("{}={}", bad_patch.display(), bad_notes.display())
+                .parse()
+                .unwrap(),
+        ],
+        ..CaptureSources::default()
+    };
+    let report = build(&cfg, &paths, &sources).unwrap();
     assert_eq!(report.captured.len(), 2, "{:?}", report.captured);
     let mul_m = report
         .captured
@@ -409,6 +467,14 @@ fn edited_mutants_are_captured_built_and_judged() {
         .find(|m| m.edits[0].body.contains("\"x\""))
         .expect("the checkout's mutant")
         .clone();
+    assert_eq!(
+        mul_m.intent.as_deref(),
+        Some("multiplies instead of adding")
+    );
+    assert_eq!(
+        bad.intent.as_deref(),
+        Some("returns text instead of a number")
+    );
     match status_of(&report.results, &bad) {
         Status::Unviable { message } => assert!(message.contains("mismatched types"), "{message}"),
         other => panic!("expected unviable: {other:?}"),

@@ -148,7 +148,13 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    shown with their note and a diff of the original body. One file can
    serve several builds: `build` warns only about keys that name no
    function in the map, and counts the keys meant for other builds in one
-   line.
+   line. Use `--patch lane.patch=notes.json` for notes that apply only to
+   that patch, so different mutants of the same function can each have a
+   note. Only this explicit form loads per-patch notes; no sidecar file is
+   picked up automatically. Per-patch notes take precedence over global
+   `--intents` notes. When a duplicate mutant carries a note, it fills a
+   missing note on the kept mutant; an existing different note is kept.
+   Build reports both cases with the mutant id and source.
 
 4. **Test them all.**
 

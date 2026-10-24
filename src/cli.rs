@@ -221,9 +221,10 @@ pub struct BuildArgs {
     pub no_capture: bool,
     /// Capture the edits of this patch (against the map's commit, paths as
     /// `git diff` writes them) instead of the checkout. Repeatable; each
-    /// patch is captured on its own.
-    #[arg(long = "patch", value_name = "FILE")]
-    pub patches: Vec<std::path::PathBuf>,
+    /// patch is captured on its own. Use PATCH=INTENTS to attach notes only
+    /// to that patch (split at the last equals sign).
+    #[arg(long = "patch", value_name = "PATCH[=INTENTS]")]
+    pub patches: Vec<crate::exec::edited::PatchSource>,
     /// Drop edits outside function bodies with a warning instead of
     /// rejecting the whole capture.
     #[arg(long)]

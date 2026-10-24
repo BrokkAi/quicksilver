@@ -1191,6 +1191,34 @@ mod tests {
     }
 
     #[test]
+    fn patch_intents_match_only_the_patch_mutants() {
+        let (a, span) = mutant_at("k.same", "src/lib.rs", 1, 4);
+        let mut first = vec![a.clone()];
+        let mut second = vec![a];
+        let functions = [
+            ("k.same", "src/lib.rs", span),
+            ("k.other", "src/other.rs", (1, 4)),
+        ];
+        for (mutants, key, note) in [
+            (&mut first, "k.same", "first fault"),
+            (&mut second, "src/lib.rs:3", "second fault"),
+        ] {
+            let intents = [
+                (key.into(), note.into()),
+                ("k.other".into(), "elsewhere".into()),
+            ]
+            .into();
+            let warnings = attach_intents(mutants, &[span], &intents, "", &functions);
+            assert_eq!(
+                warnings,
+                ["1 intent(s) name functions that this build did not capture"]
+            );
+        }
+        assert_eq!(first[0].intent.as_deref(), Some("first fault"));
+        assert_eq!(second[0].intent.as_deref(), Some("second fault"));
+    }
+
+    #[test]
     fn the_id_ignores_edit_order() {
         let e = |site: u32, body: &str| BodyEdit {
             site_id: site,
