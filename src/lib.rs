@@ -12,6 +12,7 @@ pub mod higher_order;
 pub mod index;
 pub mod linediff;
 pub mod outcome;
+pub mod pending;
 pub mod plan;
 pub mod progress;
 pub mod proptest;
@@ -54,6 +55,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Build(args) => cmd_build(&cli.common, args),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
         cli::Command::Uncovered(args) => cmd_uncovered(&cli.common, args),
+        cli::Command::Pending(args) => pending::run(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
     };
     if let Some(line) = sandbox::summary() {

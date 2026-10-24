@@ -251,6 +251,133 @@ fn edited_mutants_are_captured_built_and_judged() {
             status_of(&report.results, m)
         );
     }
+    // Pending reads the actual captured state without rebuilding anything.
+    let pending_dir = tempfile::tempdir().unwrap();
+    let pending_json = pending_dir.path().join("pending.json");
+    let split_dir = pending_dir.path().join("pending-lanes");
+    let pending_output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+        .current_dir(repo.path())
+        .args([
+            "pending",
+            "--package",
+            "tiny_a",
+            "--file",
+            "crate_a/src/lib.rs",
+            "--json",
+            pending_json.to_str().unwrap(),
+            "--split",
+            "2",
+            "--out",
+            split_dir.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run pending");
+    assert!(
+        pending_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&pending_output.stderr)
+    );
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&fs::read(&pending_json).unwrap()).unwrap();
+    assert!(!rows
+        .iter()
+        .any(|r| r["fqn"].as_str().unwrap().ends_with(".add")));
+    assert!(rows
+        .iter()
+        .any(|r| r["fqn"].as_str().unwrap().ends_with(".flag")));
+    assert!(rows.iter().all(|r| r["package"] == "tiny_a"
+        && r["path"] == "crate_a/src/lib.rs"
+        && r["mutants"] == 0));
+    let lanes: Vec<_> = (1..=2)
+        .map(|i| fs::read_to_string(split_dir.join(format!("pending-{i}.txt"))).unwrap())
+        .collect();
+    assert_eq!(
+        lanes.iter().map(|s| s.lines().count()).sum::<usize>(),
+        rows.len()
+    );
+    let totals: Vec<usize> = lanes
+        .iter()
+        .map(|lane| {
+            rows.iter()
+                .filter(|r| lane.contains(r["fqn"].as_str().unwrap()))
+                .map(|r| r["lines"].as_u64().unwrap() as usize)
+                .sum()
+        })
+        .collect();
+    let largest = rows
+        .iter()
+        .map(|r| r["lines"].as_u64().unwrap() as usize)
+        .max()
+        .unwrap();
+    assert!(totals[0].abs_diff(totals[1]) <= largest);
+    let all_output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+        .current_dir(repo.path())
+        .args([
+            "pending",
+            "--all",
+            "--package",
+            "tiny_a",
+            "--min-lines",
+            "3",
+        ])
+        .output()
+        .unwrap();
+    assert!(all_output.status.success());
+    assert!(String::from_utf8_lossy(&all_output.stdout)
+        .lines()
+        .any(|line| line.contains("tiny_a.add (3 lines) [1 mutants]")));
+    let state = cargo_quicksilver::exec::edited::State::load(&paths).unwrap();
+    let inventory = cargo_quicksilver::pending::inventory(&map, &state, 1);
+    assert_eq!(
+        inventory
+            .iter()
+            .find(|r| r.fqn.ends_with(".add"))
+            .unwrap()
+            .mutants,
+        1
+    );
+    assert!(!inventory.iter().any(|r| r.fqn.ends_with(".uncovered")));
+    let mut changed_state = state.clone();
+    changed_state.map_id = "another map".into();
+    assert_eq!(
+        cargo_quicksilver::pending::inventory(&map, &changed_state, 1)
+            .iter()
+            .find(|r| r.fqn.ends_with(".add"))
+            .unwrap()
+            .mutants,
+        1
+    );
+    for record in &mut changed_state.records {
+        record.status = Status::Unviable {
+            message: "does not compile".into(),
+        };
+    }
+    assert!(
+        cargo_quicksilver::pending::inventory(&map, &changed_state, 1)
+            .iter()
+            .all(|r| r.mutants == 0)
+    );
+    for field in ["site_id", "path", "fqn"] {
+        let mut changed = state.clone();
+        for record in &mut changed.records {
+            for edit in &mut record.mutant.edits {
+                match field {
+                    "site_id" => edit.site_id = edit.site_id.wrapping_add(1),
+                    "path" => edit.path.push_str(".other"),
+                    _ => edit.fqn.push_str(".other"),
+                }
+            }
+        }
+        assert!(cargo_quicksilver::pending::inventory(&map, &changed, 1)
+            .iter()
+            .all(|r| r.mutants == 0));
+    }
+    assert!(cargo_quicksilver::pending::inventory(&map, &state, usize::MAX).is_empty());
+    let mut scaffolding_map = map.clone();
+    for site in &mut scaffolding_map.sites {
+        site.scaffolding = Some("helper".into());
+    }
+    assert!(cargo_quicksilver::pending::inventory(&scaffolding_map, &state, 1).is_empty());
     reset();
 
     // Capturing the same edit again is a duplicate, not a second mutant.

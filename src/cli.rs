@@ -122,6 +122,8 @@ pub enum Command {
     /// List the functions no test enters, from the map of HEAD. `--package`
     /// and `--file` narrow the list.
     Uncovered(UncoveredArgs),
+    /// List entered functions that still need a captured mutant.
+    Pending(PendingArgs),
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
@@ -243,6 +245,30 @@ pub struct UncoveredArgs {
     /// `*_for_test`, or under a `cfg` that mentions `test`.
     #[arg(long)]
     pub scaffolding: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct PendingArgs {
+    /// Minimum function length in source lines, including the first and last.
+    #[arg(long, default_value_t = 1)]
+    pub min_lines: usize,
+    /// Include functions that already have mutants, with their mutant counts.
+    #[arg(long)]
+    pub all: bool,
+    /// Write this many lists balanced by source lines.
+    #[arg(long, requires = "out", value_parser = parse_positive_split)]
+    pub split: Option<usize>,
+    /// Directory for pending-1.txt through pending-N.txt.
+    #[arg(long, requires = "split", value_name = "DIR")]
+    pub out: Option<PathBuf>,
+}
+
+fn parse_positive_split(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or_else(|| "--split must be a positive integer".into())
 }
 
 #[derive(Args, Debug, Default)]

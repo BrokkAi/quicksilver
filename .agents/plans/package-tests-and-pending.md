@@ -10,11 +10,11 @@ Authors can configure partner test binaries for individual packages and ask whic
 
 - [x] (2026-10-24) Read issues #18 and #20 and inspected command, configuration, map and mutant state code.
 - [x] (2026-10-24) Implemented and verified #18; ready to commit.
-- [ ] Implement and verify #20, then commit.
+- [x] (2026-10-24) Implemented pending, inventory matching, balanced splitting and end-to-end checks; all required checks pass.
 
 ## Surprises & Discoveries
 
-GitHub access needs network escalation. The existing reverse_dependents helper includes transitive normal and development dependents and excludes build dependencies, matching the decided hint design.
+The first pending end-to-end test wrote reports inside its capture fixture; later captures correctly rejected those added files. Moving reporting output to a separate temporary directory fixed the test. GitHub access needs network escalation. The existing reverse_dependents helper includes transitive normal and development dependents and excludes build dependencies, matching the decided hint design.
 
 ## Decision Log
 
@@ -22,7 +22,7 @@ The delegated design is authoritative: package-specific extras follow CLI and gl
 
 ## Outcomes & Retrospective
 
-Issue #18 passes fmt, clippy (known build.rs warning only), library tests (138 passed, 1 ignored) and edited tests (2 passed). Sandbox process signal handling aborts library tests; the unsandboxed rerun passes. Issue #20 remains in progress.
+Issue #18 passes fmt, clippy (known build.rs warning only), library tests (138 passed, 1 ignored) and edited tests (2 passed). Sandbox process signal handling aborts library tests; the unsandboxed rerun passes. Issue #20 passes fmt, clippy (same known warning), library tests (139 passed, 1 ignored), and edited tests (2 passed). Both requested outcomes are complete.
 
 ## Context and Orientation
 
@@ -51,3 +51,5 @@ Evidence logs: /tmp/qs-18-20-logs. Issue details obtained with gh issue view 18 
 ## Interfaces and Dependencies
 
 Use existing cargo metadata dependency and reverse_dependents, serde JSON output and atomic writing. Keep FileConfig and PackageConfig strict with deny_unknown_fields. Pending reads State::load without modifying state or its persisted contract.
+
+Revision (2026-10-24): Recorded completed validation and the fixture-output fix. Pending follows the decided design with no persisted-state changes.

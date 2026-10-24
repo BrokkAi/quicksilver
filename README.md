@@ -202,6 +202,26 @@ before writing tests for it. Test scaffolding (functions in modules such as
 is left out; `--scaffolding` lists it.
 
 
+## Find functions that still need mutants
+
+After `map`, list entered functions with no captured mutant:
+
+```
+cargo quicksilver pending --min-lines 5 --package my_crate
+cargo quicksilver pending --split 4 --out mutant-lanes
+```
+
+Each line gives `path:line name (N lines)`. `--all` includes functions that
+already have mutants and shows their counts. Unviable mutants do not count;
+test scaffolding and functions no green test entered are left out.
+`--file` narrows the list and `--json FILE` saves the rows.
+
+`--split N --out DIR` also writes `pending-1.txt` through `pending-N.txt`,
+assigning the largest functions first to the list with the fewest lines so
+far. The summary reports functions with mutants and remaining functions and
+lines; each split file gets its own function and line counts.
+
+
 ## What the results mean
 
 - **Caught**: a test fails with the mutant and passes without it.
