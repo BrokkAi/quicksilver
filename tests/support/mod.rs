@@ -93,6 +93,8 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         prefix: git.prefix,
         extra_tests: Vec::new(),
         test_budget: Default::default(),
+        test_env: Default::default(),
+        sandbox: false,
         build_jobs: 2,
         test_jobs: 4,
         cm_jobs: 8,

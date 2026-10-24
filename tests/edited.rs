@@ -7,6 +7,21 @@ use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 use std::path::Path;
 
+fn walk_files(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            out.extend(walk_files(&entry.path()));
+        } else {
+            out.push(entry.path());
+        }
+    }
+    out
+}
+
 /// The whole loop on the `tiny` fixture: map once, then capture, build and
 /// test mutants written as edits to the checkout.
 #[test]
@@ -16,10 +31,29 @@ fn edited_mutants_are_captured_built_and_judged() {
         return;
     }
     let repo = support::setup_tiny();
-    let cfg = support::cfg_for(repo.path());
+    let mut cfg = support::cfg_for(repo.path());
+    cfg.sandbox = true;
+    cfg.test_env
+        .insert("FIXTURE_STATE".into(), "{sandbox}/state".into());
     let paths = cfg.paths();
+    cargo_quicksilver::sandbox::configure(&cfg, &paths).expect("sandbox");
 
     let map = build_map(&cfg, &paths).expect("map");
+    // The test that checks its HOME passed in its sandbox, and no sandbox
+    // is left behind.
+    assert!(
+        map.hits
+            .keys()
+            .any(|id| id.ends_with("state_goes_under_a_fresh_home")),
+        "{:?}",
+        map.hits.keys()
+    );
+    let left: Vec<_> = walk_files(&paths.session.join("sandbox"));
+    assert!(left.is_empty(), "{left:?}");
+    let summary = cargo_quicksilver::sandbox::current()
+        .and_then(|s| s.summary())
+        .expect("test processes ran in sandboxes");
+    assert!(summary.contains("all deleted"), "{summary}");
     let site = |fqn: &str| {
         map.sites
             .iter()
@@ -447,6 +481,15 @@ fn edited_mutants_are_captured_built_and_judged() {
     // The checkout was only read.
     assert_eq!(fs::read_to_string(&lib).unwrap(), original);
     assert!(!Path::new(&new_file).exists());
+    // Every sandbox from build and test is gone too, and the summary
+    // removes the empty directories that held them.
+    let summary = cargo_quicksilver::sandbox::summary().expect("sandboxes were used");
+    assert!(summary.contains("all deleted"), "{summary}");
+    assert!(!paths
+        .session
+        .join("sandbox")
+        .join(std::process::id().to_string())
+        .exists());
 }
 
 fn status_of(results: &[(EditedMutant, Status)], m: &EditedMutant) -> Status {

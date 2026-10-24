@@ -140,6 +140,21 @@ mod tests {
     }
 
     #[test]
+    fn state_goes_under_a_fresh_home() {
+        // Under quicksilver's sandbox each test process has a new HOME, and
+        // `[test-env]` puts FIXTURE_STATE in the same sandbox.
+        let Ok(state) = std::env::var("FIXTURE_STATE") else {
+            return;
+        };
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert_eq!(std::path::Path::new(&state).parent(), home.parent());
+        let marker = home.join(".cache").join("fixture").join("marker");
+        assert!(!marker.exists(), "{} is left over", marker.display());
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, add(1, 2).to_string()).unwrap();
+    }
+
+    #[test]
     fn parse_pair_works() {
         assert_eq!(parse_pair("1, 2"), (1, 2));
     }

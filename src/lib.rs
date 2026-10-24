@@ -16,6 +16,7 @@ pub mod plan;
 pub mod progress;
 pub mod proptest;
 pub mod report;
+pub mod sandbox;
 pub mod scan;
 pub mod schema;
 pub mod scratch;
@@ -44,7 +45,7 @@ pub fn init_tracing() {
 
 pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     init_tracing();
-    match cli.command {
+    let result = match cli.command {
         cli::Command::List(_) => cmd_list(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
         cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
@@ -54,7 +55,11 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Test(args) => cmd_test(&cli.common, args),
         cli::Command::Uncovered(args) => cmd_uncovered(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
+    };
+    if let Some(line) = sandbox::summary() {
+        eprintln!("{line}");
     }
+    result
 }
 
 fn cmd_map(common: &cli::CommonOpts, args: cli::MapArgs) -> Result<i32> {

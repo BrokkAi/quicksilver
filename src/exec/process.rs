@@ -89,6 +89,7 @@ pub fn run_exact_with_env(
     // is likewise only on when the caller asks for it.
     cmd.env_remove("QS_MUTANT");
     cmd.env_remove("QS_RECORD_SITES");
+    let _sandbox = sandbox(&mut cmd)?;
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -127,6 +128,7 @@ pub fn run_exact_capture_with_env(
     // "no mutant active", which is what the null runs depend on.
     cmd.env_remove("QS_MUTANT");
     cmd.env_remove("QS_RECORD_SITES");
+    let _sandbox = sandbox(&mut cmd)?;
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -189,6 +191,16 @@ pub fn run_exact_capture_with_env(
         elapsed,
         String::from_utf8_lossy(&bytes).into_owned(),
     ))
+}
+
+/// The configured sandbox and `[test-env]` for one test process. The
+/// sandbox is deleted when the guard drops, after the process (and, on a
+/// timeout, its process group) is gone.
+fn sandbox(cmd: &mut Command) -> Result<Option<crate::sandbox::Sandbox>> {
+    match crate::sandbox::current() {
+        Some(settings) => settings.prepare(cmd),
+        None => Ok(None),
+    }
 }
 
 fn kill_tree(child: &std::process::Child) {

@@ -45,6 +45,11 @@ pub struct CommonOpts {
     #[arg(long = "extra-tests", value_name = "BINARY", global = true)]
     pub extra_tests: Vec<String>,
 
+    /// Run tests in your own environment. By default each test process gets
+    /// a new HOME, XDG directories and TMPDIR, deleted when it exits.
+    #[arg(long, global = true)]
+    pub no_sandbox: bool,
+
     /// Restrict mutants to matching files (globs).
     #[arg(long = "file", global = true)]
     pub files: Vec<String>,

@@ -28,23 +28,38 @@ After this plan:
 
 
 - [x] (2026-10-23 23:10Z) Read all ten issues and the code they touch, including the other session's seven commits (50cf721 to 5b05298).
-- [ ] #7 capture: lock, `--patch`, `--skip-outside-bodies`, remove `--capture-only`.
-- [ ] #2 original body and intent.
-- [ ] #4 nested items as sites.
-- [ ] #3 direct builds for `impl Trait` sites.
-- [ ] #6 host `cfg` and target triple.
-- [ ] #9 `uncovered` marks.
-- [ ] #8 `--extra-tests`.
-- [ ] #5 timeouts.
-- [ ] #10 proptest.
-- [ ] #1 sandbox.
-- [ ] README and outcomes.
+- [x] (2026-10-23) #7 capture: lock, `--patch`, `--skip-outside-bodies`, remove `--capture-only` (1dc454d).
+- [x] (2026-10-23) #2 original body and intent (c507c2f).
+- [x] (2026-10-23) #4 nested items as sites (f57ec39).
+- [x] (2026-10-23) #3 direct builds for `impl Trait` sites (3f8b0dd).
+- [x] (2026-10-23) #6 host `cfg` and target triple (bd1330b).
+- [x] (2026-10-23) #9 `uncovered` marks (8ee0dcc).
+- [x] (2026-10-23) #8 `--extra-tests` (3491126).
+- [x] (2026-10-23) #5 timeouts (f0a2d38).
+- [x] (2026-10-23) #10 proptest (7e279b1).
+- [x] (2026-10-23) #1 sandbox, in the commit that closes this plan.
+- [x] (2026-10-23) README updated with each issue; the sample `outcomes:` line regenerated from a clap run.
 
 
 ## Surprises & Discoveries
 
 
-(none yet)
+- Even a single schema arm cannot hold an edited mutant of an `-> impl Trait` function: the original body stays after the prologue, so a different concrete type (any other closure) conflicts. Hence direct builds (#3).
+  Evidence: the `as_impl` fixture mutant was unviable under the schema and compiles directly.
+
+- Nested sites need offsets into the already rewritten text: an outer function's prologue shifts every inner body. `schema::apply_to_source` maps offsets with `shifted()`, and errors are attributed to the innermost site (#4).
+  Evidence: `nested_sites_get_offsets_into_the_rewritten_text`.
+
+- The calibration test with a 40 s null run against a 120 s budget failed under `<=`; the issue says "under a third", so the comparison is a strict `<` (#5).
+
+- nextest 0.9.140 still marks setup scripts as experimental ("experimental features used but not enabled: setup-scripts"), so there is no stable way to give only the baseline's test processes a sandbox while `mbx nextest run` keeps the user's environment (#1).
+
+- The first clap run with the sandbox turned `clap_complete::examples::example_tests` red: it builds the examples through the mbx cargo shim, which binds a socket under `TMPDIR`, and the sandbox path under `.git/quicksilver/main/.quicksilver/sandbox/<pid>/<n>/tmp` was longer than a Unix socket path may be.
+  Evidence: `mbx[error]: failed to bind cache session listener at /mnt/optane/quicksilver/local/clap/.git/quicksilver/main/.quicksilver/sandbox/79228/81/tmp/mbx-session-OnIIon/cache-agent.sock: path must be shorter than SUN_LEN`. With the short links the test is green and the sandboxed and unsandboxed runs give the same outcomes.
+
+- The old README sample (`--limit 120 -p clap_lex -p clap_complete`, 46 caught and 1 missed) no longer reproduces at the same clap commit: the same command now makes 41 mutant builds instead of 59, and `OsStr::contains { true }` is the 239th of 302 mutants, past the limit. `--limit` keeps the first planned mutants in batch order (`src/exec/schema.rs`), so changes to the catalog (nested functions, compiled-out functions) change which ones run. With no limit, `-p clap_lex` has no missed mutant, so the README now shows that run's real summary.
+
+- mbx uses `HOME` for C-compiler path mappings (`crates/mbx/src/cc.rs`, `path_mappings`) and for `~` in its `keep` and `evict_first` patterns (`crates/mbx/src/config.rs`). Running mbx itself with a sandboxed `HOME` could therefore change its caching.
 
 
 ## Decision Log
@@ -80,11 +95,25 @@ After this plan:
   Rationale: a fresh `HOME` alone would make child cargo builds lose the registry and mbx create a new cache inside the sandbox.
   Date/Author: 2026-10-23, Claude.
 
+- Decision (#1): every test process QS starts itself is sandboxed (site recording in `map`, mutant runs, null runs, timeout calibration), each in its own directory. The baseline `cargo nextest run` is not, which departs from the issue's proposal to run the baseline in the same sandbox.
+  Rationale: the baseline runs no mutants, so it cannot plant bad state; the verdicts compare only sandboxed runs, and a test that fails in the sandbox is not green in the recording and selects nothing. Sandboxing it would mean changing `HOME` for mbx itself (see Surprises) or depending on nextest's experimental setup scripts.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision (#1): each sandbox's variables name it through a symbolic link `<system temp>/qs-sandbox-<random>/<n>`, in a directory only the user can enter; the files stay under QS's state.
+  Rationale: a Unix socket's path must fit in about 108 bytes, and the state directory can be deep. The issue asked for the data to stay on the worktree's filesystem, because a `TMPDIR` under `/tmp` filled the root disk; the link keeps the data there and the paths short.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision (#1): the reported size is what a process left in its sandbox when it exited, measured before deletion, not a true peak.
+  Rationale: a true peak needs polling during the run; what a process leaves is what filled the disk in the field report.
+  Date/Author: 2026-10-23, Claude.
+
 
 ## Outcomes & Retrospective
 
 
-(to be written)
+All ten issues are fixed, one commit each with "Fixes #N". The unit tests, `tests/edited.rs`, `tests/engine.rs` and `tests/schema.rs` pass. The end-to-end test in `tests/edited.rs` now covers patches, skipping edits outside bodies, intents, nested sites, `impl Trait` direct builds, `cfg` filtering, `uncovered` marks, proptest flagging with a re-run, and the sandbox (a fixture test that checks its `HOME` and `[test-env]` passes, and no sandbox file remains).
+
+Not done: a true peak size per sandbox, and sandboxing the baseline nextest run (see Decision Log). Bifrost-core itself was not re-run; the fixes were checked on the fixture and on clap.
 
 
 ## Context and Orientation
@@ -108,7 +137,10 @@ Plain code changes; each commit stands alone and can be reverted.
 ## Artifacts and Notes
 
 
-(to be filled)
+Runs in `/mnt/optane/quicksilver/local/clap` at 13f2db5, inside `systemd-run --user --scope -p MemoryMax=48G`:
+
+- `run --build-jobs 3 -p clap_lex` (the README sample), log `clap-lex-run.log`: 67 total, 40 caught, 0 missed, 13 not covered, 14 unviable; 240 sandboxed test processes, the largest left 1.7 KiB, all deleted.
+- `run --build-jobs 3 --limit 120 -p clap_lex -p clap_complete`, with and without `--no-sandbox` (logs `clap-sandbox-run.log`, `clap-nosandbox-run.log`): both 31 caught, 74 not covered, 15 unviable, no test red.
 
 
 ## Interfaces and Dependencies

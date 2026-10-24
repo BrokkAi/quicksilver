@@ -24,6 +24,19 @@ pub struct FileConfig {
     /// own deadlines longer than three times their duration.
     #[serde(rename = "test-budget", default)]
     pub test_budget: BTreeMap<String, f64>,
+    /// Variables for every test process; `{sandbox}` in a value is the
+    /// process's sandbox directory.
+    #[serde(rename = "test-env", default)]
+    pub test_env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub sandbox: SandboxFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxFile {
+    /// `false` runs tests in the caller's own environment.
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +61,10 @@ pub struct Config {
     pub extra_tests: Vec<String>,
     /// Minimum budget in seconds per test id or name.
     pub test_budget: BTreeMap<String, f64>,
+    /// `[test-env]`: variables for every test process QS starts.
+    pub test_env: BTreeMap<String, String>,
+    /// Whether each test process gets its own HOME and TMPDIR.
+    pub sandbox: bool,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
     pub json: Option<PathBuf>,
@@ -143,6 +160,8 @@ pub fn merge_config(
         packages: extras.packages,
         reverse_dependents: cli.reverse_dependents,
         test_budget: file.test_budget.clone(),
+        test_env: file.test_env.clone(),
+        sandbox: !cli.no_sandbox && file.sandbox.enabled.unwrap_or(true),
         extra_tests: {
             let mut v = cli.extra_tests.clone();
             for b in &file.extra_tests {

@@ -46,27 +46,26 @@ Or every function in a package:
 cargo quicksilver run --package my_crate
 ```
 
-With `--package`, only that package's own tests count. To add a test binary
-of another package that exercises it, name the binary as nextest does:
-`--extra-tests other_pkg::suite_name` (repeatable, or `extra-tests = [...]`
-in `quicksilver.toml`).
-
-With `--package`, only that package's own tests are built and run. Add
-`--reverse-dependents` to also use the tests of every workspace package that
-depends on it. For a crate low in the dependency graph, that can be most of
-the workspace's tests.
+With `--package`, only that package's own tests are built and run. To add a
+test binary of another package that exercises it, name the binary as nextest
+does: `--extra-tests other_pkg::suite_name` (repeatable, or
+`extra-tests = [...]` in `quicksilver.toml`). `--reverse-dependents` adds the
+tests of every workspace package that depends on it. For a crate low in the
+dependency graph, that can be most of the workspace's tests.
 
 Quicksilver replaces each function's body with a simple value of its return
 type, such as `0`, `true`, `None` or `Default::default()`. It prints a
-summary and a line for each missed mutant:
+summary, here for clap's `clap_lex` package:
 
 ```
-outcomes: 120 total — 46 caught (0 by crash), 1 missed, 56 not covered, 16 unviable, 0 errored, 1 timeout (59 mutant builds, 5 cargo invocations)
-  MISSED  a21a581a0a795431  clap_lex::clap_lex.ext.OsStr.contains  { true }
+outcomes: 67 total — 40 caught (0 by crash, 0 by timeout), 0 missed, 13 not covered, 14 unviable, 0 errored, 0 timeout (51 mutant builds, 2 cargo invocations)
+sandbox: 240 test processes ran with their own HOME and TMPDIR; the largest left 1.7 KiB; all deleted
 ```
 
-That line says no test notices when `OsStr::contains` always returns `true`.
-`run` exits with 1 when a mutant was missed, so it can gate CI.
+Each missed mutant also gets a line with its id, function and new body, such
+as `MISSED <id> my_crate::my_crate.parse.is_valid { true }`: no test notices
+when `is_valid` always returns `true`. `run` exits with 1 when a mutant was
+missed, so it can gate CI.
 
 To keep quicksilver away from a function, mark it with `#[mutants::skip]`.
 
@@ -184,6 +183,35 @@ is left out; `--scaffolding` lists it.
   tests a longer budget, for example `"my_crate::tests::waits" = 60.0`.
 - **Errored**: a test could not run properly, for example because it fails
   even without the mutant.
+
+
+## Tests run in a sandbox
+
+A mutant can make a test write the wrong thing to the wrong place. So each
+test process quicksilver starts gets its own `HOME`, `XDG_CONFIG_HOME`,
+`XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR`, in a new
+directory under `.git/quicksilver/`, deleted when the process exits. The
+variables reach it through a short link under the system temporary
+directory, because a Unix socket's path must be short. At the end,
+quicksilver says how many processes ran and the most any one left behind.
+
+Tests that run cargo, rustup, git or mbx still work: `CARGO_HOME`,
+`RUSTUP_HOME` and `MBX_CACHE_DIR` point at your own, and your git and mbx
+config files are copied in. A test that needs other files from your home
+directory will fail in the sandbox and select no mutants.
+
+`[test-env]` in `quicksilver.toml` sets more variables for every test
+process; `{sandbox}` stands for the process's sandbox directory:
+
+```toml
+[test-env]
+BIFROST_CACHE_ROOT = "{sandbox}/cache"
+```
+
+`--no-sandbox`, or `enabled = false` under `[sandbox]`, runs tests in your
+own environment. The baseline `cargo nextest run`, which runs no mutants,
+always runs in your environment: it runs through mbx, and a different
+`HOME` can change how mbx caches builds.
 
 
 ## Clean up
