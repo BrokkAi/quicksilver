@@ -55,6 +55,9 @@ pub struct Settings {
     /// `[test-env]`, with the placeholder still in the values.
     test_env: BTreeMap<String, String>,
     next: AtomicU64,
+    /// Set by [`Settings::finish`]: from then on, the last sandbox to go
+    /// also removes the run's directory.
+    finished: std::sync::atomic::AtomicBool,
     processes: AtomicU64,
     largest: AtomicU64,
     kept: Mutex<Vec<(PathBuf, String)>>,
@@ -189,6 +192,7 @@ impl Settings {
             copies,
             test_env,
             next: AtomicU64::new(0),
+            finished: std::sync::atomic::AtomicBool::new(false),
             processes: AtomicU64::new(0),
             largest: AtomicU64::new(0),
             kept: Mutex::new(Vec::new()),
@@ -311,6 +315,13 @@ impl Drop for Sandbox {
                 .lock()
                 .unwrap()
                 .push((self.dir.clone(), err.to_string()));
+        }
+        // A test process that started after the run finished (another test
+        // in the same process, in QS's own tests) made the directory again.
+        if s.finished.load(Ordering::SeqCst) {
+            if let Some(root) = self.dir.parent() {
+                let _ = fs::remove_dir(root);
+            }
         }
     }
 }
@@ -464,6 +475,7 @@ pub fn summary() -> Option<String> {
 
 impl Settings {
     fn finish(&self) {
+        self.finished.store(true, Ordering::SeqCst);
         if let Some(root) = self.root() {
             let _ = fs::remove_dir(root);
         }
@@ -595,6 +607,12 @@ mod tests {
         assert!(summary.contains("all deleted"), "{summary}");
         // The two config copies and the 5000-byte file.
         assert!(settings.largest.load(Ordering::Relaxed) >= 5000);
+        // A process started after the end does not leave the directory.
+        let mut late = Command::new("/bin/true");
+        let sandbox = settings.prepare(&mut late).unwrap().unwrap();
+        assert!(root.exists());
+        drop(sandbox);
+        assert!(!root.exists());
     }
 
     /// A Unix socket's path must fit in about 100 bytes. The mbx cargo shim
