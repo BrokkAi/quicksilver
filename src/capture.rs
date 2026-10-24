@@ -765,34 +765,46 @@ fn capture_files(
 /// relative to the workspace or, with `prefix`, to the repository). A key
 /// that matches several mutants is not applied: guessing is how notes ended
 /// up on sibling mutants. `spans` gives each mutant's first and last line.
-/// Returns one warning per key not applied.
+///
+/// One intents file may cover several builds, so a key that matches no
+/// mutant of this build is only reported when it names none of `functions`
+/// (every function in the map, as full name, path and line span): a typo or
+/// a name from another commit. The rest are counted in one line.
+/// Returns the lines to print.
 pub fn attach_intents(
     mutants: &mut [EditedMutant],
     spans: &[(usize, usize)],
     intents: &BTreeMap<String, String>,
     prefix: &str,
+    functions: &[(&str, &str, (usize, usize))],
 ) -> Vec<String> {
     let mut warnings = Vec::new();
+    let mut elsewhere = 0usize;
     for (key, text) in intents {
         let by_line = key.rsplit_once(':').and_then(|(path, line)| {
             let line: usize = line.parse().ok()?;
             Some((path.strip_prefix(prefix).unwrap_or(path), line))
         });
+        let names = |fqn: &str, path: &str, span: (usize, usize)| {
+            fqn == key
+                || by_line.is_some_and(|(p, line)| path == p && span.0 <= line && line <= span.1)
+        };
         let hits: Vec<usize> = mutants
             .iter()
             .enumerate()
-            .filter(|(i, m)| {
-                m.edits.iter().any(|e| {
-                    e.fqn == *key
-                        || by_line.is_some_and(|(path, line)| {
-                            e.path == path && spans[*i].0 <= line && line <= spans[*i].1
-                        })
-                })
-            })
+            .filter(|(i, m)| m.edits.iter().any(|e| names(&e.fqn, &e.path, spans[*i])))
             .map(|(i, _)| i)
             .collect();
         match hits.as_slice() {
-            [] => warnings.push(format!("intent for `{key}` matched no captured mutant")),
+            [] if functions
+                .iter()
+                .any(|(fqn, path, span)| names(fqn, path, *span)) =>
+            {
+                elsewhere += 1
+            }
+            [] => warnings.push(format!(
+                "intent for `{key}` names no function in the map (a typo, or a name from another commit?)"
+            )),
             [one] => mutants[*one].intent = Some(text.clone()),
             many => warnings.push(format!(
                 "intent for `{key}` matched {} mutants ({}); not applied",
@@ -803,6 +815,11 @@ pub fn attach_intents(
                     .join(", ")
             )),
         }
+    }
+    if elsewhere > 0 {
+        warnings.push(format!(
+            "{elsewhere} intent(s) name functions that this build did not capture"
+        ));
     }
     warnings
 }
@@ -1134,11 +1151,22 @@ mod tests {
             ("src/registry.rs:42", "inverted negation"),
             ("k.twice", "ambiguous"),
             ("new", "a short name matches nothing"),
+            ("k.other", "for another build"),
+            ("src/other.rs:7", "also for another build"),
+            ("src/other.rs:99", "past the end of every function"),
         ]
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
-        let warnings = attach_intents(&mut mutants, &spans, &intents, "");
+        // The map also has `k.other` (lines 5 to 8 of src/other.rs), which
+        // this build did not capture.
+        let functions = [
+            ("k.Scope.new", "src/scope.rs", a_lines),
+            ("k.SchemaVersionRegistry.new", "src/registry.rs", b_lines),
+            ("k.twice", "src/t.rs", c1_lines),
+            ("k.other", "src/other.rs", (5, 8)),
+        ];
+        let warnings = attach_intents(&mut mutants, &spans, &intents, "", &functions);
         assert_eq!(
             mutants[0].intent.as_deref(),
             Some("off-by-one at the upper bound")
@@ -1146,13 +1174,20 @@ mod tests {
         assert_eq!(mutants[1].intent.as_deref(), Some("inverted negation"));
         assert_eq!(mutants[2].intent, None);
         assert_eq!(mutants[3].intent, None);
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
         assert!(warnings
             .iter()
             .any(|w| w.contains("k.twice") && w.contains("2 mutants")));
         assert!(warnings
             .iter()
-            .any(|w| w.contains("`new`") && w.contains("no captured")));
+            .any(|w| w.contains("`new`") && w.contains("names no function")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("`src/other.rs:99`") && w.contains("names no function")));
+        // The two keys for another build are one line, not one each.
+        assert!(warnings
+            .contains(&"2 intent(s) name functions that this build did not capture".to_string()));
+        assert!(!warnings.iter().any(|w| w.contains("k.other")));
     }
 
     #[test]

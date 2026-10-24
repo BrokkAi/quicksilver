@@ -902,7 +902,18 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
                     .map_or((0, 0), |s| (s.start_line, s.end_line))
             })
             .collect();
-        for w in crate::capture::attach_intents(&mut all, &spans, &sources.intents, &map.prefix) {
+        let functions: Vec<(&str, &str, (usize, usize))> = map
+            .sites
+            .iter()
+            .map(|s| (s.fqn.as_str(), s.path.as_str(), (s.start_line, s.end_line)))
+            .collect();
+        for w in crate::capture::attach_intents(
+            &mut all,
+            &spans,
+            &sources.intents,
+            &map.prefix,
+            &functions,
+        ) {
             eprintln!("  {w}");
         }
         let mut it = all.into_iter();

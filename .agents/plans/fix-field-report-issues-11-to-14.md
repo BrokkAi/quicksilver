@@ -23,7 +23,7 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 
 - [x] (2026-10-23) Read the four issues and the code they touch; fast-forwarded to b71b180 (the other session's allocator fix).
 - [x] (2026-10-23) #12 proptest re-run wording and JSON.
-- [ ] #13 intent warnings.
+- [x] (2026-10-23) #13 intent warnings.
 - [ ] #11 caller check in-process.
 - [ ] #14 sandbox location and not-green output.
 

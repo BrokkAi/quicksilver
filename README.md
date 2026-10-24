@@ -128,7 +128,10 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    `--intents notes.json`: a JSON object from a function's full name (as
    quicksilver prints it) or `path:line` to a note, such as
    `{"crate_a/src/lib.rs:2": "subtracts instead of adding"}`. Survivors are
-   shown with their note and a diff of the original body.
+   shown with their note and a diff of the original body. One file can
+   serve several builds: `build` warns only about keys that name no
+   function in the map, and counts the keys meant for other builds in one
+   line.
 
 4. **Test them all.**
 
