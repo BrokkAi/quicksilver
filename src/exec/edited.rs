@@ -970,6 +970,63 @@ pub fn read_intents(path: &Path) -> Result<BTreeMap<String, String>> {
     })
 }
 
+const SINGLE_TOKEN_MIN_MUTANTS: usize = 10;
+const SINGLE_TOKEN_WARNING_PERCENT: usize = 80;
+
+/// Compare token text, keeping group boundaries but ignoring whitespace.
+fn changed_token_count(original: &str, body: &str) -> Option<usize> {
+    fn flatten(stream: proc_macro2::TokenStream, out: &mut Vec<String>) {
+        use proc_macro2::{Delimiter, TokenTree};
+        for token in stream {
+            match token {
+                TokenTree::Group(group) => {
+                    let delimiters = match group.delimiter() {
+                        Delimiter::Parenthesis => Some(("(", ")")),
+                        Delimiter::Brace => Some(("{", "}")),
+                        Delimiter::Bracket => Some(("[", "]")),
+                        Delimiter::None => None,
+                    };
+                    if let Some((open, _)) = delimiters {
+                        out.push(open.into());
+                    }
+                    flatten(group.stream(), out);
+                    if let Some((_, close)) = delimiters {
+                        out.push(close.into());
+                    }
+                }
+                leaf => out.push(leaf.to_string()),
+            }
+        }
+    }
+    let mut before = Vec::new();
+    let mut after = Vec::new();
+    flatten(original.parse().ok()?, &mut before);
+    flatten(body.parse().ok()?, &mut after);
+    (before.len() == after.len()).then(|| before.iter().zip(&after).filter(|(a, b)| a != b).count())
+}
+
+fn changes_single_token(mutant: &EditedMutant) -> bool {
+    mutant.edits.iter().try_fold(0usize, |total, edit| {
+        Some(total + changed_token_count(&edit.original, &edit.body)?)
+    }) == Some(1)
+}
+
+fn report_single_token_changes(source: &str, outcome: &CaptureOutcome) {
+    let total = outcome.mutants.len();
+    if total < SINGLE_TOKEN_MIN_MUTANTS {
+        return;
+    }
+    let single = outcome
+        .mutants
+        .iter()
+        .filter(|m| changes_single_token(m))
+        .count();
+    eprintln!("{source}: {single} of {total} mutants change a single token");
+    if single * 100 >= total * SINGLE_TOKEN_WARNING_PERCENT {
+        eprintln!("warning: most of {source}'s mutants change a single token, such as one operator; check that each function was read and given a realistic fault");
+    }
+}
+
 /// Print a capture's dropped edits and problems. Returns false when the
 /// capture was rejected.
 fn check_capture(source: &str, outcome: &CaptureOutcome, report: &mut BuildReport) -> bool {
@@ -1148,6 +1205,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     }
     let captured_any = !captures.is_empty();
     for (source, outcome) in captures {
+        report_single_token_changes(&source, &outcome);
         record_capture(&mut state, &source, outcome, &mut report);
     }
     if captured_any {
@@ -1706,6 +1764,52 @@ pub fn test(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_comparison_counts_text_changes_and_rejects_invalid_tokens() {
+        for (before, after, expected) in [
+            ("{ a + b }", "{ a - b }", Some(1)),
+            ("{ 42 }", "{ 43 }", Some(1)),
+            ("{ first }", "{ second }", Some(1)),
+            ("{ a + b }", "{ a - c }", Some(2)),
+            ("{ a }", "{ a + b }", None),
+            ("{ a }", "{ ", None),
+            ("{ ", "{ a }", None),
+            ("{ (a) }", "{ [a] }", Some(2)),
+            ("{ a + b }", "{a /* same tokens */ + b}", Some(0)),
+        ] {
+            assert_eq!(
+                changed_token_count(before, after),
+                expected,
+                "{before} -> {after}"
+            );
+        }
+    }
+
+    #[test]
+    fn single_token_count_sums_all_edits() {
+        let edit = |original: &str, body: &str| crate::capture::BodyEdit {
+            site_id: 0,
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: "p.f".into(),
+            line: 1,
+            original: original.into(),
+            body: body.into(),
+        };
+        let mut mutant = EditedMutant {
+            id: "m".into(),
+            edits: vec![edit("{ 1 }", "{ 2 }")],
+            intent: None,
+        };
+        assert!(changes_single_token(&mutant));
+        mutant.edits.push(edit("{ a }", "{ a }"));
+        assert!(changes_single_token(&mutant));
+        mutant.edits.push(edit("{ b }", "{ c }"));
+        assert!(!changes_single_token(&mutant));
+        mutant.edits[2] = edit("{ b }", "{ ");
+        assert!(!changes_single_token(&mutant));
+    }
+
     #[test]
     fn duplicate_notes_fill_missing_notes_and_keep_the_first_note() {
         let mut state = State::default();

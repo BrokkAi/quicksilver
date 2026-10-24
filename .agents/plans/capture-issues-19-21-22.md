@@ -10,7 +10,7 @@ Authors can attach separate notes to two patches that edit the same function, se
 
 - [x] (2026-10-24) Read issues #19, #21 and #22 and inspect capture flow.
 - [x] (2026-10-24) Implemented #19; formatting, clippy and both test suites pass.
-- [ ] Implement and verify #21, then commit.
+- [x] (2026-10-24) Implemented #21; formatting, clippy and both test suites pass.
 - [ ] Implement and verify #22, then commit.
 
 ## Context and Orientation
@@ -62,3 +62,5 @@ Issue #19 now supports explicit patch notes and duplicate note merging. Library 
 Sandboxed process tests initially aborted in wait-timeout due to denied signaling; rerunning with permitted host operations passed. Validation logs will be listed in the handback report. Plan created before implementation to track the three independent commits.
 
 Updated after #19 validation to record note behavior and the sandbox limitation.
+
+Updated after #21: source summaries include duplicates and use named thresholds of ten mutants and eighty percent. Token tests cover all requested cases, group boundaries, whitespace and multiple edits. Library tests: 141 passed, one ignored; edited tests: two passed; only the known clippy warning remains.
