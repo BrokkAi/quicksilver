@@ -81,8 +81,16 @@ pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
         match o.kind {
             VerdictKind::Missed => {
                 eprintln!(
-                    "  MISSED  {}  {}::{}  {}",
-                    o.mutant.id, o.mutant.package, o.mutant.fqn, o.mutant.replacement
+                    "  MISSED  {}  {}::{}  {}{}",
+                    o.mutant.id,
+                    o.mutant.package,
+                    o.mutant.fqn,
+                    o.mutant.replacement,
+                    if o.message.as_deref() == Some(crate::proptest::NOTE) {
+                        "  (proptest properties only; may vary between runs)"
+                    } else {
+                        ""
+                    }
                 );
             }
             VerdictKind::Timeout => {

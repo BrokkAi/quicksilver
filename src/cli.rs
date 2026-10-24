@@ -245,6 +245,10 @@ pub struct TestArgs {
     /// Only mutants whose id starts with this (repeatable).
     #[arg(long = "mutant")]
     pub mutants: Vec<String>,
+    /// Run a survivor that only proptest properties judged once more with
+    /// `PROPTEST_CASES` set to this, before calling it missed (0: never).
+    #[arg(long, default_value_t = 0)]
+    pub proptest_cases: u32,
 }
 
 #[derive(Args, Debug, Default)]

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 6;
+pub const MAP_VERSION: u32 = 7;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -78,6 +78,9 @@ pub struct SiteMap {
     pub hits: BTreeMap<String, Vec<u32>>,
     /// Tests that did not pass under the schema binary, with why.
     pub not_green: Vec<(String, String)>,
+    /// Ids of the tests that are proptest properties.
+    #[serde(default)]
+    pub property_tests: std::collections::BTreeSet<String>,
     /// The worker tree the map was built in; `build` rebuilds there.
     pub worker: PathBuf,
     /// Staged binaries of the map build (the recording run).
@@ -498,6 +501,7 @@ mod tests {
             tests: vec![t("p::t1")],
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
             not_green: Vec::new(),
+            property_tests: Default::default(),
             worker: PathBuf::new(),
             run_dir: PathBuf::new(),
             map_secs: 0.0,
@@ -560,6 +564,7 @@ mod tests {
             .into_iter()
             .collect(),
             not_green: Vec::new(),
+            property_tests: Default::default(),
             worker: PathBuf::new(),
             run_dir: PathBuf::new(),
             map_secs: 0.0,

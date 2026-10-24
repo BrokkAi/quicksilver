@@ -143,6 +143,11 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
 
    Each mutant runs only the tests that enter the functions it changed.
 
+   A verdict that only [proptest](https://docs.rs/proptest) properties
+   decided is flagged: properties run random cases, so the verdict can
+   change between runs. `--proptest-cases 1024` runs such a survivor once
+   more with `PROPTEST_CASES=1024` before calling it missed.
+
 
 ## Find functions no test reaches
 

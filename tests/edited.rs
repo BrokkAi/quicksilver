@@ -288,6 +288,60 @@ fn edited_mutants_are_captured_built_and_judged() {
     let impl_ms = report.captured.clone();
     fs::write(&schema_lib, &schema_original).unwrap();
 
+    // A survivor that only proptest properties judged is flagged, and more
+    // cases can catch it.
+    assert!(
+        map.property_tests
+            .iter()
+            .any(|id| id.ends_with("shout_property")),
+        "{:?}",
+        map.property_tests
+    );
+    fs::write(
+        &schema_lib,
+        schema_original.replace("    s.to_uppercase()\n", "    s.to_lowercase()\n"),
+    )
+    .unwrap();
+    let lower_patch = repo.path().join("../shout_lower.patch");
+    fs::write(&lower_patch, git_diff()).unwrap();
+    fs::write(
+        &schema_lib,
+        schema_original.replace("    s.to_uppercase()\n", "    s.to_string()\n"),
+    )
+    .unwrap();
+    let report = build_with(vec![lower_patch], false);
+    assert_eq!(report.captured.len(), 2, "{:?}", report.captured);
+    fs::write(&schema_lib, &schema_original).unwrap();
+    let lower = report
+        .captured
+        .iter()
+        .find(|m| m.edits[0].body.contains("to_lowercase"))
+        .unwrap()
+        .clone();
+    let same = report
+        .captured
+        .iter()
+        .find(|m| m.edits[0].body.contains("to_string"))
+        .unwrap()
+        .clone();
+    let results = test(&cfg, &paths, std::slice::from_ref(&lower.id), 0).expect("test");
+    assert_eq!(results.len(), 1);
+    let v = &results[0].1;
+    assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
+    assert!(v.note.is_some(), "{v:?}");
+    assert!(cargo_quicksilver::exec::edited::verdict_line(&lower, v)
+        .contains("proptest properties only"));
+    let results = test(&cfg, &paths, std::slice::from_ref(&same.id), 1000).expect("test");
+    let v = &results[0].1;
+    assert_eq!(v.kind, VerdictKind::Caught, "{v:?}");
+    assert!(
+        v.message
+            .as_deref()
+            .is_some_and(|m| m.contains("PROPTEST_CASES=1000")),
+        "{v:?}"
+    );
+    assert!(v.note.is_some(), "a property decided it: {v:?}");
+
     // An edit outside any body rejects the round, unless edits outside
     // bodies are skipped: then the body edit is kept and the comment dropped.
     edit(
@@ -342,7 +396,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     );
     fs::remove_file(&new_file).unwrap();
 
-    let results = test(&cfg, &paths, &[]).expect("test");
+    let results = test(&cfg, &paths, &[], 0).expect("test");
     let verdict = |m: &EditedMutant| {
         &results
             .iter()
@@ -389,7 +443,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     );
 
     // Tested mutants are final: a second test run has nothing to do.
-    assert!(test(&cfg, &paths, &[]).unwrap().is_empty());
+    assert!(test(&cfg, &paths, &[], 0).unwrap().is_empty());
     // The checkout was only read.
     assert_eq!(fs::read_to_string(&lib).unwrap(), original);
     assert!(!Path::new(&new_file).exists());

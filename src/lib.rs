@@ -14,6 +14,7 @@ pub mod linediff;
 pub mod outcome;
 pub mod plan;
 pub mod progress;
+pub mod proptest;
 pub mod report;
 pub mod scan;
 pub mod schema;
@@ -239,7 +240,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let paths = cfg.paths();
     paths.ensure()?;
-    let results = exec::edited::test(&cfg, &paths, &args.mutants)?;
+    let results = exec::edited::test(&cfg, &paths, &args.mutants, args.proptest_cases)?;
     if results.is_empty() {
         eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
     }

@@ -42,6 +42,10 @@ pub fn not_windows() -> u32 {
     2
 }
 
+pub fn shout(s: &str) -> String {
+    s.to_uppercase()
+}
+
 pub fn calls_no_one_tests() -> u32 {
     called_in_production()
 }
@@ -117,6 +121,22 @@ mod tests {
     fn impl_and_dyn_work() {
         assert_eq!(format!("{}", as_impl()), "42");
         let _ = format!("{:?}", as_dyn());
+    }
+
+    // Stands in for the proptest crate: QS finds properties by the macro's
+    // name, and `PROPTEST_CASES` plays the part of more random cases.
+    macro_rules! proptest {
+        ($(#[test] fn $name:ident() $body:block)*) => { $(#[test] fn $name() $body)* };
+    }
+
+    proptest! {
+        #[test]
+        fn shout_property() {
+            assert!(!shout("a").is_empty());
+            if std::env::var("PROPTEST_CASES").as_deref() == Ok("1000") {
+                assert_eq!(shout("a"), "A");
+            }
+        }
     }
 
     #[test]

@@ -68,6 +68,9 @@ pub struct Verdict {
     /// Tests that ran, in order.
     pub tests_run: Vec<String>,
     pub secs: f64,
+    /// Set when only proptest properties decided the verdict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,6 +564,11 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
 
     let worker = crate::scratch::ensure_worker(paths, 0)?;
     let commit = crate::worktree::head(&worker)?;
+    let property_tests =
+        crate::proptest::property_tests(&worker, &meta, &listed).unwrap_or_else(|err| {
+            warn!("cannot look for proptest properties: {err:#}");
+            Default::default()
+        });
     let originals = read_originals(&worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
     let sites: Vec<Site> = map_sites.iter().map(identity_site).collect();
     let test_packages = crate::cargo_cmd::test_packages(cfg, &meta);
@@ -662,6 +670,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         tests,
         hits,
         not_green: recording.not_green.clone(),
+        property_tests,
         worker: worker.clone(),
         run_dir: run_dir.clone(),
         map_secs: started.elapsed().as_secs_f64(),
@@ -1112,6 +1121,7 @@ fn verdict_from(
             .map(|o| o.test_name.clone())
             .collect(),
         secs,
+        note: None,
     }
 }
 
@@ -1143,6 +1153,9 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
                     .join(", "),
                 if v.tests_run.len() > 4 { ", ..." } else { "" }
             );
+            if v.note.is_some() {
+                line.push_str("\n      proptest properties only: the verdict can change between runs (try `test --proptest-cases 1024`)");
+            }
             if let Some(intent) = &m.intent {
                 line.push_str(&format!("\n      intent: {intent}"));
             }
@@ -1180,7 +1193,14 @@ type BuiltMutant = (EditedMutant, Vec<(u32, u32)>, bool);
 
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
-pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedMutant, Verdict)>> {
+/// With `proptest_cases` above zero, a survivor judged only by proptest
+/// properties is run once more with `PROPTEST_CASES` set to it.
+pub fn test(
+    cfg: &Config,
+    paths: &Paths,
+    only: &[String],
+    proptest_cases: u32,
+) -> Result<Vec<(EditedMutant, Verdict)>> {
     let _lock = StateLock::acquire(paths)?;
     let map = SiteMap::load(paths)?
         .context("no map in this scratch session; run `cargo quicksilver map` first")?;
@@ -1240,6 +1260,7 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
                         message: None,
                         tests_run: Vec::new(),
                         secs: 0.0,
+                        note: None,
                     }
                 } else {
                     let planned = PlannedMutant {
@@ -1247,27 +1268,33 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
                         estimated_cost_secs: tests.iter().map(|t| t.duration_secs).sum(),
                         tests,
                     };
-                    let outcome = if *direct {
-                        run_mutant_tests_against(
-                            &planned,
-                            &direct_dir(paths, generation, &m.id),
-                            Some(&run_dir),
-                            &map.worker,
-                            &policy,
-                            &[(DIRECT_MUTANT_ENV.to_string(), m.id.clone())],
-                            false,
-                        )
-                    } else {
-                        run_mutant_tests_observed(
-                            &planned,
-                            &run_dir,
-                            &map.worker,
-                            &policy,
-                            &[qs_mutants_env(activation)],
-                            false,
-                        )
+                    let run_with = |extra: &[(String, String)]| {
+                        if *direct {
+                            let mut env = vec![(DIRECT_MUTANT_ENV.to_string(), m.id.clone())];
+                            env.extend(extra.iter().cloned());
+                            run_mutant_tests_against(
+                                &planned,
+                                &direct_dir(paths, generation, &m.id),
+                                Some(&run_dir),
+                                &map.worker,
+                                &policy,
+                                &env,
+                                false,
+                            )
+                        } else {
+                            let mut env = vec![qs_mutants_env(activation)];
+                            env.extend(extra.iter().cloned());
+                            run_mutant_tests_observed(
+                                &planned,
+                                &run_dir,
+                                &map.worker,
+                                &policy,
+                                &env,
+                                false,
+                            )
+                        }
                     };
-                    match outcome {
+                    let mut verdict = match run_with(&[]) {
                         Ok(run) => {
                             verdict_from(&run.outcome, &run, started.elapsed().as_secs_f64())
                         }
@@ -1279,9 +1306,46 @@ pub fn test(cfg: &Config, paths: &Paths, only: &[String]) -> Result<Vec<(EditedM
                                 message: Some(format!("{err:#}")),
                                 tests_run: Vec::new(),
                                 secs: started.elapsed().as_secs_f64(),
+                                note: None,
+                            }
+                        }
+                    };
+                    // Properties run random cases: a survivor they alone
+                    // judged may fall to more cases, and either verdict can
+                    // change between runs.
+                    let property_only = planned
+                        .tests
+                        .iter()
+                        .all(|t| map.property_tests.contains(&t.id));
+                    if verdict.kind == VerdictKind::Missed && property_only && proptest_cases > 0 {
+                        let cases = proptest_cases.to_string();
+                        if let Ok(run) = run_with(&[("PROPTEST_CASES".to_string(), cases)]) {
+                            if run.outcome.kind == VerdictKind::Caught {
+                                verdict = verdict_from(
+                                    &run.outcome,
+                                    &run,
+                                    started.elapsed().as_secs_f64(),
+                                );
+                                verdict.message = Some(format!(
+                                    "caught only with PROPTEST_CASES={proptest_cases}; the default number of cases missed it"
+                                ));
                             }
                         }
                     }
+                    let decided_by_property = match verdict.kind {
+                        VerdictKind::Missed => property_only,
+                        VerdictKind::Caught => verdict.test.as_deref().is_some_and(|name| {
+                            planned
+                                .tests
+                                .iter()
+                                .any(|t| t.name == name && map.property_tests.contains(&t.id))
+                        }),
+                        _ => false,
+                    };
+                    if decided_by_property {
+                        verdict.note = Some(crate::proptest::NOTE.to_string());
+                    }
+                    verdict
                 };
                 progress.println(&verdict_line(m, &verdict));
                 progress.inc(1);

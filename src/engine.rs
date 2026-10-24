@@ -76,6 +76,8 @@ pub struct Prepared {
     /// Candidate tests per package. The executor narrows each mutant to the
     /// tests its recording run saw enter the mutated function.
     pub selector: plan::PackageSelector,
+    /// Ids of the tests that are proptest properties.
+    pub property_tests: std::collections::BTreeSet<String>,
     pub plan: Plan,
 }
 
@@ -130,6 +132,11 @@ pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<P
     }
     let meta = load_metadata(&paths.baseline)?;
     let selector = plan::PackageSelector::new(&meta, &tests);
+    let property_tests = crate::proptest::property_tests(&paths.baseline, &meta, &tests)
+        .unwrap_or_else(|err| {
+            tracing::warn!("cannot look for proptest properties: {err:#}");
+            Default::default()
+        });
     let plan = plan::plan(&mutants, &selector, &baseline, cfg.shard, cfg.build_jobs);
     eprintln!(
         "plan: {} to build, {} not covered",
@@ -146,6 +153,7 @@ pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<P
         tests,
         source_key,
         selector,
+        property_tests,
         plan,
     })
 }
@@ -179,6 +187,25 @@ pub fn run_schema_detailed(
     let mut exec =
         crate::exec::schema::execute(&prepared.cfg, &prepared.paths, plan, cancel, limit)?;
     let rows = std::mem::take(&mut exec.coupling_rows);
+    // A survivor that only proptest properties judged may be caught on
+    // another run, with other random cases.
+    if !prepared.property_tests.is_empty() {
+        let tests_of: std::collections::HashMap<&str, &Vec<String>> = rows
+            .iter()
+            .filter(|r| r.mutant_ids.len() == 1)
+            .map(|r| (r.mutant_ids[0].as_str(), &r.selected_test_ids))
+            .collect();
+        for o in &mut exec.outcomes {
+            if o.kind != crate::types::VerdictKind::Missed {
+                continue;
+            }
+            if tests_of.get(o.mutant.id.as_str()).is_some_and(|ids| {
+                !ids.is_empty() && ids.iter().all(|i| prepared.property_tests.contains(i))
+            }) {
+                o.message = Some(crate::proptest::NOTE.to_string());
+            }
+        }
+    }
     exec.coupling = Some(crate::coupling::merge_and_save(
         &prepared.paths,
         &prepared.source_key,
