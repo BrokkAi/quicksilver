@@ -537,6 +537,24 @@ fn edited_mutants_are_captured_built_and_judged() {
 
     // Tested mutants are final: a second test run has nothing to do.
     assert!(test(&cfg, &paths, &[], 0).unwrap().is_empty());
+    // Each verdict was saved; the journal is folded into the state.
+    use cargo_quicksilver::exec::edited::{State, Status as S};
+    let tested = || {
+        State::load(&paths)
+            .unwrap()
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, S::Tested { .. }))
+            .count()
+    };
+    let tested_before = tested();
+    assert!(tested_before > 0);
+    assert!(!State::journal_path(&paths).exists());
+    // A new map of the same commit, with the same test packages, keeps the
+    // mutants and their verdicts: nothing to capture, build or test again.
+    build_map(&cfg, &paths).expect("map the same commit again");
+    assert!(test(&cfg, &paths, &[], 0).unwrap().is_empty());
+    assert_eq!(tested(), tested_before);
     // The checkout was only read.
     assert_eq!(fs::read_to_string(&lib).unwrap(), original);
     assert!(!Path::new(&new_file).exists());

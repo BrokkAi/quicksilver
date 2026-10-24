@@ -246,12 +246,31 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     let paths = cfg.paths();
     paths.ensure()?;
     let results = exec::edited::test(&cfg, &paths, &args.mutants, args.proptest_cases)?;
+    // Every verdict of this map, not only this run's: a run that continues
+    // a stopped one still writes the whole set.
+    let state = exec::edited::State::load(&paths)?;
+    let mut tested: Vec<(&capture::EditedMutant, &exec::edited::Verdict)> = state
+        .records
+        .iter()
+        .filter_map(|r| match &r.status {
+            exec::edited::Status::Tested { verdict } => Some((&r.mutant, verdict)),
+            _ => None,
+        })
+        .collect();
+    tested.sort_by(|a, b| a.0.id.cmp(&b.0.id));
     if results.is_empty() {
-        eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
+        if tested.is_empty() {
+            eprintln!("no compiled mutants to test; run `cargo quicksilver build` first");
+        } else {
+            eprintln!(
+                "every compiled mutant already has a verdict ({} in all)",
+                tested.len()
+            );
+        }
     }
     if let Some(path) = &cfg.json {
         let map = sitemap::SiteMap::load(&paths)?;
-        let rows: Vec<serde_json::Value> = results
+        let rows: Vec<serde_json::Value> = tested
             .iter()
             .map(|(m, v)| {
                 serde_json::json!({

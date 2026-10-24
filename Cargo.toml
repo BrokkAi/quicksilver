@@ -23,7 +23,7 @@ anyhow = "1"
 cargo_metadata = "0.23"
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 globset = "0.4"
 humantime = "2"
 indicatif = "0.17"

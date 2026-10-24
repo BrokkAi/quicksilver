@@ -84,6 +84,12 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    This builds the workspace with a switch in every function and records
    which functions each test enters.
 
+   Mapping the same commit again, for example with more `--extra-tests`,
+   keeps the mutants you captured. With the same test packages, their
+   builds and verdicts stay too. With other test packages, kills and
+   unviable mutants stay, and the next `build` compiles the rest again so
+   that `test` can run the new tests against them.
+
 2. **Edit function bodies** in your checkout, as many as you like, in any
    files. Each edited function becomes its own mutant. Only edits inside
    function bodies are accepted: not signatures, not new items, not test
@@ -144,6 +150,12 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    ```
 
    Each mutant runs only the tests that enter the functions it changed.
+   Each verdict is saved as soon as it is decided. To stop a long run,
+   press Ctrl-C or send SIGTERM: the mutants already started finish, and
+   `--json` is written. A second signal stops at once. Either way, running
+   `test` again tests only the mutants without a verdict, and its `--json`
+   file holds every verdict for the map, not only that run's.
+
    Tests are named by their id, the test binary as nextest names it
    (`clap::builder`) followed by the test's name, as in the map's test
    list.

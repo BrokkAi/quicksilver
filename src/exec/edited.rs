@@ -28,6 +28,7 @@ use crate::types::{Mutant, Paths, PlannedMutant, TestInfo, VerdictKind};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -88,6 +89,12 @@ pub struct Record {
 pub struct State {
     /// The map these records were built against.
     pub map_id: String,
+    /// That map's commit and test packages. A new map of the same commit
+    /// keeps the records; see [`State::reconcile`].
+    #[serde(default)]
+    pub commit: String,
+    #[serde(default)]
+    pub test_packages: Vec<String>,
     /// Bumped by every `build` that compiles something.
     pub generation: u32,
     pub records: Vec<Record>,
@@ -129,37 +136,164 @@ impl State {
         paths.state.join("edited.json")
     }
 
-    pub fn load(paths: &Paths) -> Result<State> {
-        let p = Self::path(paths);
-        if !p.is_file() {
-            return Ok(State::default());
-        }
-        let text = std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
-        serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))
+    /// Verdicts `test` decided since the state was last saved, one JSON
+    /// object per line, so that a stopped `test` keeps them.
+    pub fn journal_path(paths: &Paths) -> PathBuf {
+        paths.state.join("verdicts.jsonl")
     }
 
+    /// The saved state, with the verdicts of the journal applied.
+    pub fn load(paths: &Paths) -> Result<State> {
+        let p = Self::path(paths);
+        let mut state: State = if p.is_file() {
+            let text =
+                std::fs::read_to_string(&p).with_context(|| format!("read {}", p.display()))?;
+            serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?
+        } else {
+            State::default()
+        };
+        if let Ok(text) = std::fs::read_to_string(Self::journal_path(paths)) {
+            // A run stopped while writing leaves a partial last line.
+            for entry in text
+                .lines()
+                .filter_map(|l| serde_json::from_str::<JournalEntry>(l).ok())
+            {
+                state.apply(entry);
+            }
+        }
+        Ok(state)
+    }
+
+    fn apply(&mut self, entry: JournalEntry) {
+        if entry.map_id != self.map_id {
+            return;
+        }
+        if let Some(r) = self.records.iter_mut().find(|r| r.mutant.id == entry.id) {
+            if matches!(r.status, Status::Built { generation, .. } if generation == entry.generation)
+            {
+                r.status = Status::Tested {
+                    verdict: entry.verdict,
+                };
+            }
+        }
+    }
+
+    /// Write the state; the journal's verdicts are in it now.
     pub fn save(&self, paths: &Paths) -> Result<()> {
-        crate::util::write_atomic(&Self::path(paths), serde_json::to_vec_pretty(self)?)
+        crate::util::write_atomic(&Self::path(paths), serde_json::to_vec_pretty(self)?)?;
+        match std::fs::remove_file(Self::journal_path(paths)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).context("remove the verdict journal")
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn find(&self, id: &str) -> Option<&Record> {
         self.records.iter().find(|r| r.mutant.id == id)
     }
 
-    /// Drop every record when the map changed under them: their activations
-    /// name sites and binaries that no longer exist.
-    fn reconcile(&mut self, map: &SiteMap) -> usize {
+    /// Bind the records to `map`. A map of another commit drops them all:
+    /// their sites and binaries no longer exist. A new map of the same
+    /// commit has the same sites, so the records stay (any whose sites are
+    /// gone, for example after mapping other packages, are dropped). With
+    /// the same test packages, the compiled generation and the verdicts
+    /// stay valid too. With other test packages, the generation lacks the
+    /// new test binaries: unviable mutants and kills stay, and every other
+    /// mutant goes back to pending, to be compiled by the next `build` and
+    /// tested against the new map's tests.
+    fn reconcile(&mut self, map: &SiteMap) -> Reconciled {
         if self.map_id == map.map_id {
-            return 0;
+            return Reconciled::default();
         }
-        let n = self.records.len();
-        *self = State {
-            map_id: map.map_id.clone(),
-            generation: 0,
-            records: Vec::new(),
+        if self.commit.is_empty() || self.commit != map.commit {
+            let dropped = self.records.len();
+            *self = State {
+                map_id: map.map_id.clone(),
+                commit: map.commit.clone(),
+                test_packages: map.test_packages.clone(),
+                generation: 0,
+                records: Vec::new(),
+            };
+            return Reconciled {
+                dropped,
+                ..Reconciled::default()
+            };
+        }
+        let before = self.records.len();
+        self.records.retain(|r| {
+            r.mutant.edits.iter().all(|e| {
+                map.site(e.site_id)
+                    .is_some_and(|s| s.path == e.path && s.fqn == e.fqn)
+            })
+        });
+        let mut done = Reconciled {
+            dropped: before - self.records.len(),
+            kept: self.records.len(),
+            ..Reconciled::default()
         };
-        n
+        if self.test_packages != map.test_packages {
+            for r in &mut self.records {
+                let stays = match &r.status {
+                    Status::Pending | Status::Unviable { .. } => true,
+                    Status::Tested { verdict } => verdict.kind == VerdictKind::Caught,
+                    Status::Built { .. } => false,
+                };
+                if !stays {
+                    r.status = Status::Pending;
+                    done.recompile += 1;
+                }
+            }
+        }
+        self.map_id = map.map_id.clone();
+        self.test_packages = map.test_packages.clone();
+        done
     }
+}
+
+/// What binding the state to a new map did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Records dropped: captured against another commit, or naming sites
+    /// the new map does not have.
+    pub dropped: usize,
+    /// Records kept from an earlier map of the same commit.
+    pub kept: usize,
+    /// Kept records that need compiling again, because the new map has
+    /// other test packages.
+    pub recompile: usize,
+}
+
+impl Reconciled {
+    /// Say what happened, if anything did.
+    fn report(&self) {
+        if self.dropped > 0 {
+            eprintln!(
+                "discarded {} mutant(s) captured against an earlier map",
+                self.dropped
+            );
+        }
+        if self.kept > 0 && self.recompile > 0 {
+            eprintln!(
+                "kept {} mutant(s) captured against an earlier map of this commit; {} of them will be compiled again for the new map's test packages and tested against its tests (kills and unviable mutants stay)",
+                self.kept, self.recompile
+            );
+        } else if self.kept > 0 {
+            eprintln!(
+                "kept {} mutant(s), their builds and verdicts from an earlier map of this commit with the same test packages",
+                self.kept
+            );
+        }
+    }
+}
+
+/// One line of the verdict journal.
+#[derive(Debug, Serialize, Deserialize)]
+struct JournalEntry {
+    map_id: String,
+    generation: u32,
+    id: String,
+    verdict: Verdict,
 }
 
 /// Generation run directory: `runs/edited/gen-N`.
@@ -765,10 +899,9 @@ fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;
-    let discarded_records = state.reconcile(&map);
-    if discarded_records > 0 {
-        eprintln!("discarded {discarded_records} mutant(s) captured against an earlier map");
-    }
+    let reconciled = state.reconcile(&map);
+    reconciled.report();
+    let discarded_records = reconciled.dropped;
     let report = BuildReport {
         captured: Vec::new(),
         duplicates: Vec::new(),
@@ -1246,10 +1379,18 @@ pub fn test(
     let map = SiteMap::load(paths)?
         .context("no map in this scratch session; run `cargo quicksilver map` first")?;
     let mut state = State::load(paths)?;
-    if state.map_id != map.map_id {
-        bail!(
-            "the mutant state was built against another map; run `cargo quicksilver build` first"
-        );
+    let reconciled = state.reconcile(&map);
+    if reconciled != Reconciled::default() {
+        reconciled.report();
+        state.save(paths)?;
+    }
+    let pending = state
+        .records
+        .iter()
+        .filter(|r| matches!(r.status, Status::Pending))
+        .count();
+    if pending > 0 {
+        eprintln!("{pending} captured mutant(s) are not compiled yet; run `cargo quicksilver build` to test them");
     }
     let generation = state.generation;
     let run_dir = generation_dir(paths, generation);
@@ -1280,6 +1421,17 @@ pub fn test(
         slowdown: 1.0,
         confirm: true,
     };
+    // Each verdict is appended as soon as it is decided, so a run that is
+    // stopped keeps what it decided: the next `test` skips those mutants.
+    let journal = Mutex::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(State::journal_path(paths))
+            .context("open the verdict journal")?,
+    );
+    let stop = crate::engine::install_ctrlc();
+    let stopping = std::sync::Once::new();
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(EditedMutant, Verdict)>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1287,6 +1439,14 @@ pub fn test(
     std::thread::scope(|scope| {
         for _ in 0..cfg.test_jobs.max(1).min(set.len()) {
             scope.spawn(|| loop {
+                if stop.load(Ordering::SeqCst) {
+                    stopping.call_once(|| {
+                        progress.println(
+                            "stopping: the mutants already started finish; their verdicts and the earlier ones are kept (interrupt again to quit at once)",
+                        )
+                    });
+                    break;
+                }
                 let k = next.fetch_add(1, Ordering::SeqCst);
                 let Some((m, activation, direct)) = set.get(k) else {
                     break;
@@ -1406,11 +1566,33 @@ pub fn test(
                 };
                 progress.println(&verdict_line(m, &verdict));
                 progress.inc(1);
+                let entry = JournalEntry {
+                    map_id: map.map_id.clone(),
+                    generation,
+                    id: m.id.clone(),
+                    verdict: verdict.clone(),
+                };
+                if let Err(err) = serde_json::to_string(&entry)
+                    .map_err(std::io::Error::from)
+                    .and_then(|line| writeln!(journal.lock().unwrap(), "{line}"))
+                {
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push(format!("{}: cannot save its verdict: {err}", m.id));
+                }
                 results.lock().unwrap().push((m.clone(), verdict));
             });
         }
     });
     let mut results = results.into_inner().unwrap();
+    if stop.load(Ordering::SeqCst) {
+        eprintln!(
+            "stopped after {} of {} mutant(s); run `cargo quicksilver test` again to test the rest",
+            results.len(),
+            set.len()
+        );
+    }
     let count = |k: VerdictKind| results.iter().filter(|(_, v)| v.kind == k).count();
     progress.finish(&format!(
         "tested {} mutant(s) in {:.1}s: {} caught, {} missed, {} not covered, {} timeout, {} errored",
@@ -1447,6 +1629,232 @@ mod tests {
             verdict,
             wall_secs: 0.1,
         }
+    }
+
+    fn site(id: u32, path: &str, fqn: &str) -> crate::sitemap::MapSite {
+        crate::sitemap::MapSite {
+            site_id: id,
+            salt: 0,
+            package: "p".into(),
+            path: path.into(),
+            fqn: fqn.into(),
+            fn_start_byte: 0,
+            body_start_byte: 0,
+            body_end_byte: 1,
+            start_line: 1,
+            end_line: 3,
+            opaque_return: false,
+            trait_impl: false,
+            scaffolding: None,
+        }
+    }
+
+    fn map_of(map_id: &str, commit: &str, test_packages: &[&str]) -> SiteMap {
+        SiteMap {
+            version: crate::sitemap::MAP_VERSION,
+            map_id: map_id.into(),
+            commit: commit.into(),
+            prefix: String::new(),
+            repo_root: PathBuf::new(),
+            target: String::new(),
+            files: BTreeMap::new(),
+            sites: vec![site(1, "src/a.rs", "p.a"), site(2, "src/b.rs", "p.b")],
+            test_lines: Default::default(),
+            dropped: Vec::new(),
+            crate_roots: BTreeMap::new(),
+            test_packages: test_packages.iter().map(|p| p.to_string()).collect(),
+            tests: Vec::new(),
+            hits: BTreeMap::new(),
+            not_green: Vec::new(),
+            not_green_output: Default::default(),
+            property_tests: Default::default(),
+            worker: PathBuf::new(),
+            run_dir: PathBuf::new(),
+            map_secs: 0.0,
+        }
+    }
+
+    fn record(id: &str, site_id: u32, fqn: &str, status: Status) -> Record {
+        Record {
+            mutant: EditedMutant {
+                id: id.into(),
+                edits: vec![crate::capture::BodyEdit {
+                    site_id,
+                    package: "p".into(),
+                    path: if site_id == 1 { "src/a.rs" } else { "src/b.rs" }.into(),
+                    fqn: fqn.into(),
+                    line: 1,
+                    original: "{ 1 }".into(),
+                    body: "{ 2 }".into(),
+                }],
+                intent: None,
+            },
+            status,
+            captured_at: String::new(),
+        }
+    }
+
+    fn verdict(kind: VerdictKind) -> Verdict {
+        Verdict {
+            kind,
+            test: None,
+            message: None,
+            tests_run: Vec::new(),
+            secs: 0.0,
+            note: None,
+            proptest_rerun_cases: None,
+        }
+    }
+
+    fn built() -> Status {
+        Status::Built {
+            generation: 3,
+            activation: vec![(1, 1)],
+            direct: false,
+        }
+    }
+
+    fn state_for(map: &SiteMap) -> State {
+        State {
+            map_id: map.map_id.clone(),
+            commit: map.commit.clone(),
+            test_packages: map.test_packages.clone(),
+            generation: 3,
+            records: vec![
+                record("built", 1, "p.a", built()),
+                record(
+                    "caught",
+                    1,
+                    "p.a",
+                    Status::Tested {
+                        verdict: verdict(VerdictKind::Caught),
+                    },
+                ),
+                record(
+                    "missed",
+                    2,
+                    "p.b",
+                    Status::Tested {
+                        verdict: verdict(VerdictKind::Missed),
+                    },
+                ),
+                record(
+                    "unviable",
+                    2,
+                    "p.b",
+                    Status::Unviable {
+                        message: "e".into(),
+                    },
+                ),
+                record("pending", 2, "p.b", Status::Pending),
+                // Names a function the new map does not have at that site.
+                record("gone", 2, "p.renamed", Status::Pending),
+            ],
+        }
+    }
+
+    fn statuses(state: &State) -> Vec<(String, &'static str)> {
+        state
+            .records
+            .iter()
+            .map(|r| {
+                let s = match &r.status {
+                    Status::Pending => "pending",
+                    Status::Unviable { .. } => "unviable",
+                    Status::Built { .. } => "built",
+                    Status::Tested { verdict } if verdict.kind == VerdictKind::Caught => "caught",
+                    Status::Tested { .. } => "tested",
+                };
+                (r.mutant.id.clone(), s)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_new_map_of_the_same_commit_keeps_the_records() {
+        let old = map_of("m1", "c1", &["p"]);
+        // Same commit and test packages: builds and verdicts stay.
+        let mut state = state_for(&old);
+        let done = state.reconcile(&map_of("m2", "c1", &["p"]));
+        assert_eq!(
+            done,
+            Reconciled {
+                dropped: 1,
+                kept: 5,
+                recompile: 0
+            }
+        );
+        assert_eq!(state.map_id, "m2");
+        assert_eq!(state.generation, 3);
+        let s = statuses(&state);
+        assert!(s.contains(&("built".into(), "built")));
+        assert!(s.contains(&("missed".into(), "tested")));
+        // More test packages: the generation lacks their binaries. Kills and
+        // unviable mutants stay; the rest are compiled and tested again.
+        let mut state = state_for(&old);
+        let done = state.reconcile(&map_of("m2", "c1", &["p", "q"]));
+        assert_eq!(done.recompile, 2);
+        assert_eq!(state.test_packages, vec!["p".to_string(), "q".to_string()]);
+        assert_eq!(
+            statuses(&state),
+            vec![
+                ("built".to_string(), "pending"),
+                ("caught".to_string(), "caught"),
+                ("missed".to_string(), "pending"),
+                ("unviable".to_string(), "unviable"),
+                ("pending".to_string(), "pending"),
+            ]
+        );
+        // Another commit: nothing stays.
+        let mut state = state_for(&old);
+        let done = state.reconcile(&map_of("m3", "c2", &["p"]));
+        assert_eq!(done.dropped, 6);
+        assert!(state.records.is_empty());
+        assert_eq!((state.commit.as_str(), state.generation), ("c2", 0));
+        // A state saved before the commit was recorded is dropped as before.
+        let mut state = state_for(&old);
+        state.commit.clear();
+        assert_eq!(state.reconcile(&map_of("m2", "c1", &["p"])).dropped, 6);
+        // The same map changes nothing.
+        let mut state = state_for(&old);
+        assert_eq!(state.reconcile(&old), Reconciled::default());
+    }
+
+    #[test]
+    fn verdicts_in_the_journal_survive_a_stopped_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tree(tmp.path(), "", tmp.path());
+        std::fs::create_dir_all(&paths.state).unwrap();
+        let map = map_of("m1", "c1", &["p"]);
+        let mut state = state_for(&map);
+        state.records.push(record("built2", 1, "p.a", built()));
+        state.save(&paths).unwrap();
+        let line = |map_id: &str, generation: u32, id: &str| {
+            serde_json::to_string(&JournalEntry {
+                map_id: map_id.into(),
+                generation,
+                id: id.into(),
+                verdict: verdict(VerdictKind::Missed),
+            })
+            .unwrap()
+        };
+        let journal = [
+            line("m1", 3, "built"),
+            // Another map's or generation's verdicts do not apply.
+            line("other", 3, "built2"),
+            line("m1", 2, "built2"),
+            // A run stopped mid-write leaves a partial line.
+            line("m1", 3, "built2")[..20].to_string(),
+        ]
+        .join("\n");
+        std::fs::write(State::journal_path(&paths), journal).unwrap();
+        let loaded = State::load(&paths).unwrap();
+        let s = statuses(&loaded);
+        assert!(s.contains(&("built".into(), "tested")), "{s:?}");
+        assert!(s.contains(&("built2".into(), "built")), "{s:?}");
+        loaded.save(&paths).unwrap();
+        assert!(!State::journal_path(&paths).exists());
+        assert!(statuses(&State::load(&paths).unwrap()).contains(&("built".into(), "tested")));
     }
 
     #[test]

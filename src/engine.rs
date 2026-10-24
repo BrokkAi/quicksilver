@@ -48,13 +48,22 @@ pub fn config_from_cli(
     Ok((cfg, file))
 }
 
+/// A flag that Ctrl-C, SIGTERM or SIGHUP sets, for stopping after the work
+/// in progress. A second signal ends the process at once. Every call
+/// returns the same flag.
 pub fn install_ctrlc() -> Arc<AtomicBool> {
-    let flag = Arc::new(AtomicBool::new(false));
-    let f = Arc::clone(&flag);
-    let _ = ctrlc::set_handler(move || {
-        f.store(true, Ordering::SeqCst);
-    });
-    flag
+    static FLAG: std::sync::OnceLock<Arc<AtomicBool>> = std::sync::OnceLock::new();
+    FLAG.get_or_init(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let f = Arc::clone(&flag);
+        let _ = ctrlc::set_handler(move || {
+            if f.swap(true, Ordering::SeqCst) {
+                std::process::exit(130);
+            }
+        });
+        flag
+    })
+    .clone()
 }
 
 pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
