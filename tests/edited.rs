@@ -509,6 +509,11 @@ fn edited_mutants_are_captured_built_and_judged() {
         );
     }
     assert_eq!(verdict(&uncovered_m).kind, VerdictKind::NotCovered);
+    // Tests are named by id, with their binary.
+    assert_eq!(
+        verdict(&add_m).test.as_deref(),
+        Some("tiny_a::tests::add_works")
+    );
     let v = verdict(&missed_m);
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
     let shown = cargo_quicksilver::exec::edited::verdict_line(&missed_m, v);
@@ -522,7 +527,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(
         v.tests_run
             .iter()
-            .any(|t| t.ends_with("calls_always_ok_without_asserting")),
+            .any(|t| t == "tiny_c::tests::calls_always_ok_without_asserting"),
         "{v:?}"
     );
     assert!(

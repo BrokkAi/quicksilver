@@ -1124,20 +1124,37 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     Ok(report)
 }
 
+/// Tests are named by their id, `<binary id>::<name>` as in the map's test
+/// list: two binaries of one run (with `--extra-tests`) can share a name.
 fn verdict_from(
     outcome: &crate::types::Outcome,
     run: &crate::exec::test::ObservedRun,
     secs: f64,
 ) -> Verdict {
+    let id = |o: &crate::types::TestObservation| {
+        if o.test_id.is_empty() {
+            o.test_name.clone()
+        } else {
+            o.test_id.clone()
+        }
+    };
+    // The outcome names the deciding test only by name: find its
+    // observation, the one whose verdict is the outcome's.
+    let test = outcome.test.as_deref().map(|name| {
+        let wanted = crate::exec::test::verdict_for_outcome(outcome);
+        let named = |o: &&crate::types::TestObservation| o.test_name == name;
+        run.observations
+            .iter()
+            .filter(named)
+            .find(|o| o.verdict == wanted)
+            .or_else(|| run.observations.iter().find(named))
+            .map_or_else(|| name.to_string(), id)
+    });
     Verdict {
         kind: outcome.kind,
-        test: outcome.test.clone(),
+        test,
         message: outcome.message.clone(),
-        tests_run: run
-            .observations
-            .iter()
-            .map(|o| o.test_name.clone())
-            .collect(),
+        tests_run: run.observations.iter().map(id).collect(),
         secs,
         note: None,
         proptest_rerun_cases: None,
@@ -1376,12 +1393,10 @@ pub fn test(
                     }
                     let decided_by_property = match verdict.kind {
                         VerdictKind::Missed => property_only,
-                        VerdictKind::Caught => verdict.test.as_deref().is_some_and(|name| {
-                            planned
-                                .tests
-                                .iter()
-                                .any(|t| t.name == name && map.property_tests.contains(&t.id))
-                        }),
+                        VerdictKind::Caught => verdict
+                            .test
+                            .as_deref()
+                            .is_some_and(|id| map.property_tests.contains(id)),
                         _ => false,
                     };
                     if decided_by_property {
@@ -1418,4 +1433,65 @@ pub fn test(
         warn!("test run error: {e}");
     }
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Mutant, Outcome, TestObservation, TestVerdict};
+
+    fn observed(id: &str, name: &str, verdict: TestVerdict) -> TestObservation {
+        TestObservation {
+            test_id: id.into(),
+            test_name: name.into(),
+            verdict,
+            wall_secs: 0.1,
+        }
+    }
+
+    #[test]
+    fn verdicts_name_tests_by_id_when_two_binaries_share_a_name() {
+        let mutant = Mutant {
+            id: "m".into(),
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: "p.f".into(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+            body_start_byte: 0,
+            body_end_byte: 1,
+            replacement: "{}".into(),
+            return_kind: "unit".into(),
+        };
+        let run = crate::exec::test::ObservedRun {
+            outcome: Outcome::caught(mutant, "store::roundtrip".into()),
+            observations: vec![
+                observed(
+                    "p::store::roundtrip",
+                    "store::roundtrip",
+                    TestVerdict::Passed,
+                ),
+                observed(
+                    "q::suite_persistence::store::roundtrip",
+                    "store::roundtrip",
+                    TestVerdict::Killed,
+                ),
+            ],
+            complete: false,
+        };
+        let v = verdict_from(&run.outcome, &run, 1.0);
+        assert_eq!(
+            v.test.as_deref(),
+            Some("q::suite_persistence::store::roundtrip")
+        );
+        assert_eq!(
+            v.tests_run,
+            vec![
+                "p::store::roundtrip".to_string(),
+                "q::suite_persistence::store::roundtrip".to_string()
+            ]
+        );
+    }
 }

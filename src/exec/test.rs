@@ -760,7 +760,7 @@ fn observation(t: &ResolvedTest, verdict: TestVerdict, wall: Duration) -> TestOb
     }
 }
 
-fn verdict_for_outcome(outcome: &Outcome) -> TestVerdict {
+pub(crate) fn verdict_for_outcome(outcome: &Outcome) -> TestVerdict {
     match outcome.kind {
         crate::types::VerdictKind::Caught => TestVerdict::Killed,
         crate::types::VerdictKind::Timeout => TestVerdict::Timeout,

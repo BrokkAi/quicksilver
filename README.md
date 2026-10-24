@@ -140,10 +140,13 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    ```
 
    ```
-     CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by default_vals::default_ifs_arg_present_order
+     CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by clap::builder::default_vals::default_ifs_arg_present_order
    ```
 
    Each mutant runs only the tests that enter the functions it changed.
+   Tests are named by their id, the test binary as nextest names it
+   (`clap::builder`) followed by the test's name, as in the map's test
+   list.
 
    A verdict that only [proptest](https://docs.rs/proptest) properties
    decided is flagged: properties run random cases, so the verdict can
