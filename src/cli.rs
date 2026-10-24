@@ -38,6 +38,13 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub reverse_dependents: bool,
 
+    /// With `--package`, also build and run this test binary of another
+    /// package, named as nextest names it: `pkg` for its unit tests,
+    /// `pkg::target` for an integration test. Repeatable; `extra-tests` in
+    /// quicksilver.toml adds more.
+    #[arg(long = "extra-tests", value_name = "BINARY", global = true)]
+    pub extra_tests: Vec<String>,
+
     /// Restrict mutants to matching files (globs).
     #[arg(long = "file", global = true)]
     pub files: Vec<String>,

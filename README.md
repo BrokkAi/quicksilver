@@ -46,6 +46,11 @@ Or every function in a package:
 cargo quicksilver run --package my_crate
 ```
 
+With `--package`, only that package's own tests count. To add a test binary
+of another package that exercises it, name the binary as nextest does:
+`--extra-tests other_pkg::suite_name` (repeatable, or `extra-tests = [...]`
+in `quicksilver.toml`).
+
 With `--package`, only that package's own tests are built and run. Add
 `--reverse-dependents` to also use the tests of every workspace package that
 depends on it. For a crate low in the dependency graph, that can be most of

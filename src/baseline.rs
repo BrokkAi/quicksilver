@@ -69,6 +69,9 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
             &mut cmd,
             &crate::cargo_cmd::test_packages(cfg, &meta),
         );
+        if let Some(filter) = crate::cargo_cmd::nextest_filter(cfg, &meta) {
+            cmd.arg("-E").arg(filter);
+        }
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
         let start = Instant::now();

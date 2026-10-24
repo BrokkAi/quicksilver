@@ -28,7 +28,16 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    parse_nextest_list(&out.stdout, &meta, &target_dir)
+    let mut tests = parse_nextest_list(&out.stdout, &meta, &target_dir)?;
+    tests.retain(|t| crate::cargo_cmd::keeps_test(cfg, &meta, t));
+    for binary in &cfg.extra_tests {
+        if !tests.iter().any(|t| t.binary_id == *binary) {
+            bail!(
+                "--extra-tests {binary}: no such test binary (nextest names binaries `package` or `package::target`)"
+            );
+        }
+    }
+    Ok(tests)
 }
 
 pub fn parse_nextest_list(

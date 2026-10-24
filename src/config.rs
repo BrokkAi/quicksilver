@@ -17,6 +17,9 @@ pub struct FileConfig {
     pub cm_jobs: Option<usize>,
     #[serde(rename = "build-env", default)]
     pub build_env: BTreeMap<String, String>,
+    /// Test binaries from other packages to run with `--package`.
+    #[serde(rename = "extra-tests", default)]
+    pub extra_tests: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,9 @@ pub struct Config {
     pub packages: Vec<String>,
     /// Whether tests of packages depending on `packages` cover them too.
     pub reverse_dependents: bool,
+    /// Test binaries (nextest ids) of other packages that also count with
+    /// `--package`.
+    pub extra_tests: Vec<String>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
     pub json: Option<PathBuf>,
@@ -130,6 +136,15 @@ pub fn merge_config(
         max_scratch: cli.max_scratch,
         packages: extras.packages,
         reverse_dependents: cli.reverse_dependents,
+        extra_tests: {
+            let mut v = cli.extra_tests.clone();
+            for b in &file.extra_tests {
+                if !v.contains(b) {
+                    v.push(b.clone());
+                }
+            }
+            v
+        },
         files: extras.files,
         in_diff: extras.in_diff,
         json: extras.json,

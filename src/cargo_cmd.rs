@@ -53,8 +53,53 @@ pub fn packages_for_rebuild_timing(packages: &[String], meta: &Metadata) -> Vec<
 /// Reverse dependents are opt-in because a low crate is a dependency of the
 /// whole workspace: on bifrost, `-p brokk-bifrost-core` with dependents
 /// selects about 20,000 tests instead of core's ~470.
+///
+/// `--extra-tests` adds the package of each chosen test binary, and
+/// [`keeps_test`] keeps only those binaries' tests from it.
 pub fn test_packages(cfg: &Config, meta: &Metadata) -> Vec<String> {
-    test_packages_from(&cfg.packages, cfg.reverse_dependents, meta)
+    let mut packages = test_packages_from(&cfg.packages, cfg.reverse_dependents, meta);
+    if !packages.is_empty() {
+        for binary in &cfg.extra_tests {
+            let package = extra_test_package(binary);
+            if !packages.contains(&package) {
+                packages.push(package);
+            }
+        }
+    }
+    packages
+}
+
+/// The package of a nextest binary id: `pkg` for unit tests,
+/// `pkg::name` for an integration test, `pkg::bin/name` for a binary.
+pub fn extra_test_package(binary_id: &str) -> String {
+    binary_id
+        .split("::")
+        .next()
+        .unwrap_or(binary_id)
+        .to_string()
+}
+
+/// Whether a listed test counts: every test when no package is named;
+/// otherwise the tests of the named packages (and their dependents with
+/// `--reverse-dependents`) and of the `--extra-tests` binaries.
+pub fn keeps_test(cfg: &Config, meta: &Metadata, test: &crate::types::TestInfo) -> bool {
+    let own = test_packages_from(&cfg.packages, cfg.reverse_dependents, meta);
+    own.is_empty() || own.contains(&test.package) || cfg.extra_tests.contains(&test.binary_id)
+}
+
+/// A nextest filterset that runs exactly the tests [`keeps_test`] keeps,
+/// when `--extra-tests` makes package selection too wide.
+pub fn nextest_filter(cfg: &Config, meta: &Metadata) -> Option<String> {
+    let own = test_packages_from(&cfg.packages, cfg.reverse_dependents, meta);
+    if own.is_empty() || cfg.extra_tests.is_empty() {
+        return None;
+    }
+    let terms: Vec<String> = own
+        .iter()
+        .map(|p| format!("package(={p})"))
+        .chain(cfg.extra_tests.iter().map(|b| format!("binary_id(={b})")))
+        .collect();
+    Some(terms.join(" | "))
 }
 
 pub fn test_packages_from(packages: &[String], reverse: bool, meta: &Metadata) -> Vec<String> {

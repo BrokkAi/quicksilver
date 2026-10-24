@@ -91,6 +91,7 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         repo_root: repo.to_path_buf(),
         worktree_root: cargo_quicksilver::worktree::root(&git),
         prefix: git.prefix,
+        extra_tests: Vec::new(),
         build_jobs: 2,
         test_jobs: 4,
         cm_jobs: 8,

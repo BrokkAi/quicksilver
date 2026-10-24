@@ -444,3 +444,43 @@ fn in_diff_discovery_matches_full_discovery_for_changed_functions() {
     scoped.sort();
     assert_eq!(scoped, full, "discover_in_diff must match full discovery");
 }
+
+/// `--package tiny_a` runs only tiny_a's tests, so `always_ok`, which only
+/// tiny_c's tests call, is not covered. `--extra-tests tiny_c` adds that
+/// one binary (and none of tiny_b's tests) and the mutant is reached.
+#[test]
+fn extra_tests_add_one_downstream_binary_to_a_package_run() {
+    if !tools_ok() {
+        eprintln!("skip: nextest not available");
+        return;
+    }
+    let repo = support::setup_tiny();
+    let verdict = |extra: &[&str]| {
+        let mut cfg = support::cfg_for(repo.path());
+        cfg.packages = vec!["tiny_a".into()];
+        cfg.extra_tests = extra.iter().map(|s| s.to_string()).collect();
+        cfg.timeout_floor = std::time::Duration::from_millis(800);
+        let prepared = prepare(cfg, false, false).expect("prepare");
+        let packages: std::collections::BTreeSet<String> =
+            prepared.tests.iter().map(|t| t.package.clone()).collect();
+        let always_false = prepared
+            .mutants
+            .iter()
+            .find(|m| m.fqn.contains("always_ok") && m.replacement.contains("false"))
+            .cloned()
+            .expect("always_ok -> false");
+        let (outcomes, _) =
+            run_schema(&prepared, 0, Some(std::slice::from_ref(&always_false))).expect("run");
+        (packages, outcomes[0].kind)
+    };
+    let (packages, kind) = verdict(&[]);
+    assert_eq!(packages.into_iter().collect::<Vec<_>>(), vec!["tiny_a"]);
+    assert_eq!(kind, VerdictKind::NotCovered);
+    let (packages, kind) = verdict(&["tiny_c"]);
+    assert_eq!(
+        packages.into_iter().collect::<Vec<_>>(),
+        vec!["tiny_a", "tiny_c"],
+        "tiny_b's tests stay out"
+    );
+    assert_eq!(kind, VerdictKind::Missed, "tiny_c's test reaches always_ok");
+}
