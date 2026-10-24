@@ -145,7 +145,9 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
    A verdict that only [proptest](https://docs.rs/proptest) properties
    decided is flagged: properties run random cases, so the verdict can
    change between runs. `--proptest-cases 1024` runs such a survivor once
-   more with `PROPTEST_CASES=1024` before calling it missed.
+   more with `PROPTEST_CASES=1024` before calling it missed; the verdict
+   then says "still missed with PROPTEST_CASES=1024", and `--json` records
+   `proptest_rerun_cases`.
 
 
 ## Find functions no test reaches

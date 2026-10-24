@@ -71,6 +71,10 @@ pub struct Verdict {
     /// Set when only proptest properties decided the verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The `PROPTEST_CASES` of the re-run that decided a survivor judged
+    /// only by properties, when `test --proptest-cases` ran one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proptest_rerun_cases: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1122,6 +1126,7 @@ fn verdict_from(
             .collect(),
         secs,
         note: None,
+        proptest_rerun_cases: None,
     }
 }
 
@@ -1154,7 +1159,12 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
                 if v.tests_run.len() > 4 { ", ..." } else { "" }
             );
             if v.note.is_some() {
-                line.push_str("\n      proptest properties only: the verdict can change between runs (try `test --proptest-cases 1024`)");
+                line.push_str(&match v.proptest_rerun_cases {
+                    Some(n) => format!(
+                        "\n      proptest properties only: still missed with PROPTEST_CASES={n}"
+                    ),
+                    None => "\n      proptest properties only: the verdict can change between runs (try `test --proptest-cases 1024`)".to_string(),
+                });
             }
             if let Some(intent) = &m.intent {
                 line.push_str(&format!("\n      intent: {intent}"));
@@ -1261,6 +1271,7 @@ pub fn test(
                         tests_run: Vec::new(),
                         secs: 0.0,
                         note: None,
+                        proptest_rerun_cases: None,
                     }
                 } else {
                     let planned = PlannedMutant {
@@ -1307,6 +1318,7 @@ pub fn test(
                                 tests_run: Vec::new(),
                                 secs: started.elapsed().as_secs_f64(),
                                 note: None,
+                                proptest_rerun_cases: None,
                             }
                         }
                     };
@@ -1318,9 +1330,13 @@ pub fn test(
                         .iter()
                         .all(|t| map.property_tests.contains(&t.id));
                     if verdict.kind == VerdictKind::Missed && property_only && proptest_cases > 0 {
+                        info!(
+                            "{}: only proptest properties judged it; running them again with PROPTEST_CASES={proptest_cases}",
+                            m.id
+                        );
                         let cases = proptest_cases.to_string();
-                        if let Ok(run) = run_with(&[("PROPTEST_CASES".to_string(), cases)]) {
-                            if run.outcome.kind == VerdictKind::Caught {
+                        match run_with(&[("PROPTEST_CASES".to_string(), cases)]) {
+                            Ok(run) if run.outcome.kind == VerdictKind::Caught => {
                                 verdict = verdict_from(
                                     &run.outcome,
                                     &run,
@@ -1329,7 +1345,19 @@ pub fn test(
                                 verdict.message = Some(format!(
                                     "caught only with PROPTEST_CASES={proptest_cases}; the default number of cases missed it"
                                 ));
+                                verdict.proptest_rerun_cases = Some(proptest_cases);
                             }
+                            Ok(run) if run.outcome.kind == VerdictKind::Missed => {
+                                verdict.proptest_rerun_cases = Some(proptest_cases);
+                            }
+                            Ok(run) => warn!(
+                                "{}: the PROPTEST_CASES={proptest_cases} run ended {:?}; the verdict stays the one with default cases",
+                                m.id, run.outcome.kind
+                            ),
+                            Err(err) => warn!(
+                                "{}: the PROPTEST_CASES={proptest_cases} run failed: {err:#}",
+                                m.id
+                            ),
                         }
                     }
                     let decided_by_property = match verdict.kind {

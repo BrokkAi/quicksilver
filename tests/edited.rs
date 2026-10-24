@@ -340,11 +340,18 @@ fn edited_mutants_are_captured_built_and_judged() {
     fs::write(&lower_patch, git_diff()).unwrap();
     fs::write(
         &schema_lib,
+        schema_original.replace("    s.to_uppercase()\n", "    s.to_uppercase().clone()\n"),
+    )
+    .unwrap();
+    let same_patch = repo.path().join("../shout_same.patch");
+    fs::write(&same_patch, git_diff()).unwrap();
+    fs::write(
+        &schema_lib,
         schema_original.replace("    s.to_uppercase()\n", "    s.to_string()\n"),
     )
     .unwrap();
-    let report = build_with(vec![lower_patch], false);
-    assert_eq!(report.captured.len(), 2, "{:?}", report.captured);
+    let report = build_with(vec![lower_patch, same_patch], false);
+    assert_eq!(report.captured.len(), 3, "{:?}", report.captured);
     fs::write(&schema_lib, &schema_original).unwrap();
     let lower = report
         .captured
@@ -358,13 +365,21 @@ fn edited_mutants_are_captured_built_and_judged() {
         .find(|m| m.edits[0].body.contains("to_string"))
         .unwrap()
         .clone();
+    let equivalent = report
+        .captured
+        .iter()
+        .find(|m| m.edits[0].body.contains(".clone()"))
+        .unwrap()
+        .clone();
     let results = test(&cfg, &paths, std::slice::from_ref(&lower.id), 0).expect("test");
     assert_eq!(results.len(), 1);
     let v = &results[0].1;
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
     assert!(v.note.is_some(), "{v:?}");
-    assert!(cargo_quicksilver::exec::edited::verdict_line(&lower, v)
-        .contains("proptest properties only"));
+    let line = cargo_quicksilver::exec::edited::verdict_line(&lower, v);
+    assert!(line.contains("proptest properties only"), "{line}");
+    assert!(line.contains("try `test --proptest-cases"), "{line}");
+    assert_eq!(v.proptest_rerun_cases, None);
     let results = test(&cfg, &paths, std::slice::from_ref(&same.id), 1000).expect("test");
     let v = &results[0].1;
     assert_eq!(v.kind, VerdictKind::Caught, "{v:?}");
@@ -375,6 +390,21 @@ fn edited_mutants_are_captured_built_and_judged() {
         "{v:?}"
     );
     assert!(v.note.is_some(), "a property decided it: {v:?}");
+    assert_eq!(v.proptest_rerun_cases, Some(1000));
+    // A survivor of the re-run says so instead of suggesting it again.
+    let results = test(&cfg, &paths, std::slice::from_ref(&equivalent.id), 1000).expect("test");
+    let v = &results[0].1;
+    assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
+    assert_eq!(v.proptest_rerun_cases, Some(1000));
+    let line = cargo_quicksilver::exec::edited::verdict_line(&equivalent, v);
+    assert!(
+        line.contains("still missed with PROPTEST_CASES=1000"),
+        "{line}"
+    );
+    assert!(!line.contains("try `test"), "{line}");
+    assert!(serde_json::to_string(v)
+        .unwrap()
+        .contains("\"proptest_rerun_cases\":1000"));
 
     // An edit outside any body rejects the round, unless edits outside
     // bodies are skipped: then the body edit is kept and the comment dropped.
