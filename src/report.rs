@@ -28,6 +28,10 @@ pub struct JsonReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountReport {
     pub caught: usize,
+    #[serde(default)]
+    pub caught_by_crash: usize,
+    #[serde(default)]
+    pub caught_by_timeout: usize,
     pub missed: usize,
     pub not_covered: usize,
     pub unviable: usize,
@@ -43,6 +47,8 @@ impl From<&OutcomeCounts> for CountReport {
     fn from(c: &OutcomeCounts) -> Self {
         Self {
             caught: c.caught,
+            caught_by_crash: c.caught_by_crash,
+            caught_by_timeout: c.caught_by_timeout,
             missed: c.missed,
             not_covered: c.not_covered,
             unviable: c.unviable,
@@ -58,10 +64,11 @@ impl From<&OutcomeCounts> for CountReport {
 pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
     let c = OutcomeCounts::from_outcomes(outcomes);
     eprintln!(
-        "outcomes: {} total — {} caught ({} by crash), {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
+        "outcomes: {} total — {} caught ({} by crash, {} by timeout), {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
         c.total(),
         c.caught,
         c.caught_by_crash,
+        c.caught_by_timeout,
         c.missed,
         c.not_covered,
         c.unviable,

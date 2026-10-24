@@ -20,6 +20,10 @@ pub struct FileConfig {
     /// Test binaries from other packages to run with `--package`.
     #[serde(rename = "extra-tests", default)]
     pub extra_tests: Vec<String>,
+    /// Minimum seconds per test (by test id or name), for tests with their
+    /// own deadlines longer than three times their duration.
+    #[serde(rename = "test-budget", default)]
+    pub test_budget: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +46,8 @@ pub struct Config {
     /// Test binaries (nextest ids) of other packages that also count with
     /// `--package`.
     pub extra_tests: Vec<String>,
+    /// Minimum budget in seconds per test id or name.
+    pub test_budget: BTreeMap<String, f64>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
     pub json: Option<PathBuf>,
@@ -136,6 +142,7 @@ pub fn merge_config(
         max_scratch: cli.max_scratch,
         packages: extras.packages,
         reverse_dependents: cli.reverse_dependents,
+        test_budget: file.test_budget.clone(),
         extra_tests: {
             let mut v = cli.extra_tests.clone();
             for b in &file.extra_tests {

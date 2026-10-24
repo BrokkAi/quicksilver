@@ -171,7 +171,12 @@ is left out; `--scaffolding` lists it.
   difference. These are the ones to read.
 - **Not covered**: no test reaches the changed function.
 - **Unviable**: the mutant does not compile.
-- **Timeout**: a test hangs with the mutant and finishes without it.
+- **Caught by timeout**: a test passes quickly without the mutant and runs
+  past its budget with it, twice. The mutant made the code hang or slow
+  down, which the test (or its own deadline) noticed; it counts as caught.
+- **Timeout**: the same, but the test is slow even without the mutant, so
+  load may explain it. `[test-budget]` in `quicksilver.toml` gives named
+  tests a longer budget, for example `"my_crate::tests::waits" = 60.0`.
 - **Errored**: a test could not run properly, for example because it fails
   even without the mutant.
 

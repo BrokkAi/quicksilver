@@ -200,10 +200,14 @@ fn caught_missed_notcovered_timeout() {
         .cloned()
         .expect("maybe_hang -> true");
     let (to, _) = run_schema(&prepared, 0, Some(&[hang])).expect("run hang");
+    // The test passes in milliseconds without the mutant and hangs with it:
+    // a timeout the mutant caused counts as caught.
     assert!(
-        to.iter()
-            .any(|o| o.kind == VerdictKind::Timeout || o.kind == VerdictKind::Caught),
-        "maybe_hang -> true should timeout (Caught as Timeout): {:?}",
+        to.iter().any(|o| o.kind == VerdictKind::Caught
+            && o.message
+                .as_deref()
+                .is_some_and(|m| m.starts_with(cargo_quicksilver::types::TIMEOUT_PREFIX))),
+        "maybe_hang -> true should be caught by timeout: {:?}",
         to
     );
 }

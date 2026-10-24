@@ -1123,7 +1123,11 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
             m.id,
             m.fqns(),
             v.test.as_deref().unwrap_or("?"),
-            if v.message.is_some() { " (crash)" } else { "" }
+            match v.message.as_deref() {
+                Some(m) if m.starts_with(crate::types::TIMEOUT_PREFIX) => " (timeout)",
+                Some(m) if m.starts_with(crate::types::CRASH_PREFIX) => " (crash)",
+                _ => "",
+            }
         ),
         VerdictKind::Missed => {
             let mut line = format!(

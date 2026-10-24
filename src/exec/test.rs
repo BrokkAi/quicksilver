@@ -119,6 +119,34 @@ fn expected_secs(t: &ResolvedTest) -> f64 {
     calibrated_secs(t).map_or(t.duration_secs, |c| c.max(t.duration_secs))
 }
 
+/// Minimum budgets per test id or name, from `[test-budget]` in
+/// quicksilver.toml: for tests whose own deadlines (a bounded wait, an
+/// `elapsed < 60s` assertion) are longer than three times their duration.
+static TEST_BUDGETS: LazyLock<Mutex<HashMap<String, Duration>>> = LazyLock::new(Default::default);
+
+/// Install the per-test minimum budgets for this process.
+pub fn set_test_budgets(budgets: &std::collections::BTreeMap<String, f64>) {
+    let mut map = TEST_BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+    map.clear();
+    for (test, secs) in budgets {
+        map.insert(test.clone(), duration_from_secs(*secs));
+    }
+}
+
+/// `budget`, raised to the test's configured minimum.
+fn with_minimum(t: &ResolvedTest, budget: Duration) -> Duration {
+    let map = TEST_BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+    [t.id.as_str(), t.name.as_str()]
+        .iter()
+        .filter_map(|k| map.get(*k))
+        .fold(budget, |b, m| b.max(*m))
+}
+
+/// The share of its calibration budget a test must stay under with no
+/// mutant for a timeout under the mutant to count as caught. A test that needs more is
+/// slow on its own, and load could explain the timeout.
+const CAUGHT_BY_TIMEOUT_SHARE: f64 = 1.0 / 3.0;
+
 /// Cap on the stderr tail copied into an `Outcome` message. The capture
 /// buffer holds 64KB; outcomes.jsonl does not need all of it.
 const MESSAGE_TAIL: usize = 2000;
@@ -308,8 +336,12 @@ fn record_all(
     progress: Option<&crate::progress::Progress>,
 ) -> SiteRecording {
     let started = Instant::now();
-    let budget =
-        |t: &ResolvedTest| test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown);
+    let budget = |t: &ResolvedTest| {
+        with_minimum(
+            t,
+            test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown),
+        )
+    };
     let all: Vec<(usize, Duration)> = tests
         .iter()
         .enumerate()
@@ -549,7 +581,10 @@ where
     let mut observations = Vec::new();
     let mut decisive: Option<Outcome> = None;
     for t in tests {
-        let budget = test_timeout_scaled(expected_secs(t), policy.floor, policy.slowdown);
+        let budget = with_minimum(
+            t,
+            test_timeout_scaled(expected_secs(t), policy.floor, policy.slowdown),
+        );
         let (first, first_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
         if first == RunStatus::Passed {
             observations.push(observation(t, TestVerdict::Passed, first_secs));
@@ -779,6 +814,7 @@ where
     // Only the calibration can take minutes; the re-run that follows is
     // budgeted from it, so it runs without the lock. Holding the lock across
     // both made N hanging mutants cost N full re-runs in series.
+    let calibration = with_minimum(t, policy.floor.max(Duration::from_secs(120)));
     let null_secs = match calibrated_secs(t) {
         Some(secs) => {
             tracing::info!(
@@ -788,7 +824,6 @@ where
             secs
         }
         None => {
-            let calibration = policy.floor.max(Duration::from_secs(120));
             let (null, null_secs, null_err) = {
                 let _guard = confirm_lock();
                 run(&spec_for(t, calibration, &[], true))?
@@ -821,7 +856,10 @@ where
             secs
         }
     };
-    let budget = duration_from_secs((null_secs * 3.0).max(policy.floor.as_secs_f64()));
+    let budget = with_minimum(
+        t,
+        duration_from_secs((null_secs * 3.0).max(policy.floor.as_secs_f64())),
+    );
     let (again, again_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
     tracing::info!(
         "confirm {}: re-run with mutant {:?} in {:.2}s (calibrated budget {:.1}s)",
@@ -832,15 +870,39 @@ where
     );
     match again {
         RunStatus::Timeout => {
-            tracing::info!(
-                "confirm {}: TIMEOUT attributed to mutant (null passed in {:.2}s)",
-                t.name,
-                null_secs
-            );
-            Ok(Step::Done(Outcome::timeout(
-                planned.mutant.clone(),
-                t.name.clone(),
-            )))
+            let share = null_secs / calibration.as_secs_f64();
+            if share < CAUGHT_BY_TIMEOUT_SHARE {
+                // Twice over its budget with the mutant, and comfortably
+                // inside its calibration without: the mutant made it hang.
+                let message = format!(
+                    "{} ({}): passed without it in {:.2}s, exceeded {:.1}s with it twice",
+                    crate::types::TIMEOUT_PREFIX,
+                    t.name,
+                    null_secs,
+                    budget.as_secs_f64()
+                );
+                tracing::info!("confirm {}: CAUGHT by timeout", t.name);
+                Ok(Step::Done(Outcome::caught_by_timeout(
+                    planned.mutant.clone(),
+                    t.name.clone(),
+                    message,
+                )))
+            } else {
+                tracing::info!(
+                    "confirm {}: TIMEOUT, inconclusive (null run {:.2}s of a {:.1}s calibration budget)",
+                    t.name,
+                    null_secs,
+                    calibration.as_secs_f64()
+                );
+                let mut outcome = Outcome::timeout(planned.mutant.clone(), t.name.clone());
+                outcome.message = Some(format!(
+                    "the test takes {:.2}s without the mutant, {:.0}% of its {:.0}s calibration budget, so load may explain the timeout; [test-budget] in quicksilver.toml can give it more",
+                    null_secs,
+                    share * 100.0,
+                    calibration.as_secs_f64()
+                ));
+                Ok(Step::Done(outcome))
+            }
         }
         RunStatus::Failed => {
             tracing::info!("confirm {}: CAUGHT on the calibrated re-run", t.name);
@@ -1223,7 +1285,7 @@ mod tests {
     }
 
     #[test]
-    fn confirm_timeout_with_fast_null_and_second_timeout_is_a_timeout() {
+    fn confirm_timeout_with_fast_null_and_second_timeout_is_caught_by_timeout() {
         let (outcome, seen) = drive(
             true,
             &fake_tests(&["timeout-rerun"]),
@@ -1233,13 +1295,44 @@ mod tests {
                 (RunStatus::Timeout, 36.0, ""),
             ],
         );
-        assert_eq!(outcome.kind, VerdictKind::Timeout);
+        // 12s is well inside the 120s calibration: the mutant made it hang.
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        let msg = outcome.message.unwrap();
+        assert!(msg.starts_with(crate::types::TIMEOUT_PREFIX), "{msg}");
         assert_eq!(seen.len(), 3);
         assert_eq!(seen[1].timeout, Duration::from_secs(120), "calibration");
         assert!(!has_mutant(&seen[1]));
         // 3 × the 12s null run beats the 30s floor.
         assert_eq!(seen[2].timeout, Duration::from_secs(36));
         assert!(has_mutant(&seen[2]));
+    }
+
+    #[test]
+    fn a_timeout_whose_null_run_is_slow_stays_a_timeout() {
+        let (outcome, _) = drive(
+            true,
+            &fake_tests(&["timeout-slow-null"]),
+            &[
+                (RunStatus::Timeout, 30.0, ""),
+                (RunStatus::Passed, 50.0, ""),
+                (RunStatus::Timeout, 150.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Timeout);
+        let msg = outcome.message.unwrap();
+        assert!(msg.contains("load may explain"), "{msg}");
+    }
+
+    #[test]
+    fn a_configured_budget_raises_every_budget_of_that_test() {
+        set_test_budgets(&[("budgeted".to_string(), 90.0)].into_iter().collect());
+        let (outcome, seen) = drive(
+            true,
+            &fake_tests(&["budgeted"]),
+            &[(RunStatus::Passed, 0.4, "")],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Missed);
+        assert_eq!(seen[0].timeout, Duration::from_secs(90));
     }
 
     #[test]

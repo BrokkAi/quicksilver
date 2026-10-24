@@ -138,6 +138,20 @@ impl Outcome {
         }
     }
 
+    /// Caught by a test that timed out with the mutant active, twice, while
+    /// it passed without it well inside its calibration budget: the mutant
+    /// made the code hang or slow down and the test's own deadline (or
+    /// QS's) noticed. The message starts with [`TIMEOUT_PREFIX`].
+    pub fn caught_by_timeout(mutant: Mutant, test: String, message: String) -> Self {
+        Self {
+            mutant,
+            kind: VerdictKind::Caught,
+            test: Some(test),
+            message: Some(message),
+            build: true,
+        }
+    }
+
     pub fn missed(mutant: Mutant) -> Self {
         Self {
             mutant,
@@ -192,6 +206,9 @@ impl Outcome {
 
 /// Prefix of a [`Outcome::caught_by_crash`] message.
 pub const CRASH_PREFIX: &str = "crashed under the mutant";
+
+/// Prefix of a [`Outcome::caught_by_timeout`] message.
+pub const TIMEOUT_PREFIX: &str = "timed out under the mutant";
 
 /// "exit 3" or "killed by a signal" for a non-libtest test failure.
 pub fn describe_exit(code: Option<i32>) -> String {

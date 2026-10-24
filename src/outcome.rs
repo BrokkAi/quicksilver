@@ -6,6 +6,8 @@ pub struct OutcomeCounts {
     /// Of `caught`, the kills by a confirmed crash rather than a libtest
     /// assertion failure.
     pub caught_by_crash: usize,
+    /// Of `caught`, the kills by a timeout the mutant caused.
+    pub caught_by_timeout: usize,
     pub missed: usize,
     pub not_covered: usize,
     pub unviable: usize,
@@ -29,6 +31,12 @@ impl OutcomeCounts {
                         .is_some_and(|m| m.starts_with(crate::types::CRASH_PREFIX))
                     {
                         c.caught_by_crash += 1;
+                    }
+                    if o.message
+                        .as_deref()
+                        .is_some_and(|m| m.starts_with(crate::types::TIMEOUT_PREFIX))
+                    {
+                        c.caught_by_timeout += 1;
                     }
                 }
                 VerdictKind::Missed => c.missed += 1,

@@ -43,6 +43,7 @@ pub fn config_from_cli(
     extras.timeout_floor_ms = common.timeout_floor_ms;
     extras.strict_source_isolation = common.strict_source_isolation;
     let cfg = merge_config(repo, file.clone(), common, extras)?;
+    crate::exec::test::set_test_budgets(&cfg.test_budget);
     Ok((cfg, file))
 }
 
