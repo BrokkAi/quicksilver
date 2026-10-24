@@ -71,6 +71,8 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 
 All five issues of the batch (#11 to #15) are fixed on master, one commit each with "Fixes #N", plus the gate follow-up. Unit tests, `tests/edited.rs`, `tests/engine.rs` and `tests/schema.rs` pass; the end-to-end test passed three runs in a row after the gate fix.
 
+Confirmed in the field (other session, 2026-10-24, at 1a9a6f9): `map` of bifrost-store with `--extra-tests brokk-bifrost::suite_persistence` had 1,064 tests, all green. The four tests that failed only under QS in #14 pass, including the three whose cause was not confirmed by hand, so the sandbox location explains all four. The sandbox report: 1,128 processes, the largest left 30.7 MiB, all deleted.
+
 Lesson: a fixture test that is red on purpose interacts with every place that samples tests; the first passing run of the end-to-end test was not enough evidence, because the gate's sample changes between runs.
 
 
