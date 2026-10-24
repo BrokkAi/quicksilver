@@ -225,6 +225,18 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
             map.not_green.len()
         );
     }
+    let mapped: Vec<String> = map
+        .sites
+        .iter()
+        .filter(|s| in_scope(s))
+        .map(|s| s.package.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let omitted = sitemap::omitted_test_dependents(&cfg.repo_root, &mapped, &map.test_packages);
+    if !omitted.is_empty() {
+        eprintln!("hint: tests of {} may enter the listed functions; add them with --extra-tests or [package.<name>] extra-tests", omitted.join(", "));
+    }
     if let Some(path) = &cfg.json {
         let rows: Vec<serde_json::Value> = shown
             .iter()

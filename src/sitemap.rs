@@ -753,3 +753,39 @@ mod tests {
 #[cfg(test)]
 #[path = "sitemap/caller_tests.rs"]
 mod caller_tests;
+
+/// Workspace dependents whose tests were omitted from a package-limited map.
+/// Metadata failure is deliberately silent: this hint must not block reporting.
+pub fn omitted_test_dependents(root: &Path, mapped: &[String], tested: &[String]) -> Vec<String> {
+    if tested.is_empty() {
+        return Vec::new();
+    }
+    let Ok(meta) = crate::cargo_cmd::load_metadata(root) else {
+        return Vec::new();
+    };
+    crate::cargo_cmd::reverse_dependents(&meta, mapped)
+        .into_iter()
+        .filter(|p| !tested.contains(p))
+        .collect()
+}
+
+#[cfg(test)]
+mod dependent_hint_tests {
+    use super::*;
+
+    #[test]
+    fn hint_names_only_omitted_dependents_of_a_limited_map() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let mapped = vec!["tiny_a".into()];
+        assert_eq!(
+            omitted_test_dependents(&root, &mapped, &mapped),
+            ["tiny_b", "tiny_c"]
+        );
+        assert_eq!(
+            omitted_test_dependents(&root, &mapped, &["tiny_a".into(), "tiny_b".into()]),
+            ["tiny_c"]
+        );
+        assert!(omitted_test_dependents(&root, &mapped, &[]).is_empty());
+        assert!(omitted_test_dependents(&root.join("missing"), &mapped, &mapped).is_empty());
+    }
+}

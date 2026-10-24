@@ -53,6 +53,17 @@ does: `--extra-tests other_pkg::suite_name` (repeatable, or
 tests of every workspace package that depends on it. For a crate low in the
 dependency graph, that can be most of the workspace's tests.
 
+To add partner tests whenever a particular package is selected, configure:
+
+```toml
+[package.brokk-bifrost-rust]
+extra-tests = ["brokk-bifrost-rust-analysis"]
+```
+
+These entries apply only with `--package brokk-bifrost-rust`, after CLI and
+top-level `extra-tests`, without duplicates. Names are nextest binary ids:
+`pkg` for unit tests and `pkg::target` for integration tests.
+
 Quicksilver replaces each function's body with a simple value of its return
 type, such as `0`, `true`, `None` or `Default::default()`. It prints a
 summary, here for clap's `clap_lex` package:
@@ -179,6 +190,10 @@ cargo quicksilver uncovered
 These are test gaps that need no mutants to find. Mutants there would only
 come back not covered, so write tests first. `--package` and `--file` narrow
 the list.
+
+When the map limits tests to some packages, a hint names omitted workspace
+dependents whose tests may enter these functions. Add their binaries with
+`--extra-tests` or `[package.<name>] extra-tests` and map again.
 
 A function marked `[no callers]` is named nowhere in the workspace except
 its own definition and its own file's tests: check whether it is dead code

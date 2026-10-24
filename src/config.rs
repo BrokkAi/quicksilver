@@ -20,6 +20,8 @@ pub struct FileConfig {
     /// Test binaries from other packages to run with `--package`.
     #[serde(rename = "extra-tests", default)]
     pub extra_tests: Vec<String>,
+    #[serde(default)]
+    pub package: BTreeMap<String, PackageConfig>,
     /// Minimum seconds per test (by test id or name), for tests with their
     /// own deadlines longer than three times their duration.
     #[serde(rename = "test-budget", default)]
@@ -30,6 +32,13 @@ pub struct FileConfig {
     pub test_env: BTreeMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PackageConfig {
+    #[serde(rename = "extra-tests", default)]
+    pub extra_tests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -154,6 +163,19 @@ pub fn merge_config(
             .or_insert(v);
     }
 
+    let mut extra_tests = Vec::new();
+    for binary in cli.extra_tests.iter().chain(&file.extra_tests).chain(
+        extras
+            .packages
+            .iter()
+            .filter_map(|p| file.package.get(p))
+            .flat_map(|p| &p.extra_tests),
+    ) {
+        if !extra_tests.contains(binary) {
+            extra_tests.push(binary.clone());
+        }
+    }
+
     Ok(Config {
         repo_root,
         worktree_root: crate::worktree::root(&repo),
@@ -175,15 +197,7 @@ pub fn merge_config(
             ),
             dir => dir.clone(),
         },
-        extra_tests: {
-            let mut v = cli.extra_tests.clone();
-            for b in &file.extra_tests {
-                if !v.contains(b) {
-                    v.push(b.clone());
-                }
-            }
-            v
-        },
+        extra_tests,
         files: extras.files,
         in_diff: extras.in_diff,
         json: extras.json,
@@ -231,4 +245,47 @@ pub struct ConfigExtras {
     pub triage: bool,
     pub triage_neighbors: usize,
     pub second_order_pairs: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn package_extra_tests_follow_cli_and_global_defaults() {
+        let file: FileConfig = toml::from_str(
+            r#"
+extra-tests = ["shared", "global"]
+[package.tiny_a]
+extra-tests = ["global", "partner"]
+[package.tiny_b]
+extra-tests = ["unselected"]
+"#,
+        )
+        .unwrap();
+        let cli = crate::cli::Cli::parse_from([
+            "qs",
+            "--extra-tests",
+            "shared",
+            "--extra-tests",
+            "cli",
+            "uncovered",
+        ]);
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let merged = merge_config(
+            root.clone(),
+            file.clone(),
+            &cli.common,
+            ConfigExtras {
+                packages: vec!["tiny_a".into()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(merged.extra_tests, ["shared", "cli", "global", "partner"]);
+        let merged = merge_config(root, file, &cli.common, ConfigExtras::default()).unwrap();
+        assert_eq!(merged.extra_tests, ["shared", "cli", "global"]);
+        assert!(toml::from_str::<FileConfig>("[package.tiny_a]\nunknown = []").is_err());
+    }
 }
