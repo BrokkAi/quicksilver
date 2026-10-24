@@ -163,11 +163,177 @@ impl SiteMap {
 /// The sites among `sites` whose name appears nowhere in the repository's
 /// Rust sources at the map's commit except in their own definition and in
 /// their own file's test code: candidates for deletion rather than tests.
-/// One `git grep -w -F` finds every occurrence. Methods of trait impls
-/// (called through the trait) and `main` are never candidates. A name
-/// shared with another function counts as used, so the hint errs toward
-/// "has callers".
+/// Committed blobs are scanned once, dropping names as soon as all sites
+/// with that name have a caller. Methods of trait impls (called through the
+/// trait) and `main` are never candidates. A name shared with another
+/// function counts as used, so the hint errs toward "has callers".
 pub fn without_callers(
+    map: &SiteMap,
+    repo_dir: &Path,
+    sites: &[&MapSite],
+) -> Result<std::collections::HashSet<u32>> {
+    Ok(scan_callers(map, repo_dir, sites)?.0)
+}
+
+// Return the number of blobs scanned as well, to verify early termination.
+fn scan_callers(
+    map: &SiteMap,
+    repo_dir: &Path,
+    sites: &[&MapSite],
+) -> Result<(std::collections::HashSet<u32>, usize)> {
+    use std::collections::{HashMap, HashSet};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+
+    let mut pending: HashMap<&str, Vec<&MapSite>> = HashMap::new();
+    let mut uncalled = HashSet::new();
+    for &site in sites {
+        let name = site.fqn.rsplit('.').next().unwrap_or("");
+        if !site.trait_impl && name != "main" {
+            pending.entry(name).or_default().push(site);
+            uncalled.insert(site.site_id);
+        }
+    }
+    if pending.is_empty() {
+        return Ok((uncalled, 0));
+    }
+
+    let tree = Command::new("git")
+        .args(["ls-tree", "-r", "-z", "--full-tree", &map.commit])
+        .current_dir(repo_dir)
+        .output()
+        .context("git ls-tree")?;
+    anyhow::ensure!(
+        tree.status.success(),
+        "git ls-tree: {}",
+        String::from_utf8_lossy(&tree.stderr).trim()
+    );
+    let mut blobs = Vec::new();
+    for entry in tree.stdout.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|b| *b == b'\t')
+            .context("invalid git ls-tree entry")?;
+        let (header, rest) = entry.split_at(tab);
+        let path = &rest[1..];
+        if !path.ends_with(b".rs") {
+            continue;
+        }
+        let header = std::str::from_utf8(header).context("git ls-tree header")?;
+        let mut fields = header.split_whitespace();
+        let mode = fields.next();
+        let kind = fields.next();
+        let oid = fields.next().context("git ls-tree object id")?;
+        if matches!(mode, Some("100644" | "100755")) && kind == Some("blob") {
+            blobs.push((oid.to_owned(), String::from_utf8_lossy(path).into_owned()));
+        }
+    }
+
+    let mut child = Command::new("git")
+        .args(["cat-file", "--batch"])
+        .current_dir(repo_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("git cat-file --batch")?;
+    let mut input = child.stdin.take().expect("piped stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("piped stdout"));
+    let ids: Vec<String> = blobs.iter().map(|(oid, _)| oid.clone()).collect();
+    // Writing requests and reading replies on the same thread can fill both
+    // pipes. The writer owns stdin and closes it after the last request.
+    let writer = std::thread::spawn(move || -> std::io::Result<()> {
+        for oid in ids {
+            writeln!(input, "{oid}")?;
+        }
+        Ok(())
+    });
+    let mut scanned = 0;
+    let scan = (|| -> Result<()> {
+        let mut header = String::new();
+        let mut bytes = Vec::new();
+        for (oid, path) in &blobs {
+            if pending.is_empty() {
+                break;
+            }
+            header.clear();
+            output
+                .read_line(&mut header)
+                .context("read git cat-file header")?;
+            let fields: Vec<_> = header.split_whitespace().collect();
+            anyhow::ensure!(
+                fields.len() == 3 && fields[0] == oid && fields[1] == "blob",
+                "invalid git cat-file response: {header:?}"
+            );
+            let size = fields[2]
+                .parse::<usize>()
+                .context("git cat-file blob size")?;
+            bytes.resize(size, 0);
+            output
+                .read_exact(&mut bytes)
+                .context("read git cat-file blob")?;
+            let mut terminator = [0];
+            output
+                .read_exact(&mut terminator)
+                .context("read git cat-file terminator")?;
+            anyhow::ensure!(terminator == *b"\n", "invalid git cat-file terminator");
+            scanned += 1;
+            if bytes[..bytes.len().min(8000)].contains(&0) {
+                continue;
+            }
+            let path = path.strip_prefix(&map.prefix).unwrap_or(path);
+            let tests = map.test_lines.get(path);
+            let text = String::from_utf8_lossy(&bytes);
+            for (index, line) in text.lines().enumerate() {
+                let lineno = index + 1;
+                let in_tests = tests
+                    .is_some_and(|ranges| ranges.iter().any(|(a, b)| *a <= lineno && lineno <= *b));
+                for word in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    let Some(candidates) = pending.get_mut(word) else {
+                        continue;
+                    };
+                    candidates.retain(|site| {
+                        let allowed = path == site.path
+                            && (in_tests || (site.start_line <= lineno && lineno <= site.end_line));
+                        if !allowed {
+                            uncalled.remove(&site.site_id);
+                        }
+                        allowed
+                    });
+                    if candidates.is_empty() {
+                        pending.remove(word);
+                        if pending.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                if pending.is_empty() {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })();
+    // On early completion or read failure, stop the producer before joining
+    // the writer: it may be blocked in a pipe write. Always reap the child.
+    let stopped = pending.is_empty() || scan.is_err();
+    if stopped {
+        let _ = child.kill();
+    }
+    drop(output);
+    let status = child.wait().context("wait for git cat-file");
+    let written = writer.join();
+    scan?;
+    let status = status?;
+    let written = written.map_err(|_| anyhow::anyhow!("git cat-file writer panicked"))?;
+    if !stopped {
+        written.context("write git cat-file requests")?;
+        anyhow::ensure!(status.success(), "git cat-file failed: {status}");
+    }
+    Ok((uncalled, scanned))
+}
+
+#[cfg(test)]
+fn without_callers_old(
     map: &SiteMap,
     repo_dir: &Path,
     sites: &[&MapSite],
@@ -583,3 +749,7 @@ mod tests {
         assert!(map.tests_entering(&[9]).is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "sitemap/caller_tests.rs"]
+mod caller_tests;
