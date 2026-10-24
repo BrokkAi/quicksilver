@@ -1048,22 +1048,44 @@ pub(crate) fn null_schema_gate(
     };
     // Schema binaries carry a prologue in every site. 3× green duration is
     // not enough; a 0.4s test timed out at 5s and failed the whole crate.
-    let floor = cfg.timeout_floor.max(Duration::from_secs(30));
-    let outcome = run_mutant_tests_with_env(&dummy, run_dir, baseline, floor, &[])?;
-    match outcome.kind {
-        VerdictKind::Caught | VerdictKind::Timeout | VerdictKind::Errored => {
-            bail!(
-                "null-schema gate failed: staged tests are not green with QS_MUTANT unset ({:?} {})",
-                outcome.kind,
-                outcome
-                    .test
-                    .as_deref()
-                    .or(outcome.message.as_deref())
-                    .unwrap_or("")
-            );
-        }
-        _ => Ok(()),
+    let policy = TestRunPolicy {
+        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
+        slowdown: 1.0,
+        confirm: false,
+    };
+    // Every sampled test runs. The gate is for a schema binary that breaks
+    // tests across the board (a runtime that deadlocks in every test), so
+    // it fails only when no sampled test passes. A test that is red for
+    // its own reasons, such as the sandbox or `[test-env]`, is reported by
+    // the site recording, with its output, and selects nothing.
+    let run = run_mutant_tests_observed(&dummy, run_dir, baseline, &policy, &[], true)?;
+    let not_green: Vec<String> = run
+        .observations
+        .iter()
+        .filter(|o| o.verdict != crate::types::TestVerdict::Passed)
+        .map(|o| format!("{} ({:?})", o.test_name, o.verdict))
+        .collect();
+    let outcome = &run.outcome;
+    if run.observations.len() == not_green.len() {
+        bail!(
+            "null-schema gate failed: no staged test is green with QS_MUTANT unset ({:?} {}); the schema binary may break every test",
+            outcome.kind,
+            outcome
+                .test
+                .as_deref()
+                .or(outcome.message.as_deref())
+                .unwrap_or("")
+        );
     }
+    if !not_green.is_empty() {
+        warn!(
+            "null-schema gate: {} of {} sampled tests are not green with QS_MUTANT unset, the others are: {}",
+            not_green.len(),
+            run.observations.len(),
+            not_green.join(", ")
+        );
+    }
+    Ok(())
 }
 
 /// One run of every candidate test under the schema binary with no mutant
