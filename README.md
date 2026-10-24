@@ -195,10 +195,23 @@ is left out; `--scaffolding` lists it.
 A mutant can make a test write the wrong thing to the wrong place. So each
 test process quicksilver starts gets its own `HOME`, `XDG_CONFIG_HOME`,
 `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR`, in a new
-directory under `.git/quicksilver/`, deleted when the process exits. The
-variables reach it through a short link under the system temporary
-directory, because a Unix socket's path must be short. At the end,
-quicksilver says how many processes ran and the most any one left behind.
+directory under the system temporary directory (a private `qs-sandbox-*`
+directory per run), deleted when the process exits. At the end, quicksilver
+says how many processes ran and the most any one left behind.
+
+To put sandboxes elsewhere, for example when the temporary directory is a
+small filesystem, set an absolute path:
+
+```toml
+[sandbox]
+dir = "/fast/disk/qs-sandboxes"
+```
+
+The directory must be outside any git repository, or tests that check
+whether their temporary directory is in a repository would see one;
+quicksilver refuses one that is inside. Keep the path short, too: a Unix
+socket's path must fit in about 100 bytes, and tools such as mbx put
+sockets in `TMPDIR`.
 
 Tests that run cargo, rustup, git or mbx still work: `CARGO_HOME`,
 `RUSTUP_HOME` and `MBX_CACHE_DIR` point at your own, and your git and mbx
@@ -212,6 +225,10 @@ process; `{sandbox}` stands for the process's sandbox directory:
 [test-env]
 BIFROST_CACHE_ROOT = "{sandbox}/cache"
 ```
+
+A test that fails or times out with no mutant active selects no mutants.
+`map` and `run` print why, with the last lines of its output, and the map
+keeps the end of its output under `not_green_output`.
 
 `--no-sandbox`, or `enabled = false` under `[sandbox]`, runs tests in your
 own environment. The baseline `cargo nextest run`, which runs no mutants,

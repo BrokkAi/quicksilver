@@ -654,8 +654,10 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         entered.len(),
         site_ids.len()
     );
-    for (test, why) in recording.not_green.iter().take(8) {
-        warn!("  not green under the schema binary: {test}: {why}");
+    for line in
+        crate::exec::test::describe_not_green(&recording.not_green, &recording.not_green_output, 8)
+    {
+        warn!("  not green under the schema binary: {line}");
     }
 
     let map = SiteMap {
@@ -674,6 +676,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         tests,
         hits,
         not_green: recording.not_green.clone(),
+        not_green_output: recording.not_green_output.clone(),
         property_tests,
         worker: worker.clone(),
         run_dir: run_dir.clone(),

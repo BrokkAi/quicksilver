@@ -3,12 +3,16 @@
 //! state: caches under `~/.cache`, config files, files left in `/tmp`.
 //!
 //! Each process gets `HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-//! `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR` in its own directory under
-//! QS's state, on the same filesystem as the worktrees. The directory is
-//! deleted when the process exits. The variables name it through a short
-//! symbolic link under the system temporary directory, because a Unix
-//! socket's path must fit in about 108 bytes and the state directory can be
-//! deep. Tools that tests may run keep working:
+//! `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR` in its own directory,
+//! deleted when the process exits. The directories of one QS run are in a
+//! private `qs-sandbox-*` directory under the system temporary directory,
+//! or under `[sandbox] dir`. That place must be outside any git repository:
+//! under `.git`, git sees a test's temporary directory as part of the
+//! repository. Its path should also be short, because a Unix socket's path
+//! must fit in about 100 bytes. A small record under QS's state names the
+//! run's directory, so a later run can delete it if QS was killed.
+//!
+//! Tools that tests may run keep working:
 //! `CARGO_HOME`, `RUSTUP_HOME` and `MBX_CACHE_DIR` point at the real ones,
 //! and the git and mbx config files are copied in.
 //!
@@ -26,23 +30,30 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
+/// The start of the name of each QS run's sandbox directory. Stale-run
+/// cleanup deletes only directories named like this.
+const ROOT_PREFIX: &str = "qs-sandbox-";
+
 /// The placeholder in `[test-env]` values for the process's sandbox.
 pub const PLACEHOLDER: &str = "{sandbox}";
 
 /// How every test process QS starts is set up.
 #[derive(Debug)]
 pub struct Settings {
-    /// Where this QS process's sandboxes go; `None` when the sandbox is off.
-    root: Option<PathBuf>,
+    /// Where this QS process's sandbox directory is made; `None` when the
+    /// sandbox is off.
+    parent: Option<PathBuf>,
+    /// This QS process's `qs-sandbox-*` directory, made on first use.
+    root: OnceLock<std::result::Result<PathBuf, String>>,
+    /// The file under QS's state that records `root`, for cleanup after a
+    /// crash; `None` keeps no record.
+    record: Option<PathBuf>,
     /// Variables every sandboxed process gets, such as the real `CARGO_HOME`.
     fixed: Vec<(String, String)>,
     /// Files copied into each sandbox: (real file, path under the sandbox).
     copies: Vec<(PathBuf, PathBuf)>,
     /// `[test-env]`, with the placeholder still in the values.
     test_env: BTreeMap<String, String>,
-    /// A private directory under the system temporary directory for the
-    /// short links to sandboxes, made on first use; `None` if it cannot be.
-    links: OnceLock<Option<PathBuf>>,
     next: AtomicU64,
     processes: AtomicU64,
     largest: AtomicU64,
@@ -131,9 +142,10 @@ fn sandbox_vars(dir: &Path) -> Vec<(String, PathBuf)> {
 }
 
 impl Settings {
-    /// Settings with the sandbox at `root` (none when off) and `[test-env]`.
+    /// Settings with sandboxes under `parent` (none when off) and
+    /// `[test-env]`.
     pub fn new(
-        root: Option<PathBuf>,
+        parent: Option<PathBuf>,
         test_env: BTreeMap<String, String>,
         real: &RealDirs,
     ) -> Result<Settings> {
@@ -141,7 +153,7 @@ impl Settings {
             if key.starts_with("QS_") {
                 bail!("[test-env] cannot set {key}: QS_ variables are quicksilver's own");
             }
-            if root.is_none() && value.contains(PLACEHOLDER) {
+            if parent.is_none() && value.contains(PLACEHOLDER) {
                 bail!("[test-env] {key} uses {PLACEHOLDER}, but the sandbox is off");
             }
         }
@@ -170,11 +182,12 @@ impl Settings {
         }
         copies.retain(|(from, _)| from.is_file());
         Ok(Settings {
-            root,
+            parent,
+            root: OnceLock::new(),
+            record: None,
             fixed,
             copies,
             test_env,
-            links: OnceLock::new(),
             next: AtomicU64::new(0),
             processes: AtomicU64::new(0),
             largest: AtomicU64::new(0),
@@ -185,12 +198,17 @@ impl Settings {
     /// Set up `cmd` to run in a new sandbox, which the returned guard
     /// deletes when dropped. Without a sandbox, only `[test-env]` is set.
     pub fn prepare(self: &Arc<Self>, cmd: &mut Command) -> Result<Option<Sandbox>> {
-        let Some(root) = &self.root else {
+        let Some(parent) = &self.parent else {
             for (key, value) in &self.test_env {
                 cmd.env(key, value);
             }
             return Ok(None);
         };
+        let root = self
+            .root
+            .get_or_init(|| self.make_root(parent))
+            .as_ref()
+            .map_err(|why| anyhow::anyhow!("{why}"))?;
         let n = self.next.fetch_add(1, Ordering::Relaxed);
         let dir = root.join(n.to_string());
         for (_, path) in sandbox_vars(&dir) {
@@ -205,45 +223,47 @@ impl Settings {
             fs::copy(from, &to)
                 .with_context(|| format!("copy {} into the sandbox", from.display()))?;
         }
-        let link = self.link_to(&dir, n);
-        let shown = link.as_deref().unwrap_or(&dir);
-        for (key, path) in sandbox_vars(shown) {
+        for (key, path) in sandbox_vars(&dir) {
             cmd.env(key, path);
         }
         for (key, value) in &self.fixed {
             cmd.env(key, value);
         }
-        let shown_text = shown.to_string_lossy();
+        let dir_text = dir.to_string_lossy();
         for (key, value) in &self.test_env {
-            cmd.env(key, value.replace(PLACEHOLDER, &shown_text));
+            cmd.env(key, value.replace(PLACEHOLDER, &dir_text));
         }
         Ok(Some(Sandbox {
             settings: Arc::clone(self),
             dir,
-            link,
         }))
     }
 
-    /// A shorter path to `dir`: a symbolic link in the private directory
-    /// for links. `None` when that is not shorter or cannot be made.
-    fn link_to(&self, dir: &Path, n: u64) -> Option<PathBuf> {
-        let links = self
-            .links
-            .get_or_init(|| private_dir(&std::env::temp_dir()))
-            .as_ref()?;
-        let link = links.join(n.to_string());
-        if link.as_os_str().len() >= dir.as_os_str().len() {
-            return None;
+    /// Make this QS process's sandbox directory under `parent` and record it.
+    fn make_root(&self, parent: &Path) -> std::result::Result<PathBuf, String> {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("create the sandbox directory {}: {err}", parent.display()))?;
+        let root = private_dir(parent)
+            .ok_or_else(|| format!("cannot make a sandbox directory under {}", parent.display()))?;
+        if let Some(record) = &self.record {
+            let saved = record
+                .parent()
+                .map_or(Ok(()), fs::create_dir_all)
+                .and_then(|()| fs::write(record, root.to_string_lossy().as_bytes()));
+            if let Err(err) = saved {
+                tracing::warn!(
+                    "cannot record the sandbox directory in {}: {err}; if quicksilver is killed, delete {} by hand",
+                    record.display(),
+                    root.display()
+                );
+            }
         }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir, &link).ok()?;
-            Some(link)
-        }
-        #[cfg(not(unix))]
-        {
-            None
-        }
+        Ok(root)
+    }
+
+    /// This QS process's sandbox directory, once a test process used it.
+    pub fn root(&self) -> Option<&Path> {
+        self.root.get()?.as_ref().ok().map(PathBuf::as_path)
     }
 
     /// One line on the sandboxes used so far, or `None` when there were none.
@@ -272,18 +292,11 @@ impl Settings {
 pub struct Sandbox {
     settings: Arc<Settings>,
     dir: PathBuf,
-    link: Option<PathBuf>,
 }
 
 impl Sandbox {
-    /// Where the files are, under QS's state.
     pub fn dir(&self) -> &Path {
         &self.dir
-    }
-
-    /// The path the process's variables use: the short link, if any.
-    pub fn path(&self) -> &Path {
-        self.link.as_deref().unwrap_or(&self.dir)
     }
 }
 
@@ -299,9 +312,6 @@ impl Drop for Sandbox {
                 .unwrap()
                 .push((self.dir.clone(), err.to_string()));
         }
-        if let Some(link) = &self.link {
-            let _ = fs::remove_file(link);
-        }
     }
 }
 
@@ -315,7 +325,7 @@ fn private_dir(parent: &Path) -> Option<PathBuf> {
             .take(8)
             .map(char::from)
             .collect();
-        let path = parent.join(format!("qs-sandbox-{name}"));
+        let path = parent.join(format!("{ROOT_PREFIX}{name}"));
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -402,42 +412,73 @@ pub fn current() -> Option<Arc<Settings>> {
 }
 
 /// Turn the sandbox on (unless `cfg` turns it off) for every test process
-/// this QS process starts, with `[test-env]`. Sandboxes of QS processes
-/// that are gone are deleted.
+/// this QS process starts, with `[test-env]`. The sandboxes go under
+/// `[sandbox] dir` or the system temporary directory, which must be outside
+/// any git repository. Sandboxes of QS processes that are gone are deleted.
 pub fn configure(cfg: &Config, paths: &Paths) -> Result<()> {
-    let base = paths.session.join("sandbox");
-    let root = cfg
-        .sandbox
-        .then(|| base.join(std::process::id().to_string()));
-    if root.is_some() {
-        remove_stale(&base);
-    }
-    let settings = Settings::new(root, cfg.test_env.clone(), &RealDirs::from_env())?;
+    let records = paths.session.join("sandbox");
+    let parent = if cfg.sandbox {
+        let parent = cfg.sandbox_dir.clone().unwrap_or_else(std::env::temp_dir);
+        if let Some(git_dir) = enclosing_repository(&parent) {
+            bail!(
+                "test sandboxes would go under {}, which git sees as inside the repository at {}, so tests that expect their temporary directory outside a repository would fail; set `dir` under [sandbox] in quicksilver.toml to a directory outside any repository, or pass --no-sandbox",
+                parent.display(),
+                git_dir
+            );
+        }
+        remove_stale(&records);
+        Some(parent)
+    } else {
+        None
+    };
+    let mut settings = Settings::new(parent, cfg.test_env.clone(), &RealDirs::from_env())?;
+    settings.record = Some(records.join(std::process::id().to_string()));
     *SETTINGS.write().unwrap() = Some(Arc::new(settings));
     Ok(())
 }
 
+/// The git directory of the repository `dir` (or its nearest existing
+/// ancestor) is inside, or `None` when it is in none or git cannot tell.
+pub fn enclosing_repository(dir: &Path) -> Option<String> {
+    let existing = dir.ancestors().find(|d| d.is_dir())?;
+    let out = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(existing)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// [`Settings::summary`] of the configured settings, after deleting this
-/// process's (now empty) sandbox and link directories.
+/// process's (now empty) sandbox directory and its record.
 pub fn summary() -> Option<String> {
     let settings = current()?;
-    settings.remove_empty_dirs();
+    settings.finish();
     settings.summary()
 }
 
 impl Settings {
-    fn remove_empty_dirs(&self) {
-        if let Some(root) = &self.root {
+    fn finish(&self) {
+        if let Some(root) = self.root() {
             let _ = fs::remove_dir(root);
         }
-        if let Some(Some(links)) = self.links.get() {
-            let _ = fs::remove_dir(links);
+        if let Some(record) = &self.record {
+            let _ = fs::remove_file(record);
         }
     }
 }
 
-fn remove_stale(base: &Path) {
-    let Ok(entries) = fs::read_dir(base) else {
+/// Delete the sandboxes of QS processes that are gone. `records` holds one
+/// file per process, named by its id, with the path of its sandbox
+/// directory. (Before sandboxes moved out of the repository, each entry was
+/// the sandbox directory itself.)
+fn remove_stale(records: &Path) {
+    let Ok(entries) = fs::read_dir(records) else {
         return;
     };
     for entry in entries.flatten() {
@@ -448,9 +489,25 @@ fn remove_stale(base: &Path) {
         else {
             continue;
         };
-        if pid as u32 != std::process::id() && !alive(pid) {
-            let _ = remove_tree(&entry.path());
+        if pid as u32 == std::process::id() || alive(pid) {
+            continue;
         }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = remove_tree(&path);
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&path) {
+            let root = PathBuf::from(text.trim());
+            let named = root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(ROOT_PREFIX));
+            if root.is_absolute() && named {
+                let _ = remove_tree(&root);
+            }
+        }
+        let _ = fs::remove_file(&path);
     }
 }
 
@@ -491,11 +548,14 @@ mod tests {
     fn a_test_process_gets_its_own_home_and_tmpdir_which_are_deleted() {
         let tmp = tempfile::tempdir().unwrap();
         let real = fake_real(tmp.path());
-        let root = tmp.path().join("sandbox");
+        let parent = tmp.path().join("sandboxes");
         let env = [("APP_CACHE".to_string(), "{sandbox}/app".to_string())]
             .into_iter()
             .collect();
-        let settings = Arc::new(Settings::new(Some(root.clone()), env, &real).unwrap());
+        let mut settings = Settings::new(Some(parent.clone()), env, &real).unwrap();
+        let record = tmp.path().join("state/sandbox/1234");
+        settings.record = Some(record.clone());
+        let settings = Arc::new(settings);
         let out = tmp.path().join("seen.txt");
         let mut cmd = Command::new("/bin/sh");
         cmd.arg("-c").arg(format!(
@@ -506,12 +566,20 @@ mod tests {
         ));
         let sandbox = settings.prepare(&mut cmd).unwrap().expect("sandbox on");
         let dir = sandbox.dir().to_path_buf();
-        let shown = sandbox.path().to_path_buf();
+        let root = settings.root().unwrap().to_path_buf();
+        assert_eq!(dir.parent(), Some(root.as_path()));
+        assert_eq!(root.parent(), Some(parent.as_path()));
+        assert!(root
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(ROOT_PREFIX));
+        assert_eq!(fs::read_to_string(&record).unwrap(), root.to_string_lossy());
         assert!(cmd.status().unwrap().success());
         drop(sandbox);
         let seen = fs::read_to_string(&out).unwrap();
         let fields: Vec<&str> = seen.trim().split('|').collect();
-        let d = shown.to_string_lossy();
+        let d = dir.to_string_lossy();
         assert_eq!(fields[0], format!("{d}/home"));
         assert_eq!(fields[1], format!("{d}/tmp"));
         assert_eq!(fields[2], format!("{d}/home/.cache"));
@@ -519,8 +587,9 @@ mod tests {
         assert_eq!(fields[4], real.cargo_home.unwrap().to_string_lossy());
         assert_eq!(fields[5], real.mbx_cache.unwrap().to_string_lossy());
         assert!(!dir.exists(), "the sandbox is deleted");
-        assert!(shown.symlink_metadata().is_err(), "the link is deleted");
-        settings.remove_empty_dirs();
+        settings.finish();
+        assert!(!root.exists(), "the run's directory is deleted at the end");
+        assert!(!record.exists(), "and so is its record");
         let summary = settings.summary().unwrap();
         assert!(summary.contains("1 test processes"), "{summary}");
         assert!(summary.contains("all deleted"), "{summary}");
@@ -528,15 +597,21 @@ mod tests {
         assert!(settings.largest.load(Ordering::Relaxed) >= 5000);
     }
 
-    /// A Unix socket's path must fit in about 108 bytes; the short link
-    /// keeps sockets in TMPDIR working when the state directory is deep.
+    /// A Unix socket's path must fit in about 100 bytes. The mbx cargo shim
+    /// binds one in TMPDIR, so a test that runs cargo needs room for it
+    /// under the system temporary directory.
     #[cfg(unix)]
     #[test]
-    fn sockets_in_tmpdir_work_when_the_state_directory_is_deep() {
+    fn a_socket_fits_in_tmpdir_under_the_system_temporary_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("d".repeat(60)).join("e".repeat(60));
-        let settings =
-            Arc::new(Settings::new(Some(root), BTreeMap::new(), &RealDirs::default()).unwrap());
+        let settings = Arc::new(
+            Settings::new(
+                Some(tmp.path().to_path_buf()),
+                BTreeMap::new(),
+                &RealDirs::default(),
+            )
+            .unwrap(),
+        );
         let mut cmd = Command::new("/bin/true");
         let sandbox = settings.prepare(&mut cmd).unwrap().unwrap();
         let tmpdir = cmd
@@ -553,7 +628,73 @@ mod tests {
             .join("tmp/mbx-session-OnIIon/cache-agent.sock")
             .exists());
         drop(sandbox);
-        settings.remove_empty_dirs();
+        settings.finish();
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let st = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    }
+
+    #[test]
+    fn a_directory_under_a_repository_is_seen_as_inside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        // The layout of #14: QS's state under the repository's .git.
+        let under_git = repo.join(".git/quicksilver/main/.quicksilver/sandbox");
+        let found = enclosing_repository(&under_git).expect("inside");
+        assert!(found.ends_with(".git"), "{found}");
+        assert!(enclosing_repository(&repo.join("src")).is_some());
+        let outside = tmp.path().join("elsewhere");
+        fs::create_dir_all(&outside).unwrap();
+        assert_eq!(enclosing_repository(&outside), None);
+    }
+
+    #[test]
+    fn sandboxes_of_finished_runs_are_deleted_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let records = tmp.path().join("records");
+        fs::create_dir_all(&records).unwrap();
+        // Process ids above Linux's limit (2^22): no process has them.
+        let dead = 999_999_000u32;
+        let stale = tmp.path().join(format!("{ROOT_PREFIX}stale"));
+        fs::create_dir_all(stale.join("0/tmp")).unwrap();
+        fs::write(
+            records.join(dead.to_string()),
+            stale.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        // A record naming a directory QS did not make is dropped, the
+        // directory kept.
+        let foreign = tmp.path().join("not-a-sandbox");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(
+            records.join((dead + 1).to_string()),
+            foreign.to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        // The layout before sandboxes left the repository: a directory.
+        fs::create_dir_all(records.join((dead + 2).to_string()).join("0/tmp")).unwrap();
+        // A running process keeps its record and sandbox.
+        let live = tmp.path().join(format!("{ROOT_PREFIX}live"));
+        fs::create_dir_all(&live).unwrap();
+        fs::write(records.join("1"), live.to_string_lossy().as_bytes()).unwrap();
+        remove_stale(&records);
+        assert!(!stale.exists());
+        assert!(foreign.exists());
+        assert!(live.exists());
+        let left: Vec<String> = fs::read_dir(&records)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, vec!["1".to_string()]);
     }
 
     #[test]
@@ -575,7 +716,7 @@ mod tests {
         assert!(cmd.status().unwrap().success());
         drop(sandbox);
         assert!(!dir.exists());
-        settings.remove_empty_dirs();
+        settings.finish();
         assert!(settings.summary().unwrap().contains("all deleted"));
     }
 

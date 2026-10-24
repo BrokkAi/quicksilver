@@ -78,6 +78,9 @@ pub struct SiteMap {
     pub hits: BTreeMap<String, Vec<u32>>,
     /// Tests that did not pass under the schema binary, with why.
     pub not_green: Vec<(String, String)>,
+    /// The end of each not-green test's output (stdout, then stderr).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub not_green_output: BTreeMap<String, String>,
     /// Ids of the tests that are proptest properties.
     #[serde(default)]
     pub property_tests: std::collections::BTreeSet<String>,
@@ -501,6 +504,7 @@ mod tests {
             tests: vec![t("p::t1")],
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
             not_green: Vec::new(),
+            not_green_output: Default::default(),
             property_tests: Default::default(),
             worker: PathBuf::new(),
             run_dir: PathBuf::new(),
@@ -564,6 +568,7 @@ mod tests {
             .into_iter()
             .collect(),
             not_green: Vec::new(),
+            not_green_output: Default::default(),
             property_tests: Default::default(),
             worker: PathBuf::new(),
             run_dir: PathBuf::new(),

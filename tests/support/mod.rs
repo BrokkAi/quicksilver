@@ -95,6 +95,7 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         test_budget: Default::default(),
         test_env: Default::default(),
         sandbox: false,
+        sandbox_dir: None,
         build_jobs: 2,
         test_jobs: 4,
         cm_jobs: 8,

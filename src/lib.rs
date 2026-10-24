@@ -221,7 +221,7 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
     }
     if !map.not_green.is_empty() {
         eprintln!(
-            "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed",
+            "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed. `map` printed why; the map's JSON (`map --json FILE`) keeps the end of each one's output under `not_green_output`",
             map.not_green.len()
         );
     }

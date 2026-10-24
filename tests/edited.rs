@@ -35,6 +35,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     cfg.sandbox = true;
     cfg.test_env
         .insert("FIXTURE_STATE".into(), "{sandbox}/state".into());
+    cfg.test_env.insert("FIXTURE_NOT_GREEN".into(), "1".into());
     let paths = cfg.paths();
     cargo_quicksilver::sandbox::configure(&cfg, &paths).expect("sandbox");
 
@@ -48,12 +49,35 @@ fn edited_mutants_are_captured_built_and_judged() {
         "{:?}",
         map.hits.keys()
     );
-    let left: Vec<_> = walk_files(&paths.session.join("sandbox"));
+    let settings = cargo_quicksilver::sandbox::current().expect("configured");
+    let root = settings
+        .root()
+        .expect("test processes used a sandbox")
+        .to_path_buf();
+    assert_eq!(
+        cargo_quicksilver::sandbox::enclosing_repository(&root),
+        None,
+        "sandboxes are outside any repository: {}",
+        root.display()
+    );
+    let left: Vec<_> = walk_files(&root);
     assert!(left.is_empty(), "{left:?}");
-    let summary = cargo_quicksilver::sandbox::current()
-        .and_then(|s| s.summary())
-        .expect("test processes ran in sandboxes");
+    let summary = settings.summary().expect("test processes ran in sandboxes");
     assert!(summary.contains("all deleted"), "{summary}");
+    // A test that is not green keeps the end of its output, stdout first.
+    let (red, why) = map
+        .not_green
+        .iter()
+        .find(|(id, _)| id.ends_with("red_only_when_asked"))
+        .unwrap_or_else(|| panic!("{:?}", map.not_green));
+    assert!(why.contains("failed with no mutant active"), "{why}");
+    let output = &map.not_green_output[red];
+    assert!(output.contains("output before the failure"), "{output}");
+    assert!(
+        output.contains("asked to fail by FIXTURE_NOT_GREEN"),
+        "{output}"
+    );
+    assert_eq!(map.not_green.len(), 1, "{:?}", map.not_green);
     let site = |fqn: &str| {
         map.sites
             .iter()
@@ -512,9 +536,10 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert_eq!(fs::read_to_string(&lib).unwrap(), original);
     assert!(!Path::new(&new_file).exists());
     // Every sandbox from build and test is gone too, and the summary
-    // removes the empty directories that held them.
+    // removes the run's directory and its record.
     let summary = cargo_quicksilver::sandbox::summary().expect("sandboxes were used");
     assert!(summary.contains("all deleted"), "{summary}");
+    assert!(!root.exists(), "{}", root.display());
     assert!(!paths
         .session
         .join("sandbox")

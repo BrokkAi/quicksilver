@@ -1113,8 +1113,10 @@ fn record_sites(
         entered.len(),
         site_ids.len()
     );
-    for (test, why) in recording.not_green.iter().take(8) {
-        warn!("  not green under the schema binary, selects nothing: {test}: {why}");
+    for line in
+        crate::exec::test::describe_not_green(&recording.not_green, &recording.not_green_output, 8)
+    {
+        warn!("  not green under the schema binary, selects nothing: {line}");
     }
     if !recording.sites_by_test.is_empty() && entered.is_empty() {
         // Legitimate when no test calls this crate's mutated functions. A

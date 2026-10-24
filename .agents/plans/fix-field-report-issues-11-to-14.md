@@ -25,13 +25,15 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 - [x] (2026-10-23) #12 proptest re-run wording and JSON.
 - [x] (2026-10-23) #13 intent warnings.
 - [ ] #11 caller check in-process.
-- [ ] #14 sandbox location and not-green output.
+- [x] (2026-10-23) #14 sandbox location and not-green output.
 
 
 ## Surprises & Discoveries
 
 
-(none yet)
+- libtest prints a failing test's panic message and captured output on stdout, not stderr, so keeping a not-green test's output means capturing stdout too (#14). Seen while debugging #1: with stdout discarded, the mbx error behind `clap_complete::examples::example_tests` was invisible.
+
+- A symbolic link does not help with #14: git finds the repository from the physical working directory, so a short link into `.git/quicksilver/...` still puts the test's temporary directory inside the repository. The real directory has to be outside.
 
 
 ## Decision Log
@@ -44,8 +46,19 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 - Decision (#13): an intent that matches no mutant of the build is reported only when its key names no function in the map (a typo or a stale name); the others are counted in one line.
   Date/Author: 2026-10-23, Claude.
 
-- Decision (#14): sandboxes move to a private, randomly named directory under the system temporary directory (QS's own `TMPDIR`), or under `[sandbox] dir` when set; QS refuses a sandbox directory that git sees as inside a repository. The short links from #1 are no longer needed.
+- Decision (#14): sandboxes move to a private, randomly named directory under the system temporary directory (QS's own `TMPDIR`), or under `[sandbox] dir` when set; QS refuses a sandbox directory that git sees as inside a repository. The short links from #1 are removed.
   Rationale: anything under `.git` is inside a repository for git and libgit2. The disk concern from #1 came from sandboxes that were never deleted; each is now deleted when its process exits, so the temporary directory holds at most one sandbox per running test. `[sandbox] dir` covers a small temporary filesystem.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision (#14): a file `<QS state>/sandbox/<pid>` records each run's sandbox directory; a later run deletes the directories of runs whose process is gone, and only directories named `qs-sandbox-*`.
+  Rationale: with sandboxes outside QS's state, `cargo quicksilver clean` no longer removes leftovers of a killed run; the name check keeps a corrupt record from deleting anything else.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision (#14): the map keeps the last 40 lines (at most 8 KiB) of each not-green test's output, stdout then stderr, in `not_green_output`; warnings show the last 15.
+  Date/Author: 2026-10-23, Claude.
+
+- Decision (#11): a child agent implemented the decided design in a detached worktree (`/mnt/optane/quicksilver/qs-callers-wt`), and its commit was cherry-picked after review. Its own plan is `.agents/plans/stream-caller-check.md`.
+  Rationale: the change was independent of #13 and #14, and its benchmark output on a large repository did not need to be in this session's context.
   Date/Author: 2026-10-23, Claude.
 
 
@@ -76,7 +89,11 @@ Plain code changes; each commit stands alone and can be reverted.
 ## Artifacts and Notes
 
 
-(to be filled)
+#11, from the child's evidence (all at `nice -n 10` on the shared host; rough times):
+- clap 13f2db5, 1,100 candidates: the old and new checks give the same 501 site ids; new about 0.7 s, old about 47 s.
+- rust-lang/rust a1e52fc, 37,241 `.rs` blobs, 1,100 candidates including `new`, `fmt`, `len`, `from`, `default`, `build`, `get`: new about 66 s with 447 functions without callers (rare names force a full scan); the old check did not finish in 300 s.
+
+#14, on clap (`run --build-jobs 3 --limit 30 -p clap_complete`, sandbox on, log `/mnt/optane/quicksilver/local/clap-sandbox-14.log`): 0 tests not green, 82 sandboxed processes, all deleted. `example_tests` builds through the mbx shim, which binds a socket in `TMPDIR`, so the new location leaves room for it.
 
 
 ## Interfaces and Dependencies

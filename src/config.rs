@@ -37,6 +37,9 @@ pub struct FileConfig {
 pub struct SandboxFile {
     /// `false` runs tests in the caller's own environment.
     pub enabled: Option<bool>,
+    /// Where sandboxes go instead of the system temporary directory: an
+    /// absolute path outside any git repository.
+    pub dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,6 +68,9 @@ pub struct Config {
     pub test_env: BTreeMap<String, String>,
     /// Whether each test process gets its own HOME and TMPDIR.
     pub sandbox: bool,
+    /// `[sandbox] dir`: where sandboxes go instead of the system temporary
+    /// directory.
+    pub sandbox_dir: Option<PathBuf>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
     pub json: Option<PathBuf>,
@@ -162,6 +168,13 @@ pub fn merge_config(
         test_budget: file.test_budget.clone(),
         test_env: file.test_env.clone(),
         sandbox: !cli.no_sandbox && file.sandbox.enabled.unwrap_or(true),
+        sandbox_dir: match &file.sandbox.dir {
+            Some(dir) if !dir.is_absolute() => anyhow::bail!(
+                "[sandbox] dir must be an absolute path, not {}",
+                dir.display()
+            ),
+            dir => dir.clone(),
+        },
         extra_tests: {
             let mut v = cli.extra_tests.clone();
             for b in &file.extra_tests {

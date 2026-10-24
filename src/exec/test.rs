@@ -1,5 +1,6 @@
 use crate::exec::process::{
-    run_exact_capture_with_env, run_exact_with_env, RunStatus, LIBTEST_FAILURE_CODE,
+    run_exact_capture_output_with_env, run_exact_capture_with_env, run_exact_with_env, RunStatus,
+    LIBTEST_FAILURE_CODE,
 };
 use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
@@ -283,6 +284,8 @@ pub struct SiteRecording {
     /// Tests that did not pass with no mutant active. They select nothing:
     /// the schema binary cannot judge a mutant with a test that is not green.
     pub not_green: Vec<(String, String)>,
+    /// Test id (or name) -> the end of its output, for not-green tests.
+    pub not_green_output: std::collections::BTreeMap<String, String>,
     pub wall_secs: f64,
 }
 
@@ -350,7 +353,7 @@ fn record_all(
     let mut results = record_pass(tests, &all, dir, jobs, progress);
     let retry: Vec<(usize, Duration)> = results
         .iter()
-        .filter(|(_, r)| matches!(r, Err(RecordFailure::TimedOut(_))))
+        .filter(|(_, r)| matches!(r, Err((RecordFailure::TimedOut(_), _))))
         .map(|(i, _)| (*i, budget(&tests[*i]) * RECORD_RETRY_FACTOR))
         .collect();
     if !retry.is_empty() {
@@ -385,11 +388,62 @@ fn record_all(
                 recording.secs_by_test.insert(key.clone(), secs);
                 recording.sites_by_test.insert(key, sites);
             }
-            Err(why) => recording.not_green.push((key, why.to_string())),
+            Err((why, output)) => {
+                if !output.trim().is_empty() {
+                    recording
+                        .not_green_output
+                        .insert(key.clone(), output_tail(&output));
+                }
+                recording.not_green.push((key, why.to_string()));
+            }
         }
     }
     recording.not_green.sort();
     recording
+}
+
+/// Lines of a not-green test's output kept in the map, and bytes at most.
+const NOT_GREEN_LINES: usize = 40;
+const NOT_GREEN_BYTES: usize = 8 * 1024;
+
+/// The end of a test's output, as kept for a test that is not green.
+fn output_tail(output: &str) -> String {
+    let lines: Vec<&str> = output.trim_end().lines().collect();
+    let mut tail = lines[lines.len().saturating_sub(NOT_GREEN_LINES)..].join("\n");
+    if tail.len() > NOT_GREEN_BYTES {
+        let mut cut = tail.len() - NOT_GREEN_BYTES;
+        while !tail.is_char_boundary(cut) {
+            cut += 1;
+        }
+        tail.drain(..cut);
+    }
+    tail
+}
+
+/// Warning lines for the first `limit` tests that are not green: each
+/// test and why, then the last lines of its output, indented.
+pub fn describe_not_green(
+    not_green: &[(String, String)],
+    output: &std::collections::BTreeMap<String, String>,
+    limit: usize,
+) -> Vec<String> {
+    const SHOWN_LINES: usize = 15;
+    let mut out = Vec::new();
+    for (test, why) in not_green.iter().take(limit) {
+        let mut text = format!("{test}: {why}");
+        if let Some(tail) = output.get(test) {
+            let lines: Vec<&str> = tail.lines().collect();
+            for line in &lines[lines.len().saturating_sub(SHOWN_LINES)..] {
+                text.push_str("\n      | ");
+                text.push_str(line);
+            }
+        }
+        out.push(text);
+    }
+    if not_green.len() > limit {
+        out.push(format!("... and {} more", not_green.len() - limit));
+    }
+    out
 }
 
 /// Run `(test index, timeout)` pairs on `jobs` threads.
@@ -436,11 +490,12 @@ impl std::fmt::Display for RecordFailure {
     }
 }
 
-/// One test's recorded sites and wall seconds, or why it selects nothing.
-type RecordResult = Result<(std::collections::BTreeSet<u32>, f64), RecordFailure>;
+/// One test's recorded sites and wall seconds, or why it selects nothing
+/// with the end of its output.
+type RecordResult = Result<(std::collections::BTreeSet<u32>, f64), (RecordFailure, String)>;
 
 fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> RecordResult {
-    let other = RecordFailure::Other;
+    let other = |why: String| (RecordFailure::Other(why), String::new());
     let path = dir.join(format!("{index:06}.txt"));
     fs::write(&path, b"").map_err(|err| other(format!("create {}: {err}", path.display())))?;
     let env = test_env(
@@ -450,17 +505,22 @@ fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> 
             path.to_string_lossy().into_owned(),
         )],
     );
-    let started = Instant::now();
-    let status = run_exact_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
-        .map_err(|err| other(format!("{err:#}")))?;
-    let secs = started.elapsed().as_secs_f64();
+    let (status, elapsed, output) =
+        run_exact_capture_output_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
+            .map_err(|err| other(format!("{err:#}")))?;
+    let secs = elapsed.as_secs_f64();
+    let failed = |why: RecordFailure| Err((why, output.clone()));
     match status {
         RunStatus::Passed => {}
-        RunStatus::Failed => return Err(other("failed with no mutant active".into())),
-        RunStatus::Error { code } => {
-            return Err(other(format!("exited {code:?} with no mutant active")))
+        RunStatus::Failed => {
+            return failed(RecordFailure::Other("failed with no mutant active".into()))
         }
-        RunStatus::Timeout => return Err(RecordFailure::TimedOut(timeout)),
+        RunStatus::Error { code } => {
+            return failed(RecordFailure::Other(format!(
+                "exited {code:?} with no mutant active"
+            )))
+        }
+        RunStatus::Timeout => return failed(RecordFailure::TimedOut(timeout)),
     }
     let text = fs::read_to_string(&path)
         .map_err(|err| other(format!("read {}: {err}", path.display())))?;

@@ -119,10 +119,49 @@ pub fn run_exact_capture_with_env(
     timeout: Duration,
     extra_env: &[(String, String)],
 ) -> Result<(RunStatus, Duration, String)> {
+    let (status, elapsed, _, stderr) =
+        run_capturing(binary, test_name, cwd, timeout, extra_env, false)?;
+    Ok((status, elapsed, stderr))
+}
+
+/// Like [`run_exact_capture_with_env`], but stdout is kept too, before
+/// stderr: libtest prints a failing test's panic and output on stdout.
+pub fn run_exact_capture_output_with_env(
+    binary: &Path,
+    test_name: &str,
+    cwd: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+) -> Result<(RunStatus, Duration, String)> {
+    let (status, elapsed, stdout, stderr) =
+        run_capturing(binary, test_name, cwd, timeout, extra_env, true)?;
+    let mut output = stdout;
+    if !output.is_empty() && !stderr.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&stderr);
+    Ok((status, elapsed, output))
+}
+
+/// Run one test with stderr, and with `stdout` also stdout, drained into
+/// capped buffers. Returns the status, wall time, stdout tail and stderr
+/// tail.
+fn run_capturing(
+    binary: &Path,
+    test_name: &str,
+    cwd: &Path,
+    timeout: Duration,
+    extra_env: &[(String, String)],
+    stdout: bool,
+) -> Result<(RunStatus, Duration, String, String)> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd);
     cmd.arg("--exact").arg(test_name);
-    cmd.stdout(Stdio::null());
+    cmd.stdout(if stdout {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     cmd.stderr(Stdio::piped());
     // Never inherit a mutant from the parent; an empty extra_env means
     // "no mutant active", which is what the null runs depend on.
@@ -142,32 +181,8 @@ pub fn run_exact_capture_with_env(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {}", binary.display()))?;
-    let reader = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf: Vec<u8> = Vec::new();
-            let mut chunk = [0u8; 8192];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&chunk[..n]);
-                        // Amortized trim: only copy once per CAP bytes read.
-                        if buf.len() > STDERR_CAP * 2 {
-                            let drop_to = buf.len() - STDERR_CAP;
-                            buf.drain(..drop_to);
-                        }
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-            if buf.len() > STDERR_CAP {
-                let drop_to = buf.len() - STDERR_CAP;
-                buf.drain(..drop_to);
-            }
-            buf
-        })
-    });
+    let reader = child.stderr.take().map(drain_tail);
+    let out_reader = child.stdout.take().map(drain_tail);
 
     let wait = match child.wait_timeout(timeout).context("wait_timeout")? {
         Some(status) => WaitResult::Exited(status),
@@ -178,19 +193,45 @@ pub fn run_exact_capture_with_env(
         }
     };
     let elapsed = start.elapsed();
-    let bytes = match reader {
-        Some(h) => h.join().unwrap_or_default(),
-        None => Vec::new(),
+    let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        let bytes = h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
     };
+    let (stderr, stdout) = (text(reader), text(out_reader));
     let status = match wait {
         WaitResult::Exited(st) => classify_exit(st),
         WaitResult::Timeout => RunStatus::Timeout,
     };
-    Ok((
-        status,
-        elapsed,
-        String::from_utf8_lossy(&bytes).into_owned(),
-    ))
+    Ok((status, elapsed, stdout, stderr))
+}
+
+/// Read `pipe` to its end on a new thread, keeping the last [`STDERR_CAP`]
+/// bytes.
+fn drain_tail(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    // Amortized trim: only copy once per CAP bytes read.
+                    if buf.len() > STDERR_CAP * 2 {
+                        let drop_to = buf.len() - STDERR_CAP;
+                        buf.drain(..drop_to);
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        if buf.len() > STDERR_CAP {
+            let drop_to = buf.len() - STDERR_CAP;
+            buf.drain(..drop_to);
+        }
+        buf
+    })
 }
 
 /// The configured sandbox and `[test-env]` for one test process. The
@@ -255,6 +296,44 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, RunStatus::Error { code: Some(1) });
+    }
+
+    #[test]
+    fn capture_output_keeps_stdout_then_stderr() {
+        let script = &format!("/tmp/qs_output_probe_{}.sh", std::process::id());
+        std::fs::write(
+            script,
+            "#!/bin/sh\necho 'panicked at src/lib.rs:3'\necho 'a warning' >&2\nexit 101\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut result = None;
+        for _ in 0..50 {
+            match run_exact_capture_output_with_env(
+                Path::new(script),
+                "ignored",
+                Path::new("/"),
+                Duration::from_secs(30),
+                &[],
+            ) {
+                Ok(r) => {
+                    result = Some(r);
+                    break;
+                }
+                Err(e) if format!("{e:#}").contains("Text file busy") => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("spawn failed for a non-ETXTBSY reason: {e:#}"),
+            }
+        }
+        let (status, _dur, output) = result.expect("script stayed ETXTBSY after 50 tries");
+        let _ = std::fs::remove_file(script);
+        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(output, "panicked at src/lib.rs:3\na warning\n");
     }
 
     #[test]

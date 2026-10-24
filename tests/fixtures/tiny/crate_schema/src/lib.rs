@@ -152,6 +152,30 @@ mod tests {
         assert!(!marker.exists(), "{} is left over", marker.display());
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, add(1, 2).to_string()).unwrap();
+        // For git, the temporary directory is in no repository.
+        let tmp = std::env::temp_dir();
+        if let Ok(out) = std::process::Command::new("git")
+            .args(["rev-parse", "--absolute-git-dir"])
+            .current_dir(&tmp)
+            .output()
+        {
+            assert!(
+                !out.status.success(),
+                "{} is inside the repository at {}",
+                tmp.display(),
+                String::from_utf8_lossy(&out.stdout).trim()
+            );
+        }
+    }
+
+    #[test]
+    fn red_only_when_asked() {
+        // Quicksilver's end-to-end test sets this through `[test-env]`, to
+        // check that a test that is not green keeps its output.
+        if std::env::var_os("FIXTURE_NOT_GREEN").is_some() {
+            println!("output before the failure");
+            panic!("asked to fail by FIXTURE_NOT_GREEN");
+        }
     }
 
     #[test]
