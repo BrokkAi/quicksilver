@@ -499,3 +499,38 @@ fn status_of(results: &[(EditedMutant, Status)], m: &EditedMutant) -> Status {
         .map(|(_, s)| s.clone())
         .unwrap_or_else(|| panic!("{} in results", m.id))
 }
+
+/// bifrost-store's test binary installs a counting `#[global_allocator]`. Its
+/// methods get prologues, and the runtime allocates while it initializes, so
+/// every test in such a binary deadlocked at startup on the runtime's own
+/// `LazyLock` and the map timed it out.
+#[test]
+fn a_crate_with_its_own_global_allocator_records_its_tests() {
+    if !cargo_quicksilver::cargo_cmd::nextest_available() {
+        eprintln!("skip: nextest not available");
+        return;
+    }
+    let repo = support::setup_fixture("allocator");
+    let cfg = support::cfg_for(repo.path());
+    let paths = cfg.paths();
+    let map = build_map(&cfg, &paths).expect("map");
+    assert!(map.not_green.is_empty(), "{:?}", map.not_green);
+    assert!(
+        map.sites
+            .iter()
+            .any(|s| s.fqn.ends_with("CountingAllocator.alloc")),
+        "the allocator's methods stay sites: {:?}",
+        map.sites.iter().map(|s| &s.fqn).collect::<Vec<_>>()
+    );
+    let repeat = map
+        .sites
+        .iter()
+        .find(|s| s.fqn.ends_with(".repeat"))
+        .expect("repeat is a site")
+        .site_id;
+    assert!(
+        map.hits.values().any(|hits| hits.contains(&repeat)),
+        "the test that calls repeat was recorded: {:?}",
+        map.hits
+    );
+}

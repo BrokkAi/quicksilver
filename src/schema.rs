@@ -82,8 +82,27 @@ pub mod __qs_rt {
             let _ = file.write_all(line.as_bytes());
         }
     }
+    // The runtime allocates and reads the environment. A site reached from
+    // that work, such as the methods of a #[global_allocator], must not
+    // re-enter it: a nested force of RECORD or ACTIVE waits on its own Once
+    // forever. A nested call reports no mutant and records nothing. The flag
+    // is a const thread-local, so reading it allocates nothing.
+    thread_local! {
+        static BUSY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    struct Busy;
+    impl Drop for Busy {
+        fn drop(&mut self) {
+            let _ = BUSY.try_with(|busy| busy.set(false));
+        }
+    }
     #[inline(always)]
     pub fn active(site: u32) -> Option<u32> {
+        // Thread-locals are gone during thread teardown: report no mutant.
+        if !BUSY.try_with(|busy| !busy.replace(true)).unwrap_or(false) {
+            return None;
+        }
+        let _busy = Busy;
         if let Some(recorder) = RECORD.as_ref() {
             record(recorder, site);
         }
