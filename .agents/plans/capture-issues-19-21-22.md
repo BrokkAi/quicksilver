@@ -11,7 +11,7 @@ Authors can attach separate notes to two patches that edit the same function, se
 - [x] (2026-10-24) Read issues #19, #21 and #22 and inspect capture flow.
 - [x] (2026-10-24) Implemented #19; formatting, clippy and both test suites pass.
 - [x] (2026-10-24) Implemented #21; formatting, clippy and both test suites pass.
-- [ ] Implement and verify #22, then commit.
+- [x] (2026-10-24) Implemented #22; formatting, clippy, both test suites and CLI probe pass.
 
 ## Context and Orientation
 
@@ -55,7 +55,7 @@ The assigned design takes precedence over issue #19's suggestion of automatic si
 
 ## Outcomes & Retrospective
 
-Issue #19 now supports explicit patch notes and duplicate note merging. Library tests: 139 passed, one ignored. Edited tests: two passed. Only the known clippy warning remains.
+All three issues are implemented. Explicit patch notes and duplicate merging preserve source intent. Token diagnostics identify repetitive capture sources. Build summaries distinguish newly captured, successfully built mutants from all untested mutants in this generation. Final library tests: 141 passed, one ignored. Edited tests: two passed. Only the known clippy warning remains. The CLI probe verifies summaries of 10 new / 10 total, then 1 new / 11 total, then 0 new / 11 total, plus the single-token warning and local-note precedence summary.
 
 ## Artifacts and Notes
 
@@ -64,3 +64,5 @@ Sandboxed process tests initially aborted in wait-timeout due to denied signalin
 Updated after #19 validation to record note behavior and the sandbox limitation.
 
 Updated after #21: source summaries include duplicates and use named thresholds of ten mutants and eighty percent. Token tests cover all requested cases, group boundaries, whitespace and multiple edits. Library tests: 141 passed, one ignored; edited tests: two passed; only the known clippy warning remains.
+
+Updated after #22 verification: no existing test or README quoted the old summary. A disposable CLI probe initially left notes and patch files untracked, which checkout capture correctly rejected; removing them before checkout capture made every probe assertion pass. No design changes were needed.

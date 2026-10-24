@@ -128,9 +128,19 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         return Ok(0);
     }
     let mut unviable = 0usize;
+    let mut new = 0usize;
+    let mut untested = 0usize;
     for (m, status) in &report.results {
         match status {
-            exec::edited::Status::Built { .. } => eprintln!("  COMPILED {} {}", m.id, m.fqns()),
+            exec::edited::Status::Built { generation, .. } => {
+                eprintln!("  COMPILED {} {}", m.id, m.fqns());
+                if *generation == report.generation {
+                    untested += 1;
+                    if report.captured.iter().any(|captured| captured.id == m.id) {
+                        new += 1;
+                    }
+                }
+            }
             exec::edited::Status::Unviable { message } => {
                 unviable += 1;
                 eprintln!("  UNVIABLE {} {}", m.id, m.fqns());
@@ -142,8 +152,9 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         }
     }
     eprintln!(
-        "build: {} mutant(s) compiled, {} unviable (generation {}, {} cargo invocation(s), {:.1}s)",
-        report.results.len() - unviable,
+        "build: {} new, {} untested in total, {} unviable (generation {}, {} cargo invocation(s), {:.1}s)",
+        new,
+        untested,
         unviable,
         report.generation,
         report.builds,
