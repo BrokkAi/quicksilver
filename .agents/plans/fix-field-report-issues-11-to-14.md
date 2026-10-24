@@ -25,13 +25,17 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 - [x] (2026-10-23) #12 proptest re-run wording and JSON.
 - [x] (2026-10-23) #13 intent warnings.
 - [x] (2026-10-24) #11 caller check in-process (child agent; cherry-picked after review).
-- [x] (2026-10-23) #14 sandbox location and not-green output.
+- [x] (2026-10-23) #14 sandbox location and not-green output (bb584d9).
+- [x] (2026-10-24) Follow-up to #14: the null-schema gate fails only when no sampled test is green (70575fa).
+- [x] (2026-10-24) #15, filed with the same batch: `test` verdicts name tests by id (16d30fc).
 
 
 ## Surprises & Discoveries
 
 
 - libtest prints a failing test's panic message and captured output on stdout, not stderr, so keeping a not-green test's output means capturing stdout too (#14). Seen while debugging #1: with stdout discarded, the mbx error behind `clap_complete::examples::example_tests` was invisible.
+
+- The end-to-end test for #14 was flaky after it was pushed: its fixture test that is red on purpose sometimes landed among the null-schema gate's eight cheapest tests, and the gate stopped `map` on any failure. Which tests are cheapest depends on measured durations. The same could stop `map` on a real workspace with a test that is red only under QS. Fixed in 70575fa: the gate fails only when no sampled test passes.
 
 - A symbolic link does not help with #14: git finds the repository from the physical working directory, so a short link into `.git/quicksilver/...` still puts the test's temporary directory inside the repository. The real directory has to be outside.
 
@@ -65,7 +69,9 @@ After this plan, `uncovered` takes seconds on a large workspace; re-run survivor
 ## Outcomes & Retrospective
 
 
-(to be written)
+All five issues of the batch (#11 to #15) are fixed on master, one commit each with "Fixes #N", plus the gate follow-up. Unit tests, `tests/edited.rs`, `tests/engine.rs` and `tests/schema.rs` pass; the end-to-end test passed three runs in a row after the gate fix.
+
+Lesson: a fixture test that is red on purpose interacts with every place that samples tests; the first passing run of the end-to-end test was not enough evidence, because the gate's sample changes between runs.
 
 
 ## Context and Orientation
