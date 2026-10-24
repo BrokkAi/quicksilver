@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 5;
+pub const MAP_VERSION: u32 = 6;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -33,6 +33,12 @@ pub struct MapSite {
     /// per build instead of as schema arms.
     #[serde(default)]
     pub opaque_return: bool,
+    /// A method of an `impl Trait for Type`, called through the trait.
+    #[serde(default)]
+    pub trait_impl: bool,
+    /// Why the function looks like test scaffolding, if it does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scaffolding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +61,10 @@ pub struct SiteMap {
     /// made. `build` compares the checkout against this.
     pub files: BTreeMap<String, String>,
     pub sites: Vec<MapSite>,
+    /// Lines of test code per file, so `uncovered` can tell a function used
+    /// only by its own file's tests from one used elsewhere.
+    #[serde(default)]
+    pub test_lines: crate::discover::TestLines,
     /// (path, fqn, why) for functions that have no site.
     pub dropped: Vec<Dropped>,
     /// package -> crate root source file, repository-relative.
@@ -142,6 +152,91 @@ impl SiteMap {
         });
         out
     }
+}
+
+/// The sites among `sites` whose name appears nowhere in the repository's
+/// Rust sources at the map's commit except in their own definition and in
+/// their own file's test code: candidates for deletion rather than tests.
+/// One `git grep -w -F` finds every occurrence. Methods of trait impls
+/// (called through the trait) and `main` are never candidates. A name
+/// shared with another function counts as used, so the hint errs toward
+/// "has callers".
+pub fn without_callers(
+    map: &SiteMap,
+    repo_dir: &Path,
+    sites: &[&MapSite],
+) -> Result<std::collections::HashSet<u32>> {
+    use std::collections::{HashMap, HashSet};
+    let name_of = |s: &MapSite| s.fqn.rsplit('.').next().unwrap_or("").to_string();
+    let candidates: Vec<&MapSite> = sites
+        .iter()
+        .copied()
+        .filter(|s| !s.trait_impl && name_of(s) != "main")
+        .collect();
+    let names: HashSet<String> = candidates.iter().map(|s| name_of(s)).collect();
+    if names.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let patterns =
+        std::env::temp_dir().join(format!("qs-names-{}-{}", std::process::id(), random_id()));
+    std::fs::write(
+        &patterns,
+        names.iter().cloned().collect::<Vec<_>>().join("\n") + "\n",
+    )?;
+    let out = std::process::Command::new("git")
+        .args(["grep", "-n", "-w", "-F", "-I", "--no-color", "-f"])
+        .arg(&patterns)
+        .arg(&map.commit)
+        .args(["--", "*.rs"])
+        .current_dir(repo_dir)
+        .output();
+    let _ = std::fs::remove_file(&patterns);
+    let out = out.context("git grep")?;
+    // 1 means no match at all.
+    if !out.status.success() && out.status.code() != Some(1) {
+        anyhow::bail!("git grep: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    let mut seen: HashMap<&str, Vec<(String, usize)>> = HashMap::new();
+    let prefix = format!("{}:", map.commit);
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Some(rest) = line.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut parts = rest.splitn(3, ':');
+        let (Some(path), Some(lineno), Some(text)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        let Ok(lineno) = lineno.parse::<usize>() else {
+            continue;
+        };
+        let path = path.strip_prefix(map.prefix.as_str()).unwrap_or(path);
+        for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if let Some(name) = names.get(word) {
+                seen.entry(name.as_str())
+                    .or_default()
+                    .push((path.to_string(), lineno));
+            }
+        }
+    }
+    let in_tests = |path: &str, line: usize| {
+        map.test_lines
+            .get(path)
+            .is_some_and(|ranges| ranges.iter().any(|(a, b)| *a <= line && line <= *b))
+    };
+    Ok(candidates
+        .into_iter()
+        .filter(|s| {
+            let name = name_of(s);
+            seen.get(name.as_str()).is_none_or(|uses| {
+                uses.iter().all(|(path, line)| {
+                    *path == s.path
+                        && ((s.start_line <= *line && *line <= s.end_line) || in_tests(path, *line))
+                })
+            })
+        })
+        .map(|s| s.site_id)
+        .collect())
 }
 
 /// Plans built-in mutants against a map: a mutant's tests are the ones that
@@ -245,6 +340,8 @@ pub fn sites_from_functions(fns: &[FnDecl]) -> Result<(Vec<MapSite>, Vec<Dropped
             start_line: f.start_line,
             end_line: f.end_line,
             opaque_return: f.opaque_return,
+            trait_impl: f.trait_impl,
+            scaffolding: f.scaffolding.clone(),
         })
         .collect();
     Ok((sites, dropped))
@@ -321,6 +418,8 @@ mod tests {
             boring_body: false,
             opaque_return: false,
             cfg_off: None,
+            trait_impl: false,
+            scaffolding: None,
             original_body: "{}".into(),
         }
     }
@@ -370,6 +469,8 @@ mod tests {
             start_line: 1,
             end_line: 1,
             opaque_return: false,
+            trait_impl: false,
+            scaffolding: None,
         };
         let t = |id: &str| TestInfo {
             id: id.into(),
@@ -389,6 +490,7 @@ mod tests {
             repo_root: PathBuf::new(),
             target: String::new(),
             files: BTreeMap::new(),
+            test_lines: Default::default(),
             sites: vec![site(7, "p.entered", 10), site(8, "p.untouched", 40)],
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
@@ -444,6 +546,7 @@ mod tests {
             repo_root: PathBuf::new(),
             target: String::new(),
             files: BTreeMap::new(),
+            test_lines: Default::default(),
             sites: Vec::new(),
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),

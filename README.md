@@ -151,6 +151,12 @@ These are test gaps that need no mutants to find. Mutants there would only
 come back not covered, so write tests first. `--package` and `--file` narrow
 the list.
 
+A function marked `[no callers]` is named nowhere in the workspace except
+its own definition and its own file's tests: check whether it is dead code
+before writing tests for it. Test scaffolding (functions in modules such as
+`test_support`, named `*_for_test`, or under a `cfg` that mentions `test`)
+is left out; `--scaffolding` lists it.
+
 
 ## What the results mean
 

@@ -81,6 +81,30 @@ fn edited_mutants_are_captured_built_and_judged() {
         map.dropped
     );
     assert!(!map.unentered().iter().any(|s| s.fqn.ends_with(elsewhere)));
+    // Uncovered functions are marked: no callers at all, or scaffolding.
+    let unentered: Vec<&cargo_quicksilver::sitemap::MapSite> = map.unentered();
+    let no_callers =
+        cargo_quicksilver::sitemap::without_callers(&map, repo.path(), &unentered).unwrap();
+    let marked = |name: &str| {
+        let s = site(name);
+        assert!(
+            unentered.iter().any(|u| u.site_id == s.site_id),
+            "{name} is uncovered"
+        );
+        no_callers.contains(&s.site_id)
+    };
+    assert!(marked(".calls_no_one_tests"));
+    assert!(
+        !marked(".called_in_production"),
+        "called by calls_no_one_tests"
+    );
+    assert!(marked("tiny_a.uncovered"));
+    assert_eq!(
+        site(".sample_for_test").scaffolding.as_deref(),
+        Some("named `*_for_test`")
+    );
+    assert_eq!(site(".called_in_production").scaffolding, None);
+
     // A method of an `impl` nested in a function body is a site of its own.
     let nested = site("parse_pair.Pair.parse");
     let outer = site(".parse_pair");

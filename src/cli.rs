@@ -109,7 +109,7 @@ pub enum Command {
     Test(TestArgs),
     /// List the functions no test enters, from the map of HEAD. `--package`
     /// and `--file` narrow the list.
-    Uncovered,
+    Uncovered(UncoveredArgs),
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
@@ -223,6 +223,14 @@ pub struct BuildArgs {
     /// Isolation rebuilds that map rustc diagnostics back to variants.
     #[arg(long, default_value_t = 5)]
     pub schema_max_rounds: u32,
+}
+
+#[derive(Args, Debug, Default)]
+pub struct UncoveredArgs {
+    /// Also list test scaffolding: functions in test-helper modules, named
+    /// `*_for_test`, or under a `cfg` that mentions `test`.
+    #[arg(long)]
+    pub scaffolding: bool,
 }
 
 #[derive(Args, Debug, Default)]

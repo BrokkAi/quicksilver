@@ -51,7 +51,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
         cli::Command::Test(args) => cmd_test(&cli.common, args),
-        cli::Command::Uncovered => cmd_uncovered(&cli.common),
+        cli::Command::Uncovered(args) => cmd_uncovered(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
     }
 }
@@ -149,7 +149,7 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     Ok(if unviable > 0 { 1 } else { 0 })
 }
 
-fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
+fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let head = worktree::head(&cfg.repo_root)?;
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
@@ -164,9 +164,34 @@ fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
         .into_iter()
         .filter(|s| in_scope(s))
         .collect();
+    let hidden = unentered
+        .iter()
+        .filter(|s| s.scaffolding.is_some() && !args.scaffolding)
+        .count();
+    let shown: Vec<&sitemap::MapSite> = unentered
+        .iter()
+        .copied()
+        .filter(|s| args.scaffolding || s.scaffolding.is_none())
+        .collect();
+    let no_callers = sitemap::without_callers(&map, &cfg.repo_root, &shown).unwrap_or_else(|err| {
+        tracing::warn!("cannot look for callers: {err:#}");
+        Default::default()
+    });
     // The list is the command's output, on stdout; the summary is on stderr.
-    for s in &unentered {
-        println!("{}:{} {}", s.path, s.start_line, s.fqn);
+    for s in &shown {
+        let mut marks = Vec::new();
+        if no_callers.contains(&s.site_id) {
+            marks.push("no callers".to_string());
+        }
+        if let Some(why) = &s.scaffolding {
+            marks.push(format!("scaffolding: {why}"));
+        }
+        let marks = if marks.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", marks.join("; "))
+        };
+        println!("{}:{} {}{marks}", s.path, s.start_line, s.fqn);
     }
     eprintln!(
         "{} of {} functions are entered by no test (map at {}, target {})",
@@ -179,6 +204,15 @@ fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
             map.target.as_str()
         }
     );
+    if !no_callers.is_empty() {
+        eprintln!(
+            "{} of them are named nowhere in the workspace except their own definition and their file's tests: check whether they are dead (public API can have callers elsewhere) before writing tests for them",
+            no_callers.len()
+        );
+    }
+    if hidden > 0 {
+        eprintln!("{hidden} test-scaffolding function(s) not listed; --scaffolding lists them");
+    }
     if !map.not_green.is_empty() {
         eprintln!(
             "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed",
@@ -186,11 +220,13 @@ fn cmd_uncovered(common: &cli::CommonOpts) -> Result<i32> {
         );
     }
     if let Some(path) = &cfg.json {
-        let rows: Vec<serde_json::Value> = unentered
+        let rows: Vec<serde_json::Value> = shown
             .iter()
             .map(|s| {
                 serde_json::json!({
                     "package": s.package, "path": s.path, "line": s.start_line, "fqn": s.fqn,
+                    "no_callers": no_callers.contains(&s.site_id),
+                    "scaffolding": s.scaffolding,
                 })
             })
             .collect();

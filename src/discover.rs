@@ -87,7 +87,7 @@ pub fn discover(root: &Path, filter: &DiscoverFilter) -> Result<Vec<Mutant>> {
         Some(spec) => Some(diff_lines(root, spec)?),
         None => None,
     };
-    expand(scan_functions(root, filter, diff.as_ref())?)
+    expand(scan_functions(root, filter, diff.as_ref(), None)?)
 }
 
 /// `--in-diff` discovery: `discover` with the filter's diff, which selects
@@ -128,13 +128,68 @@ pub struct FnDecl {
     /// The `cfg` that is false on this target (the function is not
     /// compiled here, so no test can reach it).
     pub cfg_off: Option<String>,
+    /// A method of an `impl Trait for Type`, called through the trait.
+    pub trait_impl: bool,
+    /// Why this looks like test scaffolding rather than production code.
+    pub scaffolding: Option<String>,
     pub original_body: String,
 }
 
 /// Every function with a body in the workspace, outside test code and
 /// test-like paths, in mutable (non proc-macro) packages.
 pub fn scan_workspace(root: &Path, filter: &DiscoverFilter) -> Result<Vec<FnDecl>> {
-    scan_functions(root, filter, None)
+    scan_functions(root, filter, None, None)
+}
+
+/// Test-code line ranges per workspace-relative file.
+pub type TestLines = BTreeMap<String, Vec<(usize, usize)>>;
+
+/// [`scan_workspace`], also returning where each file's test code is.
+pub fn scan_workspace_with_tests(
+    root: &Path,
+    filter: &DiscoverFilter,
+) -> Result<(Vec<FnDecl>, TestLines)> {
+    let mut lines = TestLines::new();
+    let fns = scan_functions(root, filter, None, Some(&mut lines))?;
+    Ok((fns, lines))
+}
+
+/// Module names that hold test helpers rather than production code.
+const SCAFFOLD_MODULES: &[&str] = &[
+    "test_support",
+    "test_utils",
+    "test_util",
+    "testutils",
+    "testutil",
+    "test_helpers",
+    "testing",
+    "fixtures",
+    "mock",
+    "mocks",
+];
+
+/// Why a function looks like test scaffolding: a helper module in its
+/// path or name, a `*_for_test` name, or a `cfg` that mentions `test`
+/// without requiring it.
+pub fn scaffolding(rel: &str, fqn: &str, cfg_maybe_test: Option<&str>) -> Option<String> {
+    let path_parts = rel
+        .trim_end_matches(".rs")
+        .split('/')
+        .map(|p| p.replace('-', "_"));
+    let mut fqn_parts: Vec<String> = fqn.split('.').map(str::to_string).collect();
+    let name = fqn_parts.pop().unwrap_or_default();
+    if let Some(m) = path_parts
+        .chain(fqn_parts)
+        .find(|p| SCAFFOLD_MODULES.contains(&p.as_str()))
+    {
+        return Some(format!("in module `{m}`"));
+    }
+    for suffix in ["_for_test", "_for_tests", "_for_testing"] {
+        if name.ends_with(suffix) {
+            return Some(format!("named `*{suffix}`"));
+        }
+    }
+    cfg_maybe_test.map(|c| format!("under `{c}`"))
 }
 
 /// The built-in generator: one mutant per replacement of the return kind.
@@ -200,6 +255,7 @@ fn scan_functions(
     root: &Path,
     filter: &DiscoverFilter,
     diff: Option<&DiffSelection>,
+    mut test_lines: Option<&mut TestLines>,
 ) -> Result<Vec<FnDecl>> {
     let meta = load_metadata(root)?;
     let globset = file_globset(&filter.files)?;
@@ -236,6 +292,14 @@ fn scan_functions(
             let rel = rel_slash(rel);
             if is_test_like_path(&rel) || !scope.contains(&file.path) {
                 continue;
+            }
+            if let Some(lines) = test_lines.as_deref_mut() {
+                if !file.test_lines.is_empty() {
+                    lines
+                        .entry(rel.clone())
+                        .or_default()
+                        .extend(file.test_lines.iter().copied());
+                }
             }
             if let Some(diff) = diff {
                 if !diff.touches_file(&rel) {
@@ -276,6 +340,8 @@ fn scan_functions(
                     boring_body: boring_body(&f.block),
                     opaque_return: returns_opaque(&f.sig.output),
                     cfg_off: f.cfg_off.clone(),
+                    trait_impl: f.trait_impl,
+                    scaffolding: scaffolding(&rel, &f.fqn, f.cfg_maybe_test.as_deref()),
                     original_body: file.source[f.body_start_byte..f.body_end_byte].to_string(),
                 });
             }
@@ -687,6 +753,29 @@ pub fn restore_file(root: &Path, mutant: &Mutant, original: &[u8]) -> Result<()>
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scaffolding_is_named_by_module_name_or_cfg() {
+        assert_eq!(
+            scaffolding("src/test_support/git.rs", "k.test_support.git.init", None).as_deref(),
+            Some("in module `test_support`")
+        );
+        assert_eq!(
+            scaffolding("../test-support/git.rs", "k.git.init", None).as_deref(),
+            Some("in module `test_support`")
+        );
+        assert_eq!(
+            scaffolding("src/lib.rs", "k.Store.open_for_test", None).as_deref(),
+            Some("named `*_for_test`")
+        );
+        assert_eq!(
+            scaffolding("src/lib.rs", "k.f", Some("cfg(any(test, feature = \"t\"))")).as_deref(),
+            Some("under `cfg(any(test, feature = \"t\"))`")
+        );
+        assert_eq!(scaffolding("src/testing_utils.rs", "k.f", None), None);
+        assert_eq!(scaffolding("src/lib.rs", "k.attest", None), None);
+    }
+
     #[test]
     fn unified_zero_diff_gives_new_side_hunks_per_file() {
         let diff = "diff --git a/src/a.rs b/src/a.rs\n\

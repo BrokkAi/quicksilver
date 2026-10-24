@@ -31,6 +31,13 @@ pub struct ScannedFn {
     /// The `cfg` (on the function or an enclosing item) that is false on
     /// the target, such as `cfg(windows)` on Linux.
     pub cfg_off: Option<String>,
+    /// A method of an `impl Trait for Type` block: called through the
+    /// trait, so its name need not appear at any call site.
+    pub trait_impl: bool,
+    /// A `cfg` (on the function or an enclosing item) that mentions `test`
+    /// without requiring it, such as `cfg(any(test, feature = "testing"))`:
+    /// test scaffolding compiled into some non-test builds.
+    pub cfg_maybe_test: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +45,9 @@ pub struct ScannedFile {
     pub path: PathBuf,
     pub source: String,
     pub functions: Vec<ScannedFn>,
+    /// First and last lines of test code in this file: `#[cfg(test)]`
+    /// modules and impls, test functions, or the whole file.
+    pub test_lines: Vec<(usize, usize)>,
 }
 
 /// Every function with a body reachable from `root_file`, with no target
@@ -75,6 +85,7 @@ struct Walker<'t> {
 struct Ctx {
     in_test: bool,
     cfg_off: Option<String>,
+    maybe_test: Option<String>,
 }
 
 impl Ctx {
@@ -83,6 +94,10 @@ impl Ctx {
         Ctx {
             in_test: self.in_test || is_cfg_test(attrs),
             cfg_off: self.cfg_off.clone().or_else(|| target.compiled_out(attrs)),
+            maybe_test: self
+                .maybe_test
+                .clone()
+                .or_else(|| cfg_mentioning_test(attrs)),
         }
     }
 
@@ -153,29 +168,25 @@ impl Walker<'_> {
             inline_depth: 0,
         };
         let index = LineIndex::new(&source);
-        let mut functions = Vec::new();
-        let mut pending: Vec<Pending> = Vec::new();
+        let mut sink = Sink::default();
         // Inner attributes (`#![cfg(windows)]`) apply to the whole file.
         let ctx = ctx.inside(&file.attrs, self.target);
+        if ctx.in_test {
+            sink.test_lines.push((1, usize::MAX));
+        }
         let env = Env {
             dirs: &dirs,
             index: &index,
             target: self.target,
         };
-        walk_items(
-            &file.items,
-            module_path,
-            &ctx,
-            &env,
-            &mut functions,
-            &mut pending,
-        );
+        walk_items(&file.items, module_path, &ctx, &env, &mut sink);
         self.files.push(ScannedFile {
             path: path.to_path_buf(),
             source,
-            functions,
+            functions: sink.functions,
+            test_lines: sink.test_lines,
         });
-        for (child, module_path, ctx) in pending {
+        for (child, module_path, ctx) in sink.pending {
             self.scan_file(&child, &module_path, &ctx, false)?;
         }
         Ok(())
@@ -200,6 +211,24 @@ fn nested_items(block: &syn::Block) -> Vec<syn::Item> {
 /// A module file still to scan: its path, module path and context.
 type Pending = (PathBuf, Vec<String>, Ctx);
 
+/// What the walk of one file produces.
+#[derive(Default)]
+struct Sink {
+    functions: Vec<ScannedFn>,
+    pending: Vec<Pending>,
+    test_lines: Vec<(usize, usize)>,
+}
+
+impl Sink {
+    /// Record `item` as test code when it is where test code starts.
+    fn note_test(&mut self, outer: &Ctx, inner: &Ctx, item: &impl syn::spanned::Spanned) {
+        if inner.in_test && !outer.in_test {
+            let span = item.span();
+            self.test_lines.push((span.start().line, span.end().line));
+        }
+    }
+}
+
 /// One function to scan: its name, attributes, visibility, signature and
 /// body.
 struct FnParts<'a> {
@@ -208,20 +237,15 @@ struct FnParts<'a> {
     vis: Option<&'a syn::Visibility>,
     sig: &'a syn::Signature,
     block: &'a syn::Block,
+    trait_impl: bool,
 }
 
 /// Scan one function and the items nested in its body, which are named
 /// under it (`outer.Inner.method`, `outer.helper`) and are sites of their
 /// own: a serde `Visitor` impl inside `deserialize` holds the real logic.
-fn push_fn(
-    f: FnParts<'_>,
-    ctx: &Ctx,
-    env: &Env<'_>,
-    out: &mut Vec<ScannedFn>,
-    pending: &mut Vec<Pending>,
-) {
-    let ctx = ctx.function(f.attrs, env.target);
-    out.push(scanned(
+fn push_fn(f: FnParts<'_>, outer: &Ctx, env: &Env<'_>, sink: &mut Sink) {
+    let ctx = outer.function(f.attrs, env.target);
+    let mut scanned = scanned(
         f.fqn.clone(),
         f.attrs,
         f.vis,
@@ -229,10 +253,15 @@ fn push_fn(
         f.block,
         &ctx,
         env.index,
-    ));
+    );
+    scanned.trait_impl = f.trait_impl;
+    if ctx.in_test && !outer.in_test {
+        sink.test_lines.push((scanned.start_line, scanned.end_line));
+    }
+    sink.functions.push(scanned);
     let nested = nested_items(f.block);
     if !nested.is_empty() {
-        walk_items(&nested, &[f.fqn], &ctx, env, out, pending);
+        walk_items(&nested, &[f.fqn], &ctx, env, sink);
     }
 }
 
@@ -241,8 +270,7 @@ fn walk_items(
     module_path: &[String],
     ctx: &Ctx,
     env: &Env<'_>,
-    out: &mut Vec<ScannedFn>,
-    pending: &mut Vec<Pending>,
+    sink: &mut Sink,
 ) {
     for item in items {
         match item {
@@ -253,14 +281,16 @@ fn walk_items(
                     vis: Some(&f.vis),
                     sig: &f.sig,
                     block: &f.block,
+                    trait_impl: false,
                 },
                 ctx,
                 env,
-                out,
-                pending,
+                sink,
             ),
             syn::Item::Impl(i) => {
+                let outer = ctx;
                 let ctx = ctx.inside(&i.attrs, env.target);
+                sink.note_test(outer, &ctx, i);
                 let owner = join(module_path, &self_type_name(&i.self_ty));
                 for member in &i.items {
                     if let syn::ImplItem::Fn(m) = member {
@@ -271,17 +301,19 @@ fn walk_items(
                                 vis: Some(&m.vis),
                                 sig: &m.sig,
                                 block: &m.block,
+                                trait_impl: i.trait_.is_some(),
                             },
                             &ctx,
                             env,
-                            out,
-                            pending,
+                            sink,
                         );
                     }
                 }
             }
             syn::Item::Trait(t) => {
+                let outer = ctx;
                 let ctx = ctx.inside(&t.attrs, env.target);
+                sink.note_test(outer, &ctx, t);
                 let owner = join(module_path, &t.ident.to_string());
                 for member in &t.items {
                     if let syn::TraitItem::Fn(m) = member {
@@ -293,17 +325,19 @@ fn walk_items(
                                 vis: None,
                                 sig: &m.sig,
                                 block,
+                                trait_impl: false,
                             },
                             &ctx,
                             env,
-                            out,
-                            pending,
+                            sink,
                         );
                     }
                 }
             }
             syn::Item::Mod(m) => {
+                let outer = ctx;
                 let ctx = ctx.inside(&m.attrs, env.target);
+                sink.note_test(outer, &ctx, m);
                 let dirs = env.dirs;
                 let name = m.ident.to_string();
                 let child_path: Vec<String> = module_path
@@ -323,11 +357,11 @@ fn walk_items(
                             index: env.index,
                             target: env.target,
                         };
-                        walk_items(items, &child_path, &ctx, &inner_env, out, pending);
+                        walk_items(items, &child_path, &ctx, &inner_env, sink);
                     }
                     None => {
                         if let Some(file) = resolve_mod_file(&name, &m.attrs, dirs) {
-                            pending.push((file, child_path, ctx.clone()));
+                            sink.pending.push((file, child_path, ctx.clone()));
                         } else {
                             tracing::debug!(
                                 "mod {}: no file found under {}",
@@ -417,6 +451,26 @@ fn cfg_implies_test(meta: &syn::Meta) -> bool {
     }
 }
 
+/// The first `cfg` among `attrs` that mentions `test` without implying
+/// it, as written.
+fn cfg_mentioning_test(attrs: &[syn::Attribute]) -> Option<String> {
+    fn mentions(tokens: proc_macro2::TokenStream) -> bool {
+        tokens.into_iter().any(|t| match t {
+            proc_macro2::TokenTree::Ident(i) => i == "test",
+            proc_macro2::TokenTree::Group(g) => mentions(g.stream()),
+            _ => false,
+        })
+    }
+    attrs.iter().find_map(|a| {
+        if !a.path().is_ident("cfg") {
+            return None;
+        }
+        let meta = a.parse_args::<syn::Meta>().ok()?;
+        (!cfg_implies_test(&meta) && mentions(meta.to_token_stream()))
+            .then(|| crate::target::cfg_text(&meta))
+    })
+}
+
 /// `#[test]`, `#[tokio::test]`, `#[bench]` and the like.
 pub fn is_test_fn(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|a| {
@@ -492,6 +546,8 @@ fn scanned(
         block: block.clone(),
         in_test: ctx.in_test,
         cfg_off: ctx.cfg_off.clone(),
+        trait_impl: false,
+        cfg_maybe_test: ctx.maybe_test.clone(),
     }
 }
 
@@ -764,6 +820,41 @@ mod tests {
                 ("k.platform.in_platform_file".into(), gone),
             ]
         );
+    }
+
+    #[test]
+    fn trait_methods_test_lines_and_test_ish_cfgs_are_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let src = "pub struct S;\n\
+                   impl std::fmt::Display for S {\n\
+                       fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { Ok(()) }\n\
+                   }\n\
+                   impl S { pub fn own(&self) {} }\n\
+                   #[cfg(any(test, feature = \"testing\"))]\n\
+                   pub fn helper() {}\n\
+                   #[cfg(test)]\n\
+                   mod tests {\n\
+                       fn t() {}\n\
+                   }\n";
+        write(root, "src/lib.rs", src);
+        let files = scan_crate("k", &root.join("src/lib.rs")).unwrap();
+        let f = |name: &str| {
+            files[0]
+                .functions
+                .iter()
+                .find(|g| g.fqn.ends_with(name))
+                .unwrap()
+                .clone()
+        };
+        assert!(f(".fmt").trait_impl);
+        assert!(!f(".own").trait_impl);
+        assert_eq!(
+            f(".helper").cfg_maybe_test.as_deref(),
+            Some("cfg(any(test, feature = \"testing\"))")
+        );
+        assert_eq!(f(".own").cfg_maybe_test, None);
+        assert_eq!(files[0].test_lines, vec![(8, 11)]);
     }
 
     #[test]

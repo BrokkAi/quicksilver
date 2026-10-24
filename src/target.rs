@@ -162,12 +162,22 @@ impl Target {
                 return None;
             }
             let meta = a.parse_args::<syn::Meta>().ok()?;
-            (self.eval(&meta) == Some(false)).then(|| {
-                use quote::ToTokens;
-                format!("cfg({})", meta.to_token_stream())
-            })
+            (self.eval(&meta) == Some(false)).then(|| cfg_text(&meta))
         })
     }
+}
+
+/// `cfg(...)` as a person writes it: the token printer puts spaces before
+/// `(` and `,`.
+pub fn cfg_text(meta: &syn::Meta) -> String {
+    use quote::ToTokens;
+    let raw = meta.to_token_stream().to_string();
+    let tidy = raw
+        .replace(" (", "(")
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(" ,", ",");
+    format!("cfg({tidy})")
 }
 
 /// `rustc -vV`'s host triple for the toolchain that builds `dir`.

@@ -533,8 +533,10 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
     let listed = tests;
     let files = tracked_file_hashes(&cfg.repo_root)?;
 
-    let fns =
-        crate::discover::scan_workspace(&paths.baseline, &crate::engine::discover_filter(cfg))?;
+    let (fns, test_lines) = crate::discover::scan_workspace_with_tests(
+        &paths.baseline,
+        &crate::engine::discover_filter(cfg),
+    )?;
     let (map_sites, mut dropped) = sites_from_functions(&fns)?;
     info!(
         "map: {} sites, {} functions without a site",
@@ -652,6 +654,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         repo_root: cfg.repo_root.clone(),
         target: crate::target::host_triple(&worker).unwrap_or_default(),
         files,
+        test_lines,
         sites: map_sites,
         dropped,
         crate_roots,

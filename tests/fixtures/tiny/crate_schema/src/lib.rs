@@ -42,6 +42,18 @@ pub fn not_windows() -> u32 {
     2
 }
 
+pub fn calls_no_one_tests() -> u32 {
+    called_in_production()
+}
+
+fn called_in_production() -> u32 {
+    5
+}
+
+pub fn sample_for_test() -> u32 {
+    3
+}
+
 pub fn parse_pair(s: &str) -> (i32, i32) {
     struct Pair(i32, i32);
     impl Pair {
