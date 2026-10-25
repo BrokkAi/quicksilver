@@ -313,6 +313,18 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(rows.iter().all(|r| r["package"] == "tiny_a"
         && r["path"] == "crate_a/src/lib.rs"
         && r["mutants"] == 0));
+    let printed = String::from_utf8_lossy(&pending_output.stdout);
+    for row in &rows {
+        let start = row["line"].as_u64().unwrap();
+        let end = row["end_line"].as_u64().unwrap();
+        assert_eq!(end - start + 1, row["lines"].as_u64().unwrap());
+        assert!(printed.contains(&format!(
+            "{}:{start}-{end} {} ({} lines)",
+            row["path"].as_str().unwrap(),
+            row["fqn"].as_str().unwrap(),
+            row["lines"]
+        )));
+    }
     let lanes: Vec<_> = (1..=2)
         .map(|i| fs::read_to_string(split_dir.join(format!("pending-{i}.txt"))).unwrap())
         .collect();

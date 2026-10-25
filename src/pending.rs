@@ -13,6 +13,7 @@ pub struct Row {
     pub package: String,
     pub path: String,
     pub line: usize,
+    pub end_line: usize,
     pub fqn: String,
     pub lines: usize,
     pub mutants: usize,
@@ -21,8 +22,8 @@ pub struct Row {
 impl Row {
     fn text(&self, all: bool) -> String {
         let mut text = format!(
-            "{}:{} {} ({} lines)",
-            self.path, self.line, self.fqn, self.lines
+            "{}:{}-{} {} ({} lines)",
+            self.path, self.line, self.end_line, self.fqn, self.lines
         );
         if all {
             text.push_str(&format!(" [{} mutants]", self.mutants));
@@ -60,6 +61,7 @@ pub fn inventory(map: &SiteMap, state: &State, min_lines: usize) -> Vec<Row> {
                 package: s.package.clone(),
                 path: s.path.clone(),
                 line: s.start_line,
+                end_line: s.end_line,
                 fqn: s.fqn.clone(),
                 lines,
                 mutants: counts
@@ -178,10 +180,20 @@ mod tests {
             package: "p".into(),
             path: "src/lib.rs".into(),
             line: 1,
+            end_line: lines,
             fqn: format!("f{lines}"),
             lines,
             mutants: 0,
         }
+    }
+
+    #[test]
+    fn text_and_json_include_end_line() {
+        let mut row = row(7);
+        row.mutants = 2;
+        assert_eq!(row.text(false), "src/lib.rs:1-7 f7 (7 lines)");
+        assert_eq!(row.text(true), "src/lib.rs:1-7 f7 (7 lines) [2 mutants]");
+        assert_eq!(serde_json::to_value(row).unwrap()["end_line"], 7);
     }
 
     #[test]

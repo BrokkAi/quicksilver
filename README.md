@@ -220,10 +220,11 @@ cargo quicksilver pending --min-lines 5 --package my_crate
 cargo quicksilver pending --split 4 --out mutant-lanes
 ```
 
-Each line gives `path:line name (N lines)`. `--all` includes functions that
+Each line gives `path:start-end name (N lines)`. `--all` includes functions that
 already have mutants and shows their counts. Unviable mutants do not count;
 test scaffolding and functions no green test entered are left out.
-`--file` narrows the list and `--json FILE` saves the rows.
+`--file` narrows the list and `--json FILE` saves the rows, including `line`
+and `end_line` for each function.
 
 `--split N --out DIR` also writes `pending-1.txt` through `pending-N.txt`,
 assigning the largest functions first to the list with the fewest lines so
