@@ -190,9 +190,6 @@ fn scan_callers(
     sites: &[&MapSite],
 ) -> Result<(std::collections::HashSet<u32>, usize)> {
     use std::collections::{HashMap, HashSet};
-    use std::io::{BufRead, BufReader, Read, Write};
-    use std::process::{Command, Stdio};
-
     let mut pending: HashMap<&str, Vec<&MapSite>> = HashMap::new();
     let mut uncalled = HashSet::new();
     for &site in sites {
@@ -205,6 +202,57 @@ fn scan_callers(
     if pending.is_empty() {
         return Ok((uncalled, 0));
     }
+
+    let scanned = scan_rust_blobs(
+        map,
+        repo_dir,
+        |_| true,
+        |path, bytes| {
+            let path = path.strip_prefix(&map.prefix).unwrap_or(path);
+            let tests = map.test_lines.get(path);
+            let text = String::from_utf8_lossy(bytes);
+            for (index, line) in text.lines().enumerate() {
+                let lineno = index + 1;
+                let in_tests = tests
+                    .is_some_and(|ranges| ranges.iter().any(|(a, b)| *a <= lineno && lineno <= *b));
+                for word in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    let Some(candidates) = pending.get_mut(word) else {
+                        continue;
+                    };
+                    candidates.retain(|site| {
+                        let allowed = path == site.path
+                            && (in_tests || (site.start_line <= lineno && lineno <= site.end_line));
+                        if !allowed {
+                            uncalled.remove(&site.site_id);
+                        }
+                        allowed
+                    });
+                    if candidates.is_empty() {
+                        pending.remove(word);
+                        if pending.is_empty() {
+                            break;
+                        }
+                    }
+                }
+                if pending.is_empty() {
+                    break;
+                }
+            }
+            !pending.is_empty()
+        },
+    )?;
+    Ok((uncalled, scanned))
+}
+
+/// Stream regular committed Rust blobs, with bounded pipes and early cleanup.
+fn scan_rust_blobs(
+    map: &SiteMap,
+    repo_dir: &Path,
+    mut include: impl FnMut(&str) -> bool,
+    mut visit: impl FnMut(&str, &[u8]) -> bool,
+) -> Result<usize> {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
 
     let tree = Command::new("git")
         .args(["ls-tree", "-r", "-z", "--full-tree", &map.commit])
@@ -233,7 +281,10 @@ fn scan_callers(
         let kind = fields.next();
         let oid = fields.next().context("git ls-tree object id")?;
         if matches!(mode, Some("100644" | "100755")) && kind == Some("blob") {
-            blobs.push((oid.to_owned(), String::from_utf8_lossy(path).into_owned()));
+            let path = String::from_utf8_lossy(path).into_owned();
+            if include(&path) {
+                blobs.push((oid.to_owned(), path));
+            }
         }
     }
 
@@ -242,6 +293,7 @@ fn scan_callers(
         .current_dir(repo_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .context("git cat-file --batch")?;
     let mut input = child.stdin.take().expect("piped stdin");
@@ -256,13 +308,11 @@ fn scan_callers(
         Ok(())
     });
     let mut scanned = 0;
+    let mut stopped = false;
     let scan = (|| -> Result<()> {
         let mut header = String::new();
         let mut bytes = Vec::new();
         for (oid, path) in &blobs {
-            if pending.is_empty() {
-                break;
-            }
             header.clear();
             output
                 .read_line(&mut header)
@@ -288,42 +338,16 @@ fn scan_callers(
             if bytes[..bytes.len().min(8000)].contains(&0) {
                 continue;
             }
-            let path = path.strip_prefix(&map.prefix).unwrap_or(path);
-            let tests = map.test_lines.get(path);
-            let text = String::from_utf8_lossy(&bytes);
-            for (index, line) in text.lines().enumerate() {
-                let lineno = index + 1;
-                let in_tests = tests
-                    .is_some_and(|ranges| ranges.iter().any(|(a, b)| *a <= lineno && lineno <= *b));
-                for word in line.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
-                    let Some(candidates) = pending.get_mut(word) else {
-                        continue;
-                    };
-                    candidates.retain(|site| {
-                        let allowed = path == site.path
-                            && (in_tests || (site.start_line <= lineno && lineno <= site.end_line));
-                        if !allowed {
-                            uncalled.remove(&site.site_id);
-                        }
-                        allowed
-                    });
-                    if candidates.is_empty() {
-                        pending.remove(word);
-                        if pending.is_empty() {
-                            break;
-                        }
-                    }
-                }
-                if pending.is_empty() {
-                    break;
-                }
+            if !visit(path, &bytes) {
+                stopped = true;
+                break;
             }
         }
         Ok(())
     })();
     // On early completion or read failure, stop the producer before joining
     // the writer: it may be blocked in a pipe write. Always reap the child.
-    let stopped = pending.is_empty() || scan.is_err();
+    let stopped = stopped || scan.is_err();
     if stopped {
         let _ = child.kill();
     }
@@ -337,7 +361,7 @@ fn scan_callers(
         written.context("write git cat-file requests")?;
         anyhow::ensure!(status.success(), "git cat-file failed: {status}");
     }
-    Ok((uncalled, scanned))
+    Ok(scanned)
 }
 
 #[cfg(test)]
@@ -779,6 +803,117 @@ pub fn omitted_test_dependents(root: &Path, mapped: &[String], tested: &[String]
         .into_iter()
         .filter(|p| !tested.contains(p))
         .collect()
+}
+
+/// Count listed sites whose whole name appears in each omitted package's code.
+/// Paths in the tree are relative to the repository, including the map prefix.
+pub(crate) fn rank_test_dependents(
+    root: &Path,
+    map: &SiteMap,
+    sites: &[&MapSite],
+    omitted: &[String],
+) -> Result<Vec<(String, usize)>> {
+    use std::collections::{HashMap, HashSet};
+
+    let meta = crate::cargo_cmd::load_metadata(root)?;
+    let mut dirs = Vec::new();
+    for name in omitted {
+        let package = meta
+            .workspace_packages()
+            .into_iter()
+            .find(|p| p.name.as_str() == name)
+            .context("omitted package missing from metadata")?;
+        let dir = package
+            .manifest_path
+            .as_std_path()
+            .parent()
+            .context("package manifest directory")?
+            .strip_prefix(root)?;
+        dirs.push(PathBuf::from(&map.prefix).join(dir));
+    }
+    let mut names: HashMap<&str, usize> = HashMap::new();
+    for site in sites {
+        let name = site.fqn.rsplit('.').next().unwrap_or("");
+        if !site.trait_impl && name != "main" {
+            *names.entry(name).or_default() += 1;
+        }
+    }
+    let mut found = vec![HashSet::new(); dirs.len()];
+    if !names.is_empty() && !dirs.is_empty() {
+        scan_rust_blobs(
+            map,
+            root,
+            |path| dirs.iter().any(|dir| Path::new(path).starts_with(dir)),
+            |path, bytes| {
+                let packages: Vec<_> = dirs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, dir)| Path::new(path).starts_with(dir))
+                    .map(|(i, _)| i)
+                    .collect();
+                let text = String::from_utf8_lossy(bytes);
+                for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+                    if let Some((&name, _)) = names.get_key_value(word) {
+                        for &i in &packages {
+                            found[i].insert(name);
+                        }
+                    }
+                }
+                true
+            },
+        )?;
+    }
+    let mut ranked: Vec<_> = omitted
+        .iter()
+        .cloned()
+        .zip(
+            found
+                .iter()
+                .map(|set| set.iter().map(|name| names[name]).sum::<usize>()),
+        )
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Ok(ranked)
+}
+
+pub(crate) fn dependent_hint(
+    root: &Path,
+    map: &SiteMap,
+    sites: &[&MapSite],
+    omitted: &[String],
+) -> String {
+    let Ok(ranked) = rank_test_dependents(root, map, sites, omitted) else {
+        return format!("hint: tests of {} may enter the listed functions; add them with --extra-tests or [package.<name>] extra-tests", omitted.join(", "));
+    };
+    format_ranked_dependents(&ranked)
+}
+
+fn format_ranked_dependents(ranked: &[(String, usize)]) -> String {
+    let positive = ranked.iter().filter(|(_, n)| *n > 0).count();
+    let mut packages = ranked
+        .iter()
+        .take(positive.min(5))
+        .map(|(name, count)| format!("{name} ({count})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if positive > 5 {
+        packages.push_str(&format!(" and {} more", positive - 5));
+    }
+    let zeros = ranked.len() - positive;
+    if positive == 0 {
+        let noun = if zeros == 1 {
+            "dependent names"
+        } else {
+            "dependents name"
+        };
+        return format!("hint: {zeros} omitted {noun} none of the listed functions in Rust sources; add tests with --extra-tests or [package.<name>] extra-tests");
+    }
+    let zero_note = if zeros > 0 {
+        format!("; {zeros} name none")
+    } else {
+        String::new()
+    };
+    format!("hint: tests of these dependents may enter the listed functions, ranked by the number of listed functions named in their Rust sources: {packages}{zero_note}. Add them with --extra-tests or [package.<name>] extra-tests")
 }
 
 #[cfg(test)]

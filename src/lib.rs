@@ -254,7 +254,10 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
         .collect();
     let omitted = sitemap::omitted_test_dependents(&cfg.repo_root, &mapped, &map.test_packages);
     if !omitted.is_empty() {
-        eprintln!("hint: tests of {} may enter the listed functions; add them with --extra-tests or [package.<name>] extra-tests", omitted.join(", "));
+        eprintln!(
+            "{}",
+            sitemap::dependent_hint(&cfg.repo_root, &map, &shown, &omitted)
+        );
     }
     if let Some(path) = &cfg.json {
         let rows: Vec<serde_json::Value> = shown

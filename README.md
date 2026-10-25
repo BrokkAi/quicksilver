@@ -201,7 +201,11 @@ come back not covered, so write tests first. `--package` and `--file` narrow
 the list.
 
 When the map limits tests to some packages, a hint names omitted workspace
-dependents whose tests may enter these functions. Add their binaries with
+dependents whose tests may enter these functions. It shows up to five, ranked
+by how many listed function names appear as whole words in each package's
+committed Rust sources, with counts. This is a name match, not proof of a call.
+The hint also counts additional matches and packages that name none; if ranking
+is unavailable, it lists all omitted dependents. Add their binaries with
 `--extra-tests` or `[package.<name>] extra-tests` and map again.
 
 A function marked `[no callers]` is named nowhere in the workspace except

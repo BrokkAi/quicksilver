@@ -385,3 +385,121 @@ fn real_repository_caller_evidence() {
         assert_eq!(new, old);
     }
 }
+
+#[test]
+fn ranks_omitted_packages_by_whole_names_at_map_commit() {
+    let dir = repository(&[
+        ("workspace/Cargo.toml", b"[workspace]\nmembers = ['base', 'many', 'few', 'none']\nresolver = '2'\n"),
+        ("workspace/base/Cargo.toml", b"[package]\nname = 'base'\nversion = '0.1.0'\n"),
+        ("workspace/base/src/lib.rs", b"pub fn alpha() {}\npub fn beta() {}\n"),
+        ("workspace/many/Cargo.toml", b"[package]\nname = 'many'\nversion = '0.1.0'\n[dependencies]\nbase = { path = '../base' }\n"),
+        ("workspace/many/src/lib.rs", b"alpha alpha beta main trait_method\n"),
+        ("workspace/few/Cargo.toml", b"[package]\nname = 'few'\nversion = '0.1.0'\n[dependencies]\nbase = { path = '../base' }\n"),
+        ("workspace/few/src/lib.rs", "alpha alphabet beta_more βbeta beta2 main trait_method\n".as_bytes()),
+        ("workspace/none/Cargo.toml", b"[package]\nname = 'none'\nversion = '0.1.0'\n[dependencies]\nbase = { path = '../base' }\n"),
+        ("workspace/none/src/lib.rs", b"alphabet beta_more main trait_method\n"),
+        ("workspace/few-extra/ignored.rs", b"beta\n"),
+    ]);
+    let mut trait_site = site(5, "base/src/lib.rs", "trait_method", 1, 1);
+    trait_site.trait_impl = true;
+    let mut map = map(
+        dir.path(),
+        vec![
+            site(1, "base/src/lib.rs", "alpha", 1, 1),
+            site(2, "base/src/lib.rs", "beta", 2, 2),
+            site(3, "base/src/lib.rs", "alpha", 3, 3),
+            site(4, "base/src/lib.rs", "main", 4, 4),
+            trait_site,
+        ],
+    );
+    map.prefix = "workspace/".into();
+    let root = dir.path().join("workspace");
+    let omitted = omitted_test_dependents(&root, &["base".into()], &["base".into()]);
+    assert_eq!(omitted, ["few", "many", "none"]);
+    // Uncommitted mentions must not affect ranking.
+    std::fs::write(root.join("none/src/lib.rs"), "alpha beta").unwrap();
+    let sites: Vec<_> = map.sites.iter().collect();
+    let ranked = rank_test_dependents(&root, &map, &sites, &omitted).unwrap();
+    assert_eq!(
+        ranked,
+        [("many".into(), 3), ("few".into(), 2), ("none".into(), 0)]
+    );
+    let hint = dependent_hint(&root, &map, &sites, &omitted);
+    assert!(hint.contains("many (3), few (2); 1 name none"), "{hint}");
+    map.commit = "missing-commit".into();
+    let sites: Vec<_> = map.sites.iter().collect();
+    let fallback = dependent_hint(&root, &map, &sites, &omitted);
+    assert!(
+        fallback.contains("tests of few, many, none may enter"),
+        "{fallback}"
+    );
+    let fallback = dependent_hint(&root.join("missing"), &map, &sites, &omitted);
+    assert!(fallback.contains("tests of few, many, none may enter"));
+}
+
+#[test]
+fn ranked_hint_limits_matches_and_reports_zero_counts() {
+    let ranked: Vec<_> = (0..8)
+        .map(|i| (format!("package{i}"), 8 - i))
+        .chain([("no_names".into(), 0), ("also_none".into(), 0)])
+        .collect();
+    let hint = format_ranked_dependents(&ranked);
+    assert!(hint.contains("package0 (8), package1 (7)"));
+    assert!(hint.contains("package4 (4) and 3 more; 2 name none"));
+    assert!(!hint.contains("package5"));
+    assert!(!hint.contains("no_names"));
+    let none = format_ranked_dependents(&[("none".into(), 0)]);
+    assert!(none.contains("1 omitted dependent names none"));
+}
+
+// Read-only timing harness: no map or build command runs in the subject repo.
+#[test]
+#[ignore = "set QS_RANK_REPO to a real multi-package repository for timing"]
+fn real_repository_ranking_evidence() {
+    let repo = PathBuf::from(std::env::var_os("QS_RANK_REPO").expect("QS_RANK_REPO"));
+    let meta = crate::cargo_cmd::load_metadata(&repo).unwrap();
+    let packages: Vec<_> = meta
+        .workspace_packages()
+        .iter()
+        .map(|p| p.name.to_string())
+        .collect();
+    assert!(packages.len() > 1);
+    // Extract representative listed function names without invoking git grep.
+    let mut names = std::collections::BTreeSet::new();
+    let mut map = map(&repo, Vec::new());
+    scan_rust_blobs(
+        &map,
+        &repo,
+        |_| true,
+        |_, bytes| {
+            let text = String::from_utf8_lossy(bytes);
+            for after in text.split("fn ").skip(1) {
+                let name = after
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap();
+                if !name.is_empty() {
+                    names.insert(name.to_owned());
+                }
+            }
+            true
+        },
+    )
+    .unwrap();
+    map.sites = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| site(i as u32, "", name, 1, 1))
+        .collect();
+    let sites: Vec<_> = map.sites.iter().collect();
+    let now = std::time::Instant::now();
+    let ranked = rank_test_dependents(&repo, &map, &sites, &packages).unwrap();
+    eprintln!(
+        "repo={} commit={} packages={} functions={} elapsed={:?} ranked={ranked:?}",
+        repo.display(),
+        map.commit,
+        packages.len(),
+        sites.len(),
+        now.elapsed()
+    );
+}
