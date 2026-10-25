@@ -738,6 +738,60 @@ fn edited_mutants_are_captured_built_and_judged() {
             "{v:?}"
         );
     }
+    let state = cargo_quicksilver::exec::edited::State::load(&paths).unwrap();
+    let head = cargo_quicksilver::worktree::head(repo.path()).unwrap();
+    let survivors =
+        cargo_quicksilver::survivors::collect(&map, &state, repo.path(), &head, &[], None);
+    let survivor = survivors
+        .iter()
+        .find(|s| s.id == missed_m.id)
+        .expect("always_ok survivor");
+    assert_eq!(
+        survivor.intent.as_deref(),
+        Some("returns the opposite constant")
+    );
+    assert_eq!(survivor.at_head, Some(true));
+    assert!(survivor.edits[0].diff.contains("-    true"));
+    assert!(survivor.edits[0].diff.contains("+    false"));
+    let split_dir = tempfile::tempdir().unwrap();
+    let buckets = cargo_quicksilver::survivors::split(&survivors, 3);
+    for (lane, bucket) in buckets.iter().enumerate() {
+        let content: String = bucket
+            .iter()
+            .map(|&i| cargo_quicksilver::survivors::text_block(&survivors[i]))
+            .collect();
+        fs::write(
+            split_dir.path().join(format!("survivors-{}.txt", lane + 1)),
+            content,
+        )
+        .unwrap();
+    }
+    let paths_for_survivors: Vec<_> = (1..=3)
+        .map(|i| fs::read_to_string(split_dir.path().join(format!("survivors-{i}.txt"))).unwrap())
+        .collect();
+    for path in survivors
+        .iter()
+        .map(|s| s.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        let lanes: Vec<_> = paths_for_survivors
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| {
+                survivors
+                    .iter()
+                    .any(|s| s.path == path && text.contains(&s.id))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            lanes.len() <= 1,
+            "survivors from {path} were split across lanes: {lanes:?}"
+        );
+    }
+    assert!(paths_for_survivors
+        .iter()
+        .any(|text| text.contains(&missed_m.id)));
     assert_eq!(verdict(&uncovered_m).kind, VerdictKind::NotCovered);
     // Tests are named by id, with their binary.
     assert_eq!(

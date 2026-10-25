@@ -124,6 +124,8 @@ pub enum Command {
     Uncovered(UncoveredArgs),
     /// List entered functions that still need a captured mutant.
     Pending(PendingArgs),
+    /// Review mutants that no selected test caught.
+    Survivors(SurvivorsArgs),
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
@@ -260,6 +262,16 @@ pub struct PendingArgs {
     #[arg(long, requires = "out", value_parser = parse_positive_split)]
     pub split: Option<usize>,
     /// Directory for pending-1.txt through pending-N.txt.
+    #[arg(long, requires = "split", value_name = "DIR")]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct SurvivorsArgs {
+    /// Write this many lists, keeping each source file together.
+    #[arg(long, requires = "out", value_parser = parse_positive_split)]
+    pub split: Option<usize>,
+    /// Directory for survivors-1.txt through survivors-N.txt.
     #[arg(long, requires = "split", value_name = "DIR")]
     pub out: Option<PathBuf>,
 }

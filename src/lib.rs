@@ -22,6 +22,7 @@ pub mod scan;
 pub mod schema;
 pub mod scratch;
 pub mod sitemap;
+pub mod survivors;
 pub mod target;
 pub mod types;
 pub mod util;
@@ -56,6 +57,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Test(args) => cmd_test(&cli.common, args),
         cli::Command::Uncovered(args) => cmd_uncovered(&cli.common, args),
         cli::Command::Pending(args) => pending::run(&cli.common, args),
+        cli::Command::Survivors(args) => survivors::run(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
     };
     if let Some(line) = sandbox::summary() {

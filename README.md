@@ -236,6 +236,22 @@ far. The summary reports functions with mutants and remaining functions and
 lines; each split file gets its own function and line counts.
 
 
+## Review the survivors
+
+After `test`, list mutants that no selected test caught:
+
+```
+cargo quicksilver survivors --package my_crate --file 'src/**/*.rs'
+cargo quicksilver survivors --split 4 --out survivor-lanes
+```
+
+Each record shows the mutant id and intent, its function and unified body
+diffs, how many tests ran and were selected (with a short sample), and
+whether the function remains at `HEAD`. `--json FILE` saves the same records
+as JSON. `--split N --out DIR` writes `survivors-1.txt` through
+`survivors-N.txt`, balancing survivor counts while keeping each source file
+in one list.
+
 ## What the results mean
 
 - **Caught**: a test fails with the mutant and passes without it.
