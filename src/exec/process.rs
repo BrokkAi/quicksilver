@@ -12,8 +12,23 @@ pub enum RunStatus {
     /// Non-101 nonzero exit (dynamic linker 127, abort, …). Not Caught.
     Error {
         code: Option<i32>,
+        signal: Option<i32>,
     },
     Timeout,
+}
+
+impl RunStatus {
+    pub fn describe(self, wall: Duration) -> String {
+        match self {
+            Self::Passed => "exit 0".into(),
+            Self::Failed => format!("exit {LIBTEST_FAILURE_CODE}"),
+            Self::Error { code, signal } => crate::types::describe_exit(code, signal),
+            Self::Timeout => format!(
+                "timed out after {:.2} s (stopped by quicksilver)",
+                wall.as_secs_f64()
+            ),
+        }
+    }
 }
 
 pub enum WaitResult {
@@ -129,17 +144,16 @@ pub fn classify_exit(status: ExitStatus) -> RunStatus {
     } else if status.code() == Some(LIBTEST_FAILURE_CODE) {
         RunStatus::Failed
     } else {
-        // SIGKILL is OOM / our tree kill racing wait(), not a libtest fail.
-        // Leave SIGABRT/SEGV as Error: the mutant crashed the process.
         #[cfg(unix)]
-        {
+        let signal = {
             use std::os::unix::process::ExitStatusExt;
-            if status.signal() == Some(libc::SIGKILL) {
-                return RunStatus::Timeout;
-            }
-        }
+            status.signal()
+        };
+        #[cfg(not(unix))]
+        let signal = None;
         RunStatus::Error {
             code: status.code(),
+            signal,
         }
     }
 }
@@ -331,7 +345,13 @@ mod tests {
         cmd.stderr(Stdio::null());
         match run_command_timeout(cmd, Duration::from_secs(5)).unwrap() {
             WaitResult::Exited(st) => {
-                assert_eq!(classify_exit(st), RunStatus::Error { code: Some(1) })
+                assert_eq!(
+                    classify_exit(st),
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None
+                    }
+                )
             }
             WaitResult::Timeout => panic!("false timed out"),
         }
@@ -357,7 +377,13 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        assert_eq!(status, RunStatus::Error { code: Some(1) });
+        assert_eq!(
+            status,
+            RunStatus::Error {
+                code: Some(1),
+                signal: None
+            }
+        );
     }
 
     #[test]
@@ -473,17 +499,53 @@ mod tests {
         assert!(cpu > 0.0);
     }
 
+    #[cfg(unix)]
     #[test]
-    fn sigkill_is_timeout_not_error() {
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "kill -9 $$"]);
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
-        match run_command_timeout(cmd, Duration::from_secs(5)).unwrap() {
-            WaitResult::Exited(st) => {
-                assert_eq!(classify_exit(st), RunStatus::Timeout)
+    fn outside_kill_and_abort_are_named_errors() {
+        for (number, name) in [(libc::SIGKILL, "SIGKILL"), (libc::SIGABRT, "SIGABRT")] {
+            let mut cmd = Command::new("/bin/sh");
+            cmd.args(["-c", &format!("ulimit -c 0; kill -{number} $$")]);
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            match run_command_timeout(cmd, Duration::from_secs(30)).unwrap() {
+                WaitResult::Exited(st) => {
+                    let status = classify_exit(st);
+                    assert_eq!(
+                        status,
+                        RunStatus::Error {
+                            code: None,
+                            signal: Some(number)
+                        }
+                    );
+                    assert_eq!(
+                        status.describe(Duration::ZERO),
+                        format!("killed by signal {number} ({name})")
+                    );
+                }
+                WaitResult::Timeout => panic!("outside signal should exit"),
             }
-            WaitResult::Timeout => panic!("kill -9 should exit, not hang"),
         }
+    }
+
+    #[test]
+    fn deadline_kill_is_a_timeout_stopped_by_quicksilver() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir_in("/tmp").unwrap();
+        let script = dir.path().join("sleeps.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (status, wall, _) = run_exact_with_env(
+            &script,
+            "ignored",
+            Path::new("/"),
+            Duration::from_millis(100),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(status, RunStatus::Timeout);
+        assert!(status.describe(wall).contains("(stopped by quicksilver)"));
+        assert_eq!(
+            status.describe(Duration::from_secs(3)),
+            "timed out after 3.00 s (stopped by quicksilver)"
+        );
     }
 }

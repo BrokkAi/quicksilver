@@ -213,11 +213,61 @@ pub const CRASH_PREFIX: &str = "crashed under the mutant";
 /// Prefix of a [`Outcome::caught_by_timeout`] message.
 pub const TIMEOUT_PREFIX: &str = "timed out under the mutant";
 
-/// "exit 3" or "killed by a signal" for a non-libtest test failure.
-pub fn describe_exit(code: Option<i32>) -> String {
+/// Name both the exit code and the terminating signal when available.
+pub fn describe_exit(code: Option<i32>, signal: Option<i32>) -> String {
+    if let Some(signal) = signal {
+        return format!("killed by signal {signal} ({})", signal_name(signal));
+    }
     match code {
         Some(c) => format!("exit {c}"),
-        None => "killed by a signal".into(),
+        None => "killed by an unknown signal".into(),
+    }
+}
+
+fn signal_name(signal: i32) -> &'static str {
+    #[cfg(unix)]
+    {
+        match signal {
+            libc::SIGHUP => "SIGHUP",
+            libc::SIGINT => "SIGINT",
+            libc::SIGQUIT => "SIGQUIT",
+            libc::SIGILL => "SIGILL",
+            libc::SIGTRAP => "SIGTRAP",
+            libc::SIGABRT => "SIGABRT",
+            libc::SIGBUS => "SIGBUS",
+            libc::SIGFPE => "SIGFPE",
+            libc::SIGKILL => "SIGKILL",
+            libc::SIGUSR1 => "SIGUSR1",
+            libc::SIGSEGV => "SIGSEGV",
+            libc::SIGUSR2 => "SIGUSR2",
+            libc::SIGPIPE => "SIGPIPE",
+            libc::SIGALRM => "SIGALRM",
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGCHLD => "SIGCHLD",
+            libc::SIGCONT => "SIGCONT",
+            libc::SIGSTOP => "SIGSTOP",
+            libc::SIGTSTP => "SIGTSTP",
+            libc::SIGTTIN => "SIGTTIN",
+            libc::SIGTTOU => "SIGTTOU",
+            libc::SIGURG => "SIGURG",
+            libc::SIGXCPU => "SIGXCPU",
+            libc::SIGXFSZ => "SIGXFSZ",
+            libc::SIGVTALRM => "SIGVTALRM",
+            libc::SIGPROF => "SIGPROF",
+            libc::SIGWINCH => "SIGWINCH",
+            libc::SIGIO => "SIGIO",
+            libc::SIGSYS => "SIGSYS",
+            #[cfg(target_os = "linux")]
+            libc::SIGPWR => "SIGPWR",
+            #[cfg(target_os = "linux")]
+            libc::SIGSTKFLT => "SIGSTKFLT",
+            _ => "unknown signal",
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = signal;
+        "unknown signal"
     }
 }
 

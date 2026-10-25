@@ -10,9 +10,9 @@ Tests on a loaded host can use the same CPU while taking much longer to finish. 
 
 - [x] (2026-10-25) Read issues #29 and #30 and inspect execution, map, and state code.
 - [x] (2026-10-25) Implement #29 CPU accounting, timeout decisions, summaries, repeat selection, and documentation.
-- [x] (2026-10-25) Validate #29: formatting clean; clippy only known build.rs warning; library 157 passed, 2 ignored; required integration suites passed. Checkpoint commit follows.
-- [ ] Implement #30 null retry, signal reporting, and errored list.
-- [ ] Validate and commit #30.
+- [x] (2026-10-25) Validate #29: formatting clean; clippy only known build.rs warning; library 157 passed, 2 ignored; required integration suites passed. Committed as `4bf3cf7`.
+- [x] (2026-10-25) Implement #30 null retry, signal reporting, and errored list.
+- [x] (2026-10-25) Validate #30: formatting clean; clippy only known build.rs warning; library 160 passed, 2 ignored; edited 2 passed, engine 9 passed, schema 3 passed. Separate #30 commit follows.
 
 ## Surprises & Discoveries
 
@@ -24,7 +24,7 @@ Use the parent's supplied design: normal runs get user and system CPU from wait4
 
 ## Outcomes & Retrospective
 
-Issue #29 is implemented and validated. Linux deadline accounting uses the larger of the group snapshot and reaped CPU, so a process exiting between the deadline and the snapshot does not lose already-accounted CPU. This preserves the snapshot for live descendants. The first sandboxed library run hit the existing socket-bind restriction; rerunning with host capabilities passed. Evidence goes in `/mnt/optane/tmp/qs-29-30-logs`.
+Both issues are implemented and validated in separate commits. Null failures now get one retry, external signals retain their numbers and names, QS deadline stops identify their source, and the final error list gives ids, reasons, and the repeat command. Linux deadline accounting uses the larger of the group snapshot and reaped CPU, so a process exiting between the deadline and the snapshot does not lose already-accounted CPU. This preserves the snapshot for live descendants. The first sandboxed library run hit the existing socket-bind restriction; rerunning with host capabilities passed. Evidence goes in `/mnt/optane/tmp/qs-29-30-logs`.
 
 ## Context and Orientation
 
@@ -57,3 +57,5 @@ Issue text was read with `gh issue view 29 -R BrokkAi/quicksilver` and the corre
 Use existing libc for wait4, sysconf clock ticks, and process group signals. Runner closures return `(RunStatus, Duration, f64, String)`, where f64 is CPU seconds. Add optional recorded CPU to TestInfo and a defaulted CPU index to SiteMap. Tested records retain optional built metadata so old records can safely go Pending when repeated.
 
 Plan updated after the #29 implementation to record passing checks and the deadline/exit race handling.
+
+Plan updated after #30 acceptance: all required checks pass with host socket capabilities; no unresolved implementation decisions remain.

@@ -272,7 +272,9 @@ removed or renamed shows as gone.
   is the likely cause. `[test-budget]` in `quicksilver.toml` gives named
   tests a longer minimum budget, for example `"my_crate::tests::waits" = 60.0`.
 - **Errored**: a test could not run properly, for example because it fails
-  even without the mutant.
+  twice even without the mutant. The final list gives each mutant id and
+  reason. Signal exits name the signal (for example `9 (SIGKILL)`); a test
+  stopped at its deadline says `stopped by quicksilver`.
 
 Repeat timeout kills and inconclusive timeouts on a quieter host with
 `cargo quicksilver test --again timeouts`. Use `--again errored` for errors,

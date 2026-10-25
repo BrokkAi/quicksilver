@@ -1971,6 +1971,21 @@ pub fn test(
         count(VerdictKind::Errored)
     ));
     results.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    let errored: Vec<_> = results
+        .iter()
+        .filter(|(_, v)| v.kind == VerdictKind::Errored)
+        .collect();
+    if !errored.is_empty() {
+        eprintln!("errored mutants:");
+        for (m, v) in errored {
+            eprintln!(
+                "  {}: {}",
+                m.id,
+                v.message.as_deref().unwrap_or("test run error")
+            );
+        }
+        eprintln!("retry these mutants with `cargo quicksilver test --again errored`");
+    }
     for (m, v) in &results {
         if let Some(r) = state.records.iter_mut().find(|r| r.mutant.id == m.id) {
             r.status = r.status.tested(v.clone());

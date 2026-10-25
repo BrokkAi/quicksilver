@@ -1,6 +1,5 @@
 use crate::exec::process::{
     run_exact_capture_output_with_env, run_exact_capture_with_env, run_exact_with_env, RunStatus,
-    LIBTEST_FAILURE_CODE,
 };
 use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
@@ -462,7 +461,7 @@ enum RecordFailure {
 impl std::fmt::Display for RecordFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RecordFailure::TimedOut(after) => write!(f, "timed out after {after:?}"),
+            RecordFailure::TimedOut(after) => f.write_str(&RunStatus::Timeout.describe(*after)),
             RecordFailure::Other(why) => f.write_str(why),
         }
     }
@@ -493,9 +492,10 @@ fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> 
         RunStatus::Failed => {
             return failed(RecordFailure::Other("failed with no mutant active".into()))
         }
-        RunStatus::Error { code } => {
+        RunStatus::Error { .. } => {
             return failed(RecordFailure::Other(format!(
-                "exited {code:?} with no mutant active"
+                "{} with no mutant active",
+                status.describe(elapsed)
             )))
         }
         RunStatus::Timeout => return failed(RecordFailure::TimedOut(timeout)),
@@ -587,7 +587,7 @@ fn resolve_tests(
 #[derive(Debug, Clone)]
 struct InfraSkip {
     test: String,
-    code: Option<i32>,
+    reason: String,
     stderr: String,
 }
 
@@ -643,12 +643,13 @@ where
             let outcome = match first {
                 RunStatus::Passed => unreachable!(),
                 RunStatus::Failed => Outcome::caught(planned.mutant.clone(), t.name.clone()),
-                RunStatus::Error { code } => Outcome::errored(
+                RunStatus::Error { .. } => Outcome::errored(
                     planned.mutant.clone(),
                     t.name.clone(),
                     format!(
-                        "test {} exited {:?} (libtest failures are 101; this is not Caught)",
-                        t.name, code
+                        "test {} {} (libtest failures are 101; this is not Caught)",
+                        t.name,
+                        first.describe(first_secs)
                     ),
                 ),
                 RunStatus::Timeout => Outcome::timeout(planned.mutant.clone(), t.name.clone()),
@@ -712,10 +713,10 @@ where
     }
     let first = &skipped[0];
     let message = format!(
-        "{} selected test(s) unusable under schema binary (fail with no mutant active); first: {} exited {:?}; stderr: {}",
+        "{} selected test(s) unusable under schema binary (fail with no mutant active); first: {} {}; stderr: {}",
         skipped.len(),
         first.test,
-        first.code,
+        first.reason,
         first.stderr
     );
     tracing::info!("confirm: {}", message);
@@ -791,7 +792,7 @@ where
         );
         return Ok(Step::Next);
     }
-    let (null, null_secs, _null_cpu, null_err) = run(&spec_for(t, budget, &[], true))?;
+    let (mut null, mut null_secs, _, mut null_err) = run(&spec_for(t, budget, &[], true))?;
     tracing::info!(
         "confirm {}: null run {:?} in {:.2}s; stderr: {}",
         t.name,
@@ -799,6 +800,19 @@ where
         null_secs.as_secs_f64(),
         tail(&null_err, MESSAGE_TAIL)
     );
+    // Every selected test was green when recorded. A single null failure
+    // under load is not enough to discard that evidence.
+    if null != RunStatus::Passed {
+        let (status, wall, _, stderr) = run(&spec_for(t, budget, &[], true))?;
+        null = status;
+        null_secs = wall;
+        null_err = stderr;
+        tracing::info!(
+            "confirm {}: second null run {}",
+            t.name,
+            null.describe(null_secs)
+        );
+    }
     if null == RunStatus::Passed {
         if first == RunStatus::Failed || retry == RunStatus::Failed {
             tracing::info!(
@@ -810,24 +824,26 @@ where
                 t.name.clone(),
             )));
         }
-        let code = match first {
-            RunStatus::Error { code } => code,
-            _ => status_code(retry),
+        let crash = if matches!(first, RunStatus::Error { .. }) {
+            first
+        } else {
+            retry
         };
+        let exit = crash.describe(retry_secs);
         // A deterministic crash (stack overflow, abort, OOM kill, a nonzero
         // non-101 exit) under the mutant, on the same schema binary that
         // passes without it, is a test detecting the mutant.
         let message = format!(
             "{} ({}) and passes without it; test {}; stderr: {}",
             crate::types::CRASH_PREFIX,
-            crate::types::describe_exit(code),
+            exit,
             t.name,
             tail(&retry_err, MESSAGE_TAIL)
         );
         tracing::info!(
             "confirm {}: CAUGHT by crash ({}), passes without",
             t.name,
-            crate::types::describe_exit(code)
+            exit
         );
         return Ok(Step::Done(Outcome::caught_by_crash(
             planned.mutant.clone(),
@@ -842,7 +858,7 @@ where
     );
     Ok(Step::Skip(InfraSkip {
         test: t.name.clone(),
-        code: status_code(null),
+        reason: null.describe(null_secs),
         stderr: tail(&null_err, MESSAGE_TAIL),
     }))
 }
@@ -915,15 +931,6 @@ fn spec_for(
         timeout,
         env: test_env(t, env),
         capture,
-    }
-}
-
-fn status_code(status: RunStatus) -> Option<i32> {
-    match status {
-        RunStatus::Passed => Some(0),
-        RunStatus::Failed => Some(LIBTEST_FAILURE_CODE),
-        RunStatus::Error { code } => code,
-        RunStatus::Timeout => None,
     }
 }
 
@@ -1256,6 +1263,87 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_null_run_gets_one_retry_before_caught_or_crash() {
+        for mutant in [
+            RunStatus::Failed,
+            RunStatus::Error {
+                code: None,
+                signal: Some(libc::SIGABRT),
+            },
+        ] {
+            for null in [
+                RunStatus::Failed,
+                RunStatus::Timeout,
+                RunStatus::Error {
+                    code: None,
+                    signal: Some(libc::SIGKILL),
+                },
+            ] {
+                let (outcome, seen) = drive(
+                    true,
+                    &fake_tests(&["t"]),
+                    &[
+                        (mutant, 0.5, ""),
+                        (mutant, 0.5, "assertion or crash"),
+                        (null, 30.0, "transient null failure"),
+                        (RunStatus::Passed, 0.5, ""),
+                    ],
+                );
+                assert_eq!(outcome.kind, VerdictKind::Caught);
+                assert_eq!(seen.len(), 4);
+                assert!(!has_mutant(&seen[2]) && !has_mutant(&seen[3]));
+                assert!(seen[2].capture && seen[3].capture);
+                assert_eq!(seen[2].timeout, seen[3].timeout);
+                if matches!(mutant, RunStatus::Error { .. }) {
+                    let msg = outcome.message.unwrap();
+                    assert!(msg.starts_with(crate::types::CRASH_PREFIX), "{msg}");
+                    assert!(msg.contains("killed by signal 6 (SIGABRT)"), "{msg}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unusable_null_runs_name_signals_and_quicksilver_deadlines() {
+        for (null, expected) in [
+            (
+                RunStatus::Error {
+                    code: None,
+                    signal: Some(libc::SIGKILL),
+                },
+                "killed by signal 9 (SIGKILL)",
+            ),
+            (
+                RunStatus::Error {
+                    code: None,
+                    signal: Some(libc::SIGABRT),
+                },
+                "killed by signal 6 (SIGABRT)",
+            ),
+            (
+                RunStatus::Timeout,
+                "timed out after 30.00 s (stopped by quicksilver)",
+            ),
+        ] {
+            let (outcome, seen) = drive(
+                true,
+                &fake_tests(&["t"]),
+                &[
+                    (RunStatus::Failed, 0.5, ""),
+                    (RunStatus::Failed, 0.5, "assertion"),
+                    (null, 30.0, "first null"),
+                    (null, 30.0, "second null"),
+                ],
+            );
+            assert_eq!(outcome.kind, VerdictKind::Errored);
+            let msg = outcome.message.unwrap();
+            assert!(msg.contains(expected), "{msg}");
+            assert!(msg.contains("second null"), "{msg}");
+            assert_eq!(seen.len(), 4, "only one null retry");
+        }
+    }
+
+    #[test]
     fn confirm_fail_twice_then_null_fail_is_infra_skip_then_errored() {
         let (outcome, seen) = drive(
             true,
@@ -1264,13 +1352,14 @@ mod tests {
                 (RunStatus::Failed, 0.5, ""),
                 (RunStatus::Failed, 0.5, ""),
                 (RunStatus::Failed, 0.5, "panicked at src/lib.rs:12"),
+                (RunStatus::Failed, 0.5, "panicked at src/lib.rs:12"),
             ],
         );
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
         assert_eq!(outcome.kind, VerdictKind::Errored);
         let msg = outcome.message.unwrap();
         assert!(msg.contains("1 selected test(s) unusable under schema binary"));
-        assert!(msg.contains("exited Some(101)"), "{msg}");
+        assert!(msg.contains("exit 101"), "{msg}");
         assert!(msg.contains("panicked at src/lib.rs:12"), "{msg}");
     }
 
@@ -1375,8 +1464,24 @@ mod tests {
             &fake_tests(&["t"]),
             &[
                 (RunStatus::Timeout, 30.0, 1.0, ""),
-                (RunStatus::Error { code: None }, 40.0, 1.0, ""),
-                (RunStatus::Error { code: None }, 40.0, 1.0, ""),
+                (
+                    RunStatus::Error {
+                        code: None,
+                        signal: Some(libc::SIGKILL),
+                    },
+                    40.0,
+                    1.0,
+                    "",
+                ),
+                (
+                    RunStatus::Error {
+                        code: None,
+                        signal: Some(libc::SIGKILL),
+                    },
+                    40.0,
+                    1.0,
+                    "",
+                ),
                 (RunStatus::Passed, 40.0, 1.0, ""),
             ],
         );
@@ -1425,9 +1530,19 @@ mod tests {
             true,
             &fake_tests(&["t1"]),
             &[
-                (RunStatus::Error { code: Some(1) }, 0.5, ""),
                 (
-                    RunStatus::Error { code: Some(1) },
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
+                    0.5,
+                    "",
+                ),
+                (
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
                     0.5,
                     "error while loading shared libraries",
                 ),
@@ -1450,16 +1565,41 @@ mod tests {
             true,
             &fake_tests(&["t1"]),
             &[
-                (RunStatus::Error { code: Some(1) }, 0.5, ""),
-                (RunStatus::Error { code: Some(1) }, 0.5, "boom"),
                 (
-                    RunStatus::Error { code: Some(1) },
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
+                    0.5,
+                    "",
+                ),
+                (
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
+                    0.5,
+                    "boom",
+                ),
+                (
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
+                    0.5,
+                    "no mutant, still boom",
+                ),
+                (
+                    RunStatus::Error {
+                        code: Some(1),
+                        signal: None,
+                    },
                     0.5,
                     "no mutant, still boom",
                 ),
             ],
         );
-        assert_eq!(seen.len(), 3);
+        assert_eq!(seen.len(), 4);
         assert_eq!(outcome.kind, VerdictKind::Errored);
         let msg = outcome.message.unwrap();
         assert!(msg.contains("unusable under schema binary"), "{msg}");
