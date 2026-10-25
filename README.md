@@ -166,8 +166,11 @@ ones: an off-by-one, a swapped condition, a forgotten case. The loop is:
      CAUGHT      e1a2853eb638848c clap_builder.builder.arg.Arg.required by clap::builder::default_vals::default_ifs_arg_present_order
    ```
 
-   Each mutant runs only the tests that enter the functions it changed.
-   Each verdict is saved as soon as it is decided. To stop a long run,
+   Each mutant runs only the tests that enter the functions it changed,
+   cheapest first by the durations the map recorded, so a kill is
+   usually found early; a survivor runs them all. Every five minutes,
+   `test` prints how many mutants are decided and about how long the rest
+   will take. Each verdict is saved as soon as it is decided. To stop a long run,
    press Ctrl-C or send SIGTERM: the mutants already started finish, and
    `--json` is written. A second signal stops at once. Either way, running
    `test` again tests only the mutants without a verdict, and its `--json`
@@ -244,6 +247,38 @@ lines; each split file gets its own function and line counts.
   tests a longer budget, for example `"my_crate::tests::waits" = 60.0`.
 - **Errored**: a test could not run properly, for example because it fails
   even without the mutant.
+
+
+## Choose the tests the map uses
+
+Some tests exist only under a cfg, such as heavy tests marked
+`#[cfg_attr(not(scheduled_tests), ignore)]` that a release gate runs with
+`RUSTFLAGS='--cfg scheduled_tests'`. Without that cfg they are ignored and
+pin no mutants. `[build-env]` in `quicksilver.toml` sets variables for
+every build quicksilver runs, so the same flag maps them:
+
+```toml
+[build-env]
+RUSTFLAGS = "--cfg scheduled_tests"
+```
+
+As with cargo, `RUSTFLAGS` replaces the rustflags from `.cargo/config.toml`
+and from your environment, so repeat any you need. The map records these
+settings: a new map of the same commit with other settings compiles your
+mutants again (kills stay), and `build` warns when they changed since
+`map`.
+
+A test that cannot pass under quicksilver, such as a timing guard that the
+switch in every function slows down, can be left out by its id, the binary
+as nextest names it followed by the test's name (globs allowed):
+
+```toml
+[map]
+skip-tests = ["my_crate::suite::*::indexes_in_linear_time"]
+```
+
+`map` and `run` then never run it, and count it as left out, not as not
+green.
 
 
 ## Tests run in a sandbox

@@ -122,7 +122,16 @@ pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<P
     let mut tests = listing
         .join()
         .map_err(|_| anyhow::anyhow!("the test listing thread panicked"))??;
-    eprintln!("{} tests catalogued", tests.len());
+    let skipped = index::drop_skipped(&cfg, &mut tests)?;
+    if skipped.is_empty() {
+        eprintln!("{} tests catalogued", tests.len());
+    } else {
+        eprintln!(
+            "{} tests catalogued, {} more left out by [map] skip-tests",
+            tests.len(),
+            skipped.len()
+        );
+    }
     let timing = index::attach_timings(&mut tests, &baseline.tests);
     if !baseline.tests.is_empty() && !tests.is_empty() {
         if timing.matched == 0 {

@@ -84,6 +84,12 @@ fn cmd_map(common: &cli::CommonOpts, args: cli::MapArgs) -> Result<i32> {
         entered.len(),
         map.map_secs
     );
+    if !map.skipped_tests.is_empty() {
+        eprintln!(
+            "{} test(s) left out by [map] skip-tests: not run, not counted as not green",
+            map.skipped_tests.len()
+        );
+    }
     eprintln!(
         "map written to {}",
         sitemap::SiteMap::path(&paths).display()

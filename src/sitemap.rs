@@ -72,12 +72,20 @@ pub struct SiteMap {
     /// The packages whose tests were built and recorded; empty means the
     /// workspace. `build` compiles the same set.
     pub test_packages: Vec<String>,
+    /// `[build-env]` when the map was built, such as a `RUSTFLAGS` with
+    /// `--cfg` for tests that exist only under a cfg.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub build_env: BTreeMap<String, String>,
     /// The catalogued tests with their durations under the schema binary.
     pub tests: Vec<TestInfo>,
     /// test id -> site ids the test entered with no mutant active.
     pub hits: BTreeMap<String, Vec<u32>>,
     /// Tests that did not pass under the schema binary, with why.
     pub not_green: Vec<(String, String)>,
+    /// Tests `[map] skip-tests` left out: never run, so neither green nor
+    /// not green.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_tests: Vec<String>,
     /// The end of each not-green test's output (stdout, then stderr).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub not_green_output: BTreeMap<String, String>,
@@ -667,9 +675,11 @@ mod tests {
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
             test_packages: Vec::new(),
+            build_env: BTreeMap::new(),
             tests: vec![t("p::t1")],
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
             not_green: Vec::new(),
+            skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),
             worker: PathBuf::new(),
@@ -725,6 +735,7 @@ mod tests {
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
             test_packages: Vec::new(),
+            build_env: BTreeMap::new(),
             tests: vec![t("slow", 2.0), t("fast", 0.1), t("other", 0.5)],
             hits: [
                 ("slow".to_string(), vec![1, 2]),
@@ -734,6 +745,7 @@ mod tests {
             .into_iter()
             .collect(),
             not_green: Vec::new(),
+            skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),
             worker: PathBuf::new(),

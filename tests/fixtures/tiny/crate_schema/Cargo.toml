@@ -2,3 +2,8 @@
 name = "tiny_schema"
 version = "0.1.0"
 edition = "2021"
+
+# `qs_fixture_cfg` stands in for a cfg such as `scheduled_tests`, which
+# quicksilver's end-to-end test sets through `[build-env] RUSTFLAGS`.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(qs_fixture_cfg)"] }

@@ -36,6 +36,11 @@ fn edited_mutants_are_captured_built_and_judged() {
     cfg.test_env
         .insert("FIXTURE_STATE".into(), "{sandbox}/state".into());
     cfg.test_env.insert("FIXTURE_NOT_GREEN".into(), "1".into());
+    // Tests that exist only under a cfg are mapped when [build-env] sets it.
+    cfg.build_env
+        .insert("RUSTFLAGS".into(), "--cfg qs_fixture_cfg".into());
+    // A timing guard that fails under the switch is left out by name.
+    cfg.skip_tests = vec!["tiny_schema::*::timing_guard_*".into()];
     let paths = cfg.paths();
     cargo_quicksilver::sandbox::configure(&cfg, &paths).expect("sandbox");
 
@@ -78,6 +83,14 @@ fn edited_mutants_are_captured_built_and_judged() {
         "{output}"
     );
     assert_eq!(map.not_green.len(), 1, "{:?}", map.not_green);
+    assert_eq!(
+        map.skipped_tests,
+        vec!["tiny_schema::tests::timing_guard_red_under_quicksilver".to_string()]
+    );
+    assert!(!map
+        .tests
+        .iter()
+        .any(|t| t.id.ends_with("timing_guard_red_under_quicksilver")));
     let site = |fqn: &str| {
         map.sites
             .iter()
@@ -89,6 +102,18 @@ fn edited_mutants_are_captured_built_and_judged() {
                 )
             })
     };
+    let gated = site(".cfg_gated_target").site_id;
+    assert!(
+        map.hits
+            .get("tiny_schema::tests::only_with_the_cfg")
+            .is_some_and(|h| h.contains(&gated)),
+        "the cfg-gated test is mapped: {:?}",
+        map.hits.keys()
+    );
+    assert_eq!(
+        map.build_env.get("RUSTFLAGS").map(String::as_str),
+        Some("--cfg qs_fixture_cfg")
+    );
     let add = site("add").site_id;
     assert!(
         map.hits

@@ -58,6 +58,11 @@ pub fn sample_for_test() -> u32 {
     3
 }
 
+/// Only a test that exists under `--cfg qs_fixture_cfg` calls this.
+pub fn cfg_gated_target() -> u32 {
+    5
+}
+
 pub fn parse_pair(s: &str) -> (i32, i32) {
     struct Pair(i32, i32);
     impl Pair {
@@ -166,6 +171,20 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout).trim()
             );
         }
+    }
+
+    // Like a scheduled-only test: ignored unless built with the cfg.
+    #[test]
+    #[cfg_attr(not(qs_fixture_cfg), ignore = "needs --cfg qs_fixture_cfg")]
+    fn only_with_the_cfg() {
+        assert_eq!(cfg_gated_target(), 5);
+    }
+
+    // Like a latency guard that fails under quicksilver's switch: green in
+    // the baseline run, red where `[test-env]` sets FIXTURE_STATE.
+    #[test]
+    fn timing_guard_red_under_quicksilver() {
+        assert!(std::env::var_os("FIXTURE_STATE").is_none(), "too slow");
     }
 
     #[test]

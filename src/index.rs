@@ -13,6 +13,36 @@ use std::path::Path;
 
 /// Every test of the baseline, from `cargo nextest list` (through mbx, which
 /// builds the tests if they are not built yet).
+/// `[map] skip-tests` as a glob set over test ids.
+pub fn skip_globs(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut set = globset::GlobSetBuilder::new();
+    for p in patterns {
+        set.add(globset::Glob::new(p).with_context(|| format!("[map] skip-tests: {p}"))?);
+    }
+    Ok(Some(set.build()?))
+}
+
+/// Remove the tests `[map] skip-tests` names from `tests`, and return their
+/// ids, sorted.
+pub fn drop_skipped(cfg: &Config, tests: &mut Vec<TestInfo>) -> Result<Vec<String>> {
+    let Some(globs) = skip_globs(&cfg.skip_tests)? else {
+        return Ok(Vec::new());
+    };
+    let mut skipped = Vec::new();
+    tests.retain(|t| {
+        let skip = globs.is_match(&t.id);
+        if skip {
+            skipped.push(t.id.clone());
+        }
+        !skip
+    });
+    skipped.sort();
+    Ok(skipped)
+}
+
 pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
     let meta = load_metadata(&paths.baseline)?;
     let target_dir = paths.baseline.join("target");
@@ -209,5 +239,28 @@ mod tests {
         attach_timings(&mut tests, &baseline);
         assert_eq!(tests[0].duration_secs, 0.2);
         assert_eq!(tests[1].duration_secs, 0.8);
+    }
+}
+
+#[cfg(test)]
+mod skip_tests {
+    use super::*;
+
+    #[test]
+    fn skip_tests_match_whole_ids_with_globs() {
+        let globs = skip_globs(&[
+            "brokk-bifrost::suite_issues::*::c_wide_*_in_linear_time".to_string(),
+            "p::exact::name".to_string(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(globs.is_match(
+            "brokk-bifrost::suite_issues::issue_2145_wide_tree_traversal::c_wide_translation_unit_indexes_in_linear_time"
+        ));
+        assert!(globs.is_match("p::exact::name"));
+        assert!(!globs.is_match("p::exact::name_too"));
+        assert!(!globs.is_match("q::p::exact::name"));
+        assert!(skip_globs(&[]).unwrap().is_none());
+        assert!(skip_globs(&["a[".to_string()]).is_err());
     }
 }

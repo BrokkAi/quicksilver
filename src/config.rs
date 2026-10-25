@@ -32,6 +32,17 @@ pub struct FileConfig {
     pub test_env: BTreeMap<String, String>,
     #[serde(default)]
     pub sandbox: SandboxFile,
+    #[serde(default)]
+    pub map: MapFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MapFile {
+    /// Test ids (`<binary id>::<name>`, globs allowed) that `map` and `run`
+    /// never run, such as timing guards that fail under the switch.
+    #[serde(rename = "skip-tests", default)]
+    pub skip_tests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -77,6 +88,8 @@ pub struct Config {
     pub test_env: BTreeMap<String, String>,
     /// Whether each test process gets its own HOME and TMPDIR.
     pub sandbox: bool,
+    /// `[map] skip-tests`: test id globs never run or recorded.
+    pub skip_tests: Vec<String>,
     /// `[sandbox] dir`: where sandboxes go instead of the system temporary
     /// directory.
     pub sandbox_dir: Option<PathBuf>,
@@ -190,6 +203,10 @@ pub fn merge_config(
         test_budget: file.test_budget.clone(),
         test_env: file.test_env.clone(),
         sandbox: !cli.no_sandbox && file.sandbox.enabled.unwrap_or(true),
+        skip_tests: {
+            crate::index::skip_globs(&file.map.skip_tests)?;
+            file.map.skip_tests.clone()
+        },
         sandbox_dir: match &file.sandbox.dir {
             Some(dir) if !dir.is_absolute() => anyhow::bail!(
                 "[sandbox] dir must be an absolute path, not {}",

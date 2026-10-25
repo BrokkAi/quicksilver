@@ -95,6 +95,10 @@ pub struct State {
     pub commit: String,
     #[serde(default)]
     pub test_packages: Vec<String>,
+    /// That map's `[build-env]`: other build settings (a `--cfg` in
+    /// `RUSTFLAGS`) also make the compiled generation stale.
+    #[serde(default)]
+    pub build_env: BTreeMap<String, String>,
     /// Bumped by every `build` that compiles something.
     pub generation: u32,
     pub records: Vec<Record>,
@@ -212,6 +216,7 @@ impl State {
                 map_id: map.map_id.clone(),
                 commit: map.commit.clone(),
                 test_packages: map.test_packages.clone(),
+                build_env: map.build_env.clone(),
                 generation: 0,
                 records: Vec::new(),
             };
@@ -232,7 +237,7 @@ impl State {
             kept: self.records.len(),
             ..Reconciled::default()
         };
-        if self.test_packages != map.test_packages {
+        if self.test_packages != map.test_packages || self.build_env != map.build_env {
             for r in &mut self.records {
                 let stays = match &r.status {
                     Status::Pending | Status::Unviable { .. } => true,
@@ -247,6 +252,7 @@ impl State {
         }
         self.map_id = map.map_id.clone();
         self.test_packages = map.test_packages.clone();
+        self.build_env = map.build_env.clone();
         done
     }
 }
@@ -275,12 +281,12 @@ impl Reconciled {
         }
         if self.kept > 0 && self.recompile > 0 {
             eprintln!(
-                "kept {} mutant(s) captured against an earlier map of this commit; {} of them will be compiled again for the new map's test packages and tested against its tests (kills and unviable mutants stay)",
+                "kept {} mutant(s) captured against an earlier map of this commit; {} of them will be compiled again for the new map's test packages or build settings and tested against its tests (kills and unviable mutants stay)",
                 self.kept, self.recompile
             );
         } else if self.kept > 0 {
             eprintln!(
-                "kept {} mutant(s), their builds and verdicts from an earlier map of this commit with the same test packages",
+                "kept {} mutant(s), their builds and verdicts from an earlier map of this commit with the same test packages and build settings",
                 self.kept
             );
         }
@@ -671,7 +677,14 @@ pub fn map_at(paths: &Paths, commit: &str) -> Result<SiteMap> {
 /// its tests listed and timed.
 pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Result<SiteMap> {
     let started = Instant::now();
-    let listed = tests;
+    let mut listed = tests;
+    let skipped_tests = crate::index::drop_skipped(cfg, &mut listed)?;
+    if !skipped_tests.is_empty() {
+        info!(
+            "map: {} test(s) left out by [map] skip-tests",
+            skipped_tests.len()
+        );
+    }
     let files = tracked_file_hashes(&cfg.repo_root)?;
 
     let (fns, test_lines) = crate::discover::scan_workspace_with_tests(
@@ -807,9 +820,11 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         dropped,
         crate_roots,
         test_packages,
+        build_env: cfg.build_env.clone(),
         tests,
         hits,
         not_green: recording.not_green.clone(),
+        skipped_tests,
         not_green_output: recording.not_green_output.clone(),
         property_tests,
         worker: worker.clone(),
@@ -1111,6 +1126,11 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     let started = Instant::now();
     let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(paths)?;
+    if cfg.build_env != map.build_env {
+        warn!(
+            "[build-env] in quicksilver.toml differs from the one `map` used, so these binaries may not behave as the map recorded; run `cargo quicksilver map` again"
+        );
+    }
     let mut captures: Vec<(String, CaptureOutcome)> = Vec::new();
     if let Some(checkout) = &sources.checkout {
         let outcome = capture_checkout(&map, checkout, sources.options)?;
@@ -1510,6 +1530,97 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
 /// own.
 type BuiltMutant = (EditedMutant, Vec<(u32, u32)>, bool);
 
+/// How often a long `test` reports how far it is.
+const STATUS_EVERY: Duration = Duration::from_secs(300);
+/// Seconds added per selected test for starting its process.
+const PER_TEST_OVERHEAD_SECS: f64 = 0.02;
+
+/// What a mutant is expected to cost: its selected tests' recorded
+/// durations, which a survivor runs in full.
+fn mutant_cost(tests: &[TestInfo]) -> f64 {
+    tests
+        .iter()
+        .map(|t| t.duration_secs + PER_TEST_OVERHEAD_SECS)
+        .sum()
+}
+
+/// Verdict counts while `test` runs, for its status lines.
+struct Tally {
+    total: usize,
+    total_cost: f64,
+    decided: usize,
+    decided_cost: f64,
+    caught: usize,
+    missed: usize,
+    other: usize,
+    last_status_secs: f64,
+}
+
+impl Tally {
+    fn new(total: usize, total_cost: f64) -> Tally {
+        Tally {
+            total,
+            total_cost,
+            decided: 0,
+            decided_cost: 0.0,
+            caught: 0,
+            missed: 0,
+            other: 0,
+            last_status_secs: 0.0,
+        }
+    }
+
+    /// Count one verdict, `elapsed` seconds into the run; a status line
+    /// when one is due.
+    fn decided(&mut self, kind: VerdictKind, cost: f64, elapsed: f64) -> Option<String> {
+        self.decided += 1;
+        self.decided_cost += cost;
+        match kind {
+            VerdictKind::Caught => self.caught += 1,
+            VerdictKind::Missed => self.missed += 1,
+            _ => self.other += 1,
+        }
+        if elapsed - self.last_status_secs < STATUS_EVERY.as_secs_f64()
+            || self.decided == self.total
+        {
+            return None;
+        }
+        self.last_status_secs = elapsed;
+        Some(self.status(elapsed))
+    }
+
+    fn counts(&self) -> String {
+        format!(
+            "{} caught, {} missed, {} other",
+            self.caught, self.missed, self.other
+        )
+    }
+
+    fn status(&self, elapsed: f64) -> String {
+        let mut line = format!(
+            "test: {} of {} decided ({})",
+            self.decided,
+            self.total,
+            self.counts()
+        );
+        if let Some(left) = time_left(elapsed, self.decided_cost, self.total_cost) {
+            line.push_str(&format!(
+                ", about {} left",
+                crate::util::format_duration(left)
+            ));
+        }
+        line
+    }
+}
+
+/// Seconds left, if the work still to do goes at the rate the decided work
+/// went. Work is measured by [`mutant_cost`], so a few slow survivors left
+/// at the end count for what they are.
+fn time_left(elapsed: f64, decided_cost: f64, total_cost: f64) -> Option<f64> {
+    (decided_cost > 0.0 && elapsed > 0.0)
+        .then(|| elapsed * (total_cost - decided_cost).max(0.0) / decided_cost)
+}
+
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
 /// With `proptest_cases` above zero, a survivor judged only by proptest
@@ -1577,6 +1688,14 @@ pub fn test(
     );
     let stop = crate::engine::install_ctrlc();
     let stopping = std::sync::Once::new();
+    let costs: Vec<f64> = set
+        .iter()
+        .map(|(m, _, _)| {
+            let sites: Vec<u32> = m.edits.iter().map(|e| e.site_id).collect();
+            mutant_cost(&map.tests_entering(&sites))
+        })
+        .collect();
+    let tally = Mutex::new(Tally::new(set.len(), costs.iter().sum()));
     let next = AtomicUsize::new(0);
     let results: Mutex<Vec<(EditedMutant, Verdict)>> = Mutex::new(Vec::new());
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -1711,6 +1830,15 @@ pub fn test(
                 };
                 progress.println(&verdict_line(m, &verdict));
                 progress.inc(1);
+                if let Some(line) =
+                    tally
+                        .lock()
+                        .unwrap()
+                        .decided(verdict.kind, costs[k], progress.elapsed_secs())
+                {
+                    progress.println(&line);
+                }
+                progress.set_message(&tally.lock().unwrap().counts());
                 let entry = JournalEntry {
                     map_id: map.map_id.clone(),
                     generation,
@@ -1902,9 +2030,11 @@ mod tests {
             dropped: Vec::new(),
             crate_roots: BTreeMap::new(),
             test_packages: test_packages.iter().map(|p| p.to_string()).collect(),
+            build_env: BTreeMap::new(),
             tests: Vec::new(),
             hits: BTreeMap::new(),
             not_green: Vec::new(),
+            skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),
             worker: PathBuf::new(),
@@ -1958,6 +2088,7 @@ mod tests {
             map_id: map.map_id.clone(),
             commit: map.commit.clone(),
             test_packages: map.test_packages.clone(),
+            build_env: map.build_env.clone(),
             generation: 3,
             records: vec![
                 record("built", 1, "p.a", built()),
@@ -2044,6 +2175,14 @@ mod tests {
                 ("pending".to_string(), "pending"),
             ]
         );
+        // Other build settings, such as a `--cfg` in RUSTFLAGS: the same.
+        let mut state = state_for(&old);
+        let mut cfg_map = map_of("m2", "c1", &["p"]);
+        cfg_map
+            .build_env
+            .insert("RUSTFLAGS".into(), "--cfg scheduled_tests".into());
+        assert_eq!(state.reconcile(&cfg_map).recompile, 2);
+        assert_eq!(state.build_env, cfg_map.build_env);
         // Another commit: nothing stays.
         let mut state = state_for(&old);
         let done = state.reconcile(&map_of("m3", "c2", &["p"]));
@@ -2094,6 +2233,33 @@ mod tests {
         loaded.save(&paths).unwrap();
         assert!(!State::journal_path(&paths).exists());
         assert!(statuses(&State::load(&paths).unwrap()).contains(&("built".into(), "tested")));
+    }
+
+    #[test]
+    fn status_lines_count_verdicts_and_estimate_the_time_left() {
+        // Ten mutants: nine cheap, one survivor-sized at the end.
+        let mut tally = Tally::new(10, 9.0 + 91.0);
+        assert_eq!(
+            tally.decided(VerdictKind::Caught, 1.0, 10.0),
+            None,
+            "not due yet"
+        );
+        for _ in 0..4 {
+            tally.decided(VerdictKind::Missed, 1.0, 20.0);
+        }
+        // Five minutes in: half the mutants, but 5 of 100 cost units.
+        let line = tally
+            .decided(VerdictKind::Timeout, 1.0, 300.0)
+            .expect("due after five minutes");
+        assert!(
+            line.starts_with("test: 6 of 10 decided (1 caught, 4 missed, 1 other)"),
+            "{line}"
+        );
+        // 300 s for 6 units leaves 94 units: 4700 s.
+        assert!(line.ends_with("about 1.3 h left"), "{line}");
+        assert_eq!(tally.decided(VerdictKind::Caught, 1.0, 400.0), None);
+        assert_eq!(time_left(10.0, 0.0, 5.0), None);
+        assert_eq!(time_left(10.0, 5.0, 5.0), Some(0.0));
     }
 
     #[test]
