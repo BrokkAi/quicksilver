@@ -625,7 +625,7 @@ fn edited_mutants_are_captured_built_and_judged() {
         .find(|m| m.edits[0].body.contains(".clone()"))
         .unwrap()
         .clone();
-    let results = test(&cfg, &paths, std::slice::from_ref(&lower.id), 0).expect("test");
+    let results = test(&cfg, &paths, std::slice::from_ref(&lower.id), 0, &[]).expect("test");
     assert_eq!(results.len(), 1);
     let v = &results[0].1;
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
@@ -634,7 +634,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(line.contains("proptest properties only"), "{line}");
     assert!(line.contains("try `test --proptest-cases"), "{line}");
     assert_eq!(v.proptest_rerun_cases, None);
-    let results = test(&cfg, &paths, std::slice::from_ref(&same.id), 1000).expect("test");
+    let results = test(&cfg, &paths, std::slice::from_ref(&same.id), 1000, &[]).expect("test");
     let v = &results[0].1;
     assert_eq!(v.kind, VerdictKind::Caught, "{v:?}");
     assert!(
@@ -646,7 +646,14 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert!(v.note.is_some(), "a property decided it: {v:?}");
     assert_eq!(v.proptest_rerun_cases, Some(1000));
     // A survivor of the re-run says so instead of suggesting it again.
-    let results = test(&cfg, &paths, std::slice::from_ref(&equivalent.id), 1000).expect("test");
+    let results = test(
+        &cfg,
+        &paths,
+        std::slice::from_ref(&equivalent.id),
+        1000,
+        &[],
+    )
+    .expect("test");
     let v = &results[0].1;
     assert_eq!(v.kind, VerdictKind::Missed, "{v:?}");
     assert_eq!(v.proptest_rerun_cases, Some(1000));
@@ -714,7 +721,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     );
     fs::remove_file(&new_file).unwrap();
 
-    let results = test(&cfg, &paths, &[], 0).expect("test");
+    let results = test(&cfg, &paths, &[], 0, &[]).expect("test");
     let verdict = |m: &EditedMutant| {
         &results
             .iter()
@@ -820,7 +827,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     );
 
     // Tested mutants are final: a second test run has nothing to do.
-    assert!(test(&cfg, &paths, &[], 0).unwrap().is_empty());
+    assert!(test(&cfg, &paths, &[], 0, &[]).unwrap().is_empty());
     // Each verdict was saved; the journal is folded into the state.
     use cargo_quicksilver::exec::edited::{State, Status as S};
     let tested = || {
@@ -837,7 +844,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     // A new map of the same commit, with the same test packages, keeps the
     // mutants and their verdicts: nothing to capture, build or test again.
     build_map(&cfg, &paths).expect("map the same commit again");
-    assert!(test(&cfg, &paths, &[], 0).unwrap().is_empty());
+    assert!(test(&cfg, &paths, &[], 0, &[]).unwrap().is_empty());
     assert_eq!(tested(), tested_before);
     // The checkout was only read.
     assert_eq!(fs::read_to_string(&lib).unwrap(), original);

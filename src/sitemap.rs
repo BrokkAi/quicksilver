@@ -80,6 +80,9 @@ pub struct SiteMap {
     pub tests: Vec<TestInfo>,
     /// test id -> site ids the test entered with no mutant active.
     pub hits: BTreeMap<String, Vec<u32>>,
+    /// Test id -> CPU seconds of its green site recording.
+    #[serde(default)]
+    pub cpu_secs_by_test: BTreeMap<String, f64>,
     /// Tests that did not pass under the schema binary, with why.
     pub not_green: Vec<(String, String)>,
     /// Tests `[map] skip-tests` left out: never run, so neither green nor
@@ -155,7 +158,9 @@ impl SiteMap {
                 .get(&t.id)
                 .is_some_and(|hit| sites.iter().any(|s| hit.contains(s)));
             if entered && !out.iter().any(|x| x.id == t.id) {
-                out.push(t.clone());
+                let mut t = t.clone();
+                t.cpu_secs = self.cpu_secs_by_test.get(&t.id).copied();
+                out.push(t);
             }
         }
         out.sort_by(|a, b| {
@@ -685,6 +690,7 @@ mod tests {
             binary_rel: String::new(),
             cwd_rel: String::new(),
             duration_secs: 0.1,
+            cpu_secs: None,
         };
         let map = SiteMap {
             version: MAP_VERSION,
@@ -702,6 +708,7 @@ mod tests {
             build_env: BTreeMap::new(),
             tests: vec![t("p::t1")],
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
+            cpu_secs_by_test: Default::default(),
             not_green: Vec::new(),
             skipped_tests: Vec::new(),
             not_green_output: Default::default(),
@@ -745,8 +752,9 @@ mod tests {
             binary_rel: String::new(),
             cwd_rel: String::new(),
             duration_secs: secs,
+            cpu_secs: None,
         };
-        let map = SiteMap {
+        let mut map = SiteMap {
             version: MAP_VERSION,
             map_id: "x".into(),
             commit: String::new(),
@@ -761,6 +769,7 @@ mod tests {
             test_packages: Vec::new(),
             build_env: BTreeMap::new(),
             tests: vec![t("slow", 2.0), t("fast", 0.1), t("other", 0.5)],
+            cpu_secs_by_test: Default::default(),
             hits: [
                 ("slow".to_string(), vec![1, 2]),
                 ("fast".to_string(), vec![2]),
@@ -782,6 +791,13 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(ids, vec!["fast", "slow"]);
+        map.cpu_secs_by_test.insert("slow".into(), 0.25);
+        assert_eq!(map.tests_entering(&[1])[0].cpu_secs, Some(0.25));
+        let mut old = serde_json::to_value(&map).unwrap();
+        old.as_object_mut().unwrap().remove("cpu_secs_by_test");
+        let old: SiteMap = serde_json::from_value(old).unwrap();
+        assert_eq!(old.tests_entering(&[1])[0].cpu_secs, None);
+        assert_eq!(old.tests_entering(&[1])[0].duration_secs, 2.0);
         assert!(map.tests_entering(&[9]).is_empty());
     }
 }

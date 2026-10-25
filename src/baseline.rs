@@ -150,6 +150,7 @@ pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<Tes
             binary_rel: String::new(),
             cwd_rel: cwd,
             duration_secs: time,
+            cpu_secs: None,
         });
     }
     Ok(tests)

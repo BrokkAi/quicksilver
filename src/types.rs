@@ -35,6 +35,9 @@ pub struct TestInfo {
     /// Package directory relative to the workspace root (test cwd).
     pub cwd_rel: String,
     pub duration_secs: f64,
+    /// CPU of the green recording; absent in older plans and maps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_secs: Option<f64>,
 }
 
 impl TestInfo {

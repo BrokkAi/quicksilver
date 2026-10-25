@@ -284,8 +284,17 @@ fn parse_positive_split(value: &str) -> Result<usize, String> {
         .ok_or_else(|| "--split must be a positive integer".into())
 }
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgainKind {
+    Timeouts,
+    Errored,
+}
+
 #[derive(Args, Debug, Default)]
 pub struct TestArgs {
+    /// Repeat timeout or errored verdicts (repeatable); combines with --mutant.
+    #[arg(long, value_enum)]
+    pub again: Vec<AgainKind>,
     /// Only mutants whose id starts with this (repeatable).
     #[arg(long = "mutant")]
     pub mutants: Vec<String>,

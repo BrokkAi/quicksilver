@@ -42,9 +42,7 @@ pub enum Status {
     /// Captured, not yet compiled.
     Pending,
     /// rustc rejected one of its bodies.
-    Unviable {
-        message: String,
-    },
+    Unviable { message: String },
     /// In the staged binaries of `generation`, switched on by `activation`.
     /// A `direct` mutant (of an `impl Trait` function) has binaries of its
     /// own that always contain it, in `gen-N/direct-<id>`.
@@ -56,7 +54,35 @@ pub enum Status {
     },
     Tested {
         verdict: Verdict,
+        /// Absent in old states, whose binaries cannot safely be reused.
+        #[serde(default)]
+        built: Option<TestedBuild>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TestedBuild {
+    pub generation: u32,
+    pub activation: Vec<(u32, u32)>,
+    pub direct: bool,
+}
+
+impl Status {
+    fn tested(&self, verdict: Verdict) -> Self {
+        let built = match self {
+            Status::Built {
+                generation,
+                activation,
+                direct,
+            } => Some(TestedBuild {
+                generation: *generation,
+                activation: activation.clone(),
+                direct: *direct,
+            }),
+            _ => None,
+        };
+        Status::Tested { verdict, built }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -175,9 +201,7 @@ impl State {
         if let Some(r) = self.records.iter_mut().find(|r| r.mutant.id == entry.id) {
             if matches!(r.status, Status::Built { generation, .. } if generation == entry.generation)
             {
-                r.status = Status::Tested {
-                    verdict: entry.verdict,
-                };
+                r.status = r.status.tested(entry.verdict);
             }
         }
     }
@@ -241,7 +265,7 @@ impl State {
             for r in &mut self.records {
                 let stays = match &r.status {
                     Status::Pending | Status::Unviable { .. } => true,
-                    Status::Tested { verdict } => verdict.kind == VerdictKind::Caught,
+                    Status::Tested { verdict, .. } => verdict.kind == VerdictKind::Caught,
                     Status::Built { .. } => false,
                 };
                 if !stays {
@@ -823,6 +847,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         build_env: cfg.build_env.clone(),
         tests,
         hits,
+        cpu_secs_by_test: recording.cpu_secs_by_test.clone().into_iter().collect(),
         not_green: recording.not_green.clone(),
         skipped_tests,
         not_green_output: recording.not_green_output.clone(),
@@ -1621,6 +1646,67 @@ fn time_left(elapsed: f64, decided_cost: f64, total_cost: f64) -> Option<f64> {
         .then(|| elapsed * (total_cost - decided_cost).max(0.0) / decided_cost)
 }
 
+/// Restore selected verdicts only when their actual staged executables remain.
+fn prepare_again(
+    state: &mut State,
+    paths: &Paths,
+    only: &[String],
+    again: &[crate::cli::AgainKind],
+) -> usize {
+    use crate::cli::AgainKind;
+    let binaries_exist = |dir: &Path| {
+        std::fs::read_to_string(dir.join("manifest.json"))
+            .ok()
+            .and_then(|text| {
+                serde_json::from_str::<crate::exec::test::BinariesManifest>(&text).ok()
+            })
+            .is_some_and(|manifest| {
+                !manifest.tests.is_empty()
+                    && manifest.tests.iter().all(|t| dir.join(&t.binary).is_file())
+            })
+    };
+    let mut changed = 0;
+    for r in &mut state.records {
+        if !only.is_empty() && !only.iter().any(|p| r.mutant.id.starts_with(p)) {
+            continue;
+        }
+        let Status::Tested { verdict, built } = &r.status else {
+            continue;
+        };
+        let selected = again.iter().any(|kind| match kind {
+            AgainKind::Timeouts => {
+                verdict.kind == VerdictKind::Timeout
+                    || (verdict.kind == VerdictKind::Caught
+                        && verdict
+                            .message
+                            .as_deref()
+                            .is_some_and(|m| m.starts_with(crate::types::TIMEOUT_PREFIX)))
+            }
+            AgainKind::Errored => verdict.kind == VerdictKind::Errored,
+        });
+        if !selected {
+            continue;
+        }
+        r.status = match built {
+            Some(b)
+                if b.generation == state.generation
+                    && binaries_exist(&generation_dir(paths, b.generation))
+                    && (!b.direct
+                        || binaries_exist(&direct_dir(paths, b.generation, &r.mutant.id))) =>
+            {
+                Status::Built {
+                    generation: b.generation,
+                    activation: b.activation.clone(),
+                    direct: b.direct,
+                }
+            }
+            _ => Status::Pending,
+        };
+        changed += 1;
+    }
+    changed
+}
+
 /// Run every mutant built into the current generation (or those whose id
 /// starts with one of `only`) against the tests that entered its sites.
 /// With `proptest_cases` above zero, a survivor judged only by proptest
@@ -1630,6 +1716,7 @@ pub fn test(
     paths: &Paths,
     only: &[String],
     proptest_cases: u32,
+    again: &[crate::cli::AgainKind],
 ) -> Result<Vec<(EditedMutant, Verdict)>> {
     let _lock = StateLock::acquire(paths)?;
     let map = SiteMap::load(paths)?
@@ -1638,6 +1725,9 @@ pub fn test(
     let reconciled = state.reconcile(&map);
     if reconciled != Reconciled::default() {
         reconciled.report();
+        state.save(paths)?;
+    }
+    if prepare_again(&mut state, paths, only, again) > 0 {
         state.save(paths)?;
     }
     let pending = state
@@ -1868,10 +1958,13 @@ pub fn test(
     }
     let count = |k: VerdictKind| results.iter().filter(|(_, v)| v.kind == k).count();
     progress.finish(&format!(
-        "tested {} mutant(s) in {:.1}s: {} caught, {} missed, {} not covered, {} timeout, {} errored",
+        "tested {} mutant(s) in {:.1}s: {} caught{}, {} missed, {} not covered, {} timeout, {} errored",
         results.len(),
         progress.elapsed_secs(),
         count(VerdictKind::Caught),
+        crate::report::caught_details(
+            results.iter().filter(|(_, v)| v.kind == VerdictKind::Caught && v.message.as_deref().is_some_and(|m| m.starts_with(crate::types::TIMEOUT_PREFIX))).count(),
+            results.iter().filter(|(_, v)| v.kind == VerdictKind::Caught && v.message.as_deref().is_some_and(|m| m.starts_with(crate::types::CRASH_PREFIX))).count()),
         count(VerdictKind::Missed),
         count(VerdictKind::NotCovered),
         count(VerdictKind::Timeout),
@@ -1880,7 +1973,7 @@ pub fn test(
     results.sort_by(|a, b| a.0.id.cmp(&b.0.id));
     for (m, v) in &results {
         if let Some(r) = state.records.iter_mut().find(|r| r.mutant.id == m.id) {
-            r.status = Status::Tested { verdict: v.clone() };
+            r.status = r.status.tested(v.clone());
         }
     }
     state.save(paths)?;
@@ -2033,6 +2126,7 @@ mod tests {
             build_env: BTreeMap::new(),
             tests: Vec::new(),
             hits: BTreeMap::new(),
+            cpu_secs_by_test: Default::default(),
             not_green: Vec::new(),
             skipped_tests: Vec::new(),
             not_green_output: Default::default(),
@@ -2098,6 +2192,7 @@ mod tests {
                     "p.a",
                     Status::Tested {
                         verdict: verdict(VerdictKind::Caught),
+                        built: None,
                     },
                 ),
                 record(
@@ -2106,6 +2201,7 @@ mod tests {
                     "p.b",
                     Status::Tested {
                         verdict: verdict(VerdictKind::Missed),
+                        built: None,
                     },
                 ),
                 record(
@@ -2132,7 +2228,9 @@ mod tests {
                     Status::Pending => "pending",
                     Status::Unviable { .. } => "unviable",
                     Status::Built { .. } => "built",
-                    Status::Tested { verdict } if verdict.kind == VerdictKind::Caught => "caught",
+                    Status::Tested { verdict, .. } if verdict.kind == VerdictKind::Caught => {
+                        "caught"
+                    }
                     Status::Tested { .. } => "tested",
                 };
                 (r.mutant.id.clone(), s)
@@ -2199,6 +2297,136 @@ mod tests {
     }
 
     #[test]
+    fn again_restores_current_builds_and_requires_build_for_stale_or_missing_ones() {
+        use crate::cli::AgainKind;
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tree(tmp.path(), "", tmp.path());
+        let dir = generation_dir(&paths, 3);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("test-bin"), b"staged binary").unwrap();
+        let manifest = crate::exec::test::BinariesManifest {
+            mutant_id: "schema".into(),
+            tests: vec![crate::exec::test::ManifestTest {
+                name: "t".into(),
+                binary: "test-bin".into(),
+                cwd_rel: String::new(),
+                id: "t".into(),
+            }],
+        };
+        std::fs::write(
+            dir.join("manifest.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        let mut timeout = verdict(VerdictKind::Caught);
+        timeout.message = Some(format!("{}: runaway", crate::types::TIMEOUT_PREFIX));
+        let mut state = State {
+            generation: 3,
+            records: vec![
+                record("retry-timeout", 1, "p.a", built().tested(timeout)),
+                record(
+                    "retry-error",
+                    1,
+                    "p.a",
+                    built().tested(verdict(VerdictKind::Errored)),
+                ),
+                record(
+                    "retry-inconclusive",
+                    1,
+                    "p.a",
+                    built().tested(verdict(VerdictKind::Timeout)),
+                ),
+                record(
+                    "retry-missed",
+                    1,
+                    "p.a",
+                    built().tested(verdict(VerdictKind::Missed)),
+                ),
+                record(
+                    "other-timeout",
+                    1,
+                    "p.a",
+                    built().tested(verdict(VerdictKind::Timeout)),
+                ),
+                record("untested", 1, "p.a", built()),
+            ],
+            ..State::default()
+        };
+        let original = state.clone();
+        assert_eq!(
+            prepare_again(
+                &mut state,
+                &paths,
+                &["retry-".into()],
+                &[AgainKind::Timeouts, AgainKind::Errored]
+            ),
+            3
+        );
+        for id in [
+            "retry-timeout",
+            "retry-error",
+            "retry-inconclusive",
+            "untested",
+        ] {
+            assert_eq!(state.find(id).unwrap().status, built());
+        }
+        assert!(matches!(
+            state.find("retry-missed").unwrap().status,
+            Status::Tested { .. }
+        ));
+        assert!(matches!(
+            state.find("other-timeout").unwrap().status,
+            Status::Tested { .. }
+        ));
+        // The direct flag and activation survive persistence and restoration.
+        state = original.clone();
+        let direct = Status::Built {
+            generation: 3,
+            activation: vec![(1, 7)],
+            direct: true,
+        };
+        state.records[0].status = direct.tested(verdict(VerdictKind::Timeout));
+        assert_eq!(
+            prepare_again(
+                &mut state,
+                &paths,
+                &["retry-timeout".into()],
+                &[AgainKind::Timeouts]
+            ),
+            1
+        );
+        assert_eq!(state.records[0].status, Status::Pending);
+        let direct_dir = direct_dir(&paths, 3, "retry-timeout");
+        std::fs::create_dir_all(&direct_dir).unwrap();
+        std::fs::copy(dir.join("manifest.json"), direct_dir.join("manifest.json")).unwrap();
+        std::fs::write(direct_dir.join("test-bin"), b"direct binary").unwrap();
+        state.records[0].status = direct.tested(verdict(VerdictKind::Timeout));
+        prepare_again(
+            &mut state,
+            &paths,
+            &["retry-timeout".into()],
+            &[AgainKind::Timeouts],
+        );
+        assert_eq!(state.records[0].status, direct);
+        // Earlier generations and old records with no build metadata are pending.
+        state = original.clone();
+        state.generation = 4;
+        prepare_again(&mut state, &paths, &[], &[AgainKind::Timeouts]);
+        assert_eq!(state.records[0].status, Status::Pending);
+        let old: Status = serde_json::from_value(
+            serde_json::json!({"status":"tested", "verdict":verdict(VerdictKind::Errored)}),
+        )
+        .unwrap();
+        state.records[1].status = old;
+        prepare_again(&mut state, &paths, &[], &[AgainKind::Errored]);
+        assert_eq!(state.records[1].status, Status::Pending);
+        state = original;
+        std::fs::remove_file(dir.join("test-bin")).unwrap();
+        prepare_again(&mut state, &paths, &[], &[AgainKind::Timeouts]);
+        assert_eq!(state.records[0].status, Status::Pending);
+    }
+
+    #[test]
     fn verdicts_in_the_journal_survive_a_stopped_run() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = Paths::for_tree(tmp.path(), "", tmp.path());
@@ -2227,6 +2455,9 @@ mod tests {
         .join("\n");
         std::fs::write(State::journal_path(&paths), journal).unwrap();
         let loaded = State::load(&paths).unwrap();
+        assert!(
+            matches!(&loaded.find("built").unwrap().status, Status::Tested { built: Some(b), .. } if b.generation == 3 && b.activation == vec![(1, 1)] && !b.direct)
+        );
         let s = statuses(&loaded);
         assert!(s.contains(&("built".into(), "tested")), "{s:?}");
         assert!(s.contains(&("built2".into(), "built")), "{s:?}");

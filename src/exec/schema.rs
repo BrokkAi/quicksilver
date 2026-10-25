@@ -652,6 +652,7 @@ fn run_crate(
                     for t in &mut selected.tests {
                         if let Some(secs) = recording.recorded_secs(t) {
                             t.duration_secs = secs;
+                            t.cpu_secs = recording.recorded_cpu_secs(t);
                         }
                     }
                     if selected.tests.is_empty() {
@@ -1434,6 +1435,7 @@ mod tests {
             binary_rel: "deps/p".into(),
             cwd_rel: "p".into(),
             duration_secs: dur,
+            cpu_secs: None,
         }
     }
 

@@ -3,7 +3,6 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-use wait_timeout::ChildExt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
@@ -32,14 +31,96 @@ pub fn run_command_timeout(mut cmd: Command, timeout: Duration) -> Result<WaitRe
         cmd.process_group(0);
     }
     let mut child = cmd.spawn().context("spawn")?;
-    match child.wait_timeout(timeout).context("wait_timeout")? {
-        Some(status) => Ok(WaitResult::Exited(status)),
+    Ok(wait_measured(&mut child, timeout)?.0)
+}
+
+/// Exactly one waiter owns the pid. Never call Child::wait after wait4.
+#[cfg(unix)]
+fn wait_measured(child: &mut std::process::Child, timeout: Duration) -> Result<(WaitResult, f64)> {
+    use std::os::unix::process::ExitStatusExt;
+    let pid = child.id() as libc::pid_t;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut status = 0;
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        let result = loop {
+            let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+            if rc >= 0 {
+                break Ok((
+                    ExitStatus::from_raw(status),
+                    usage.ru_utime.tv_sec as f64
+                        + usage.ru_utime.tv_usec as f64 / 1e6
+                        + usage.ru_stime.tv_sec as f64
+                        + usage.ru_stime.tv_usec as f64 / 1e6,
+                ));
+            }
+            let err = std::io::Error::last_os_error();
+            if err.kind() != std::io::ErrorKind::Interrupted {
+                break Err(err);
+            }
+        };
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let (status, cpu) = result?;
+            Ok((WaitResult::Exited(status), cpu))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            #[cfg(target_os = "linux")]
+            let snapshot = group_cpu_secs(pid);
+            kill_tree(child);
+            let (_, cpu) = rx.recv().context("wait4 reaper stopped")??;
+            #[cfg(target_os = "linux")]
+            let cpu = snapshot?.max(cpu);
+            Ok((WaitResult::Timeout, cpu))
+        }
+        Err(err) => Err(err).context("wait4 reaper stopped"),
+    }
+}
+
+#[cfg(not(unix))]
+fn wait_measured(child: &mut std::process::Child, timeout: Duration) -> Result<(WaitResult, f64)> {
+    use wait_timeout::ChildExt;
+    match child.wait_timeout(timeout)? {
+        Some(status) => Ok((WaitResult::Exited(status), 0.0)),
         None => {
-            kill_tree(&child);
+            kill_tree(child);
             let _ = child.wait();
-            Ok(WaitResult::Timeout)
+            Ok((WaitResult::Timeout, 0.0))
         }
     }
+}
+
+/// Include live descendants as well as CPU already reaped by group members.
+#[cfg(target_os = "linux")]
+fn group_cpu_secs(group: libc::pid_t) -> Result<f64> {
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    anyhow::ensure!(ticks > 0, "could not read process CPU clock rate");
+    let mut total = 0.0;
+    for entry in std::fs::read_dir("/proc")?.flatten() {
+        if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        // comm can contain spaces and parentheses; fields begin after its last ')'.
+        let Some((_, fields)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let fields: Vec<_> = fields.split_whitespace().collect();
+        if fields.get(2).and_then(|s| s.parse::<i32>().ok()) != Some(group) {
+            continue;
+        }
+        for i in [11, 12, 13, 14] {
+            total += fields
+                .get(i)
+                .and_then(|s| s.parse::<f64>().ok())
+                .unwrap_or(0.0);
+        }
+    }
+    Ok(total / ticks as f64)
 }
 
 pub fn classify_exit(status: ExitStatus) -> RunStatus {
@@ -69,7 +150,7 @@ pub fn run_exact(
     cwd: &Path,
     timeout: Duration,
 ) -> Result<RunStatus> {
-    run_exact_with_env(binary, test_name, cwd, timeout, &[])
+    Ok(run_exact_with_env(binary, test_name, cwd, timeout, &[])?.0)
 }
 
 pub fn run_exact_with_env(
@@ -78,27 +159,10 @@ pub fn run_exact_with_env(
     cwd: &Path,
     timeout: Duration,
     extra_env: &[(String, String)],
-) -> Result<RunStatus> {
-    let mut cmd = Command::new(binary);
-    cmd.current_dir(cwd);
-    cmd.arg("--exact").arg(test_name);
-    cmd.stdout(Stdio::null());
-    cmd.stderr(Stdio::null());
-    // Never inherit a mutant from the parent. Null-schema and identity gates
-    // rely on an empty extra_env meaning "no mutant active". Site recording
-    // is likewise only on when the caller asks for it.
-    cmd.env_remove("QS_MUTANT");
-    cmd.env_remove("QS_RECORD_SITES");
-    let _sandbox = sandbox(&mut cmd)?;
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    match run_command_timeout(cmd, timeout)
-        .with_context(|| format!("spawn {}", binary.display()))?
-    {
-        WaitResult::Exited(status) => Ok(classify_exit(status)),
-        WaitResult::Timeout => Ok(RunStatus::Timeout),
-    }
+) -> Result<(RunStatus, Duration, f64)> {
+    let (status, wall, cpu, _, _) =
+        run_capturing(binary, test_name, cwd, timeout, extra_env, false, false)?;
+    Ok((status, wall, cpu))
 }
 
 /// Keep at most this much stderr. A panicking test prints its message and
@@ -106,10 +170,10 @@ pub fn run_exact_with_env(
 pub const STDERR_CAP: usize = 64 * 1024;
 
 /// Like [`run_exact_with_env`], but stderr is piped and drained into a capped
-/// buffer. Returns the wall time and the captured tail (lossy UTF-8).
+/// buffer. Returns wall time, CPU seconds, and the captured tail (lossy UTF-8).
 ///
 /// The reader thread drains continuously so the child never blocks on a full
-/// pipe, including while `wait_timeout` is still counting down. After the wait
+/// pipe, including while the deadline is still counting down. After the wait
 /// (and the tree kill on timeout) the write end is gone, the reader sees EOF,
 /// and the join returns.
 pub fn run_exact_capture_with_env(
@@ -118,10 +182,10 @@ pub fn run_exact_capture_with_env(
     cwd: &Path,
     timeout: Duration,
     extra_env: &[(String, String)],
-) -> Result<(RunStatus, Duration, String)> {
-    let (status, elapsed, _, stderr) =
-        run_capturing(binary, test_name, cwd, timeout, extra_env, false)?;
-    Ok((status, elapsed, stderr))
+) -> Result<(RunStatus, Duration, f64, String)> {
+    let (status, elapsed, cpu, _, stderr) =
+        run_capturing(binary, test_name, cwd, timeout, extra_env, false, true)?;
+    Ok((status, elapsed, cpu, stderr))
 }
 
 /// Like [`run_exact_capture_with_env`], but stdout is kept too, before
@@ -132,15 +196,15 @@ pub fn run_exact_capture_output_with_env(
     cwd: &Path,
     timeout: Duration,
     extra_env: &[(String, String)],
-) -> Result<(RunStatus, Duration, String)> {
-    let (status, elapsed, stdout, stderr) =
-        run_capturing(binary, test_name, cwd, timeout, extra_env, true)?;
+) -> Result<(RunStatus, Duration, f64, String)> {
+    let (status, elapsed, cpu, stdout, stderr) =
+        run_capturing(binary, test_name, cwd, timeout, extra_env, true, true)?;
     let mut output = stdout;
     if !output.is_empty() && !stderr.is_empty() && !output.ends_with('\n') {
         output.push('\n');
     }
     output.push_str(&stderr);
-    Ok((status, elapsed, output))
+    Ok((status, elapsed, cpu, output))
 }
 
 /// Run one test with stderr, and with `stdout` also stdout, drained into
@@ -153,7 +217,8 @@ fn run_capturing(
     timeout: Duration,
     extra_env: &[(String, String)],
     stdout: bool,
-) -> Result<(RunStatus, Duration, String, String)> {
+    capture: bool,
+) -> Result<(RunStatus, Duration, f64, String, String)> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd);
     cmd.arg("--exact").arg(test_name);
@@ -162,7 +227,11 @@ fn run_capturing(
     } else {
         Stdio::null()
     });
-    cmd.stderr(Stdio::piped());
+    cmd.stderr(if capture {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     // Never inherit a mutant from the parent; an empty extra_env means
     // "no mutant active", which is what the null runs depend on.
     cmd.env_remove("QS_MUTANT");
@@ -184,14 +253,7 @@ fn run_capturing(
     let reader = child.stderr.take().map(drain_tail);
     let out_reader = child.stdout.take().map(drain_tail);
 
-    let wait = match child.wait_timeout(timeout).context("wait_timeout")? {
-        Some(status) => WaitResult::Exited(status),
-        None => {
-            kill_tree(&child);
-            let _ = child.wait();
-            WaitResult::Timeout
-        }
-    };
+    let (wait, cpu) = wait_measured(&mut child, timeout)?;
     let elapsed = start.elapsed();
     let text = |h: Option<std::thread::JoinHandle<Vec<u8>>>| {
         let bytes = h.map(|h| h.join().unwrap_or_default()).unwrap_or_default();
@@ -202,7 +264,7 @@ fn run_capturing(
         WaitResult::Exited(st) => classify_exit(st),
         WaitResult::Timeout => RunStatus::Timeout,
     };
-    Ok((status, elapsed, stdout, stderr))
+    Ok((status, elapsed, cpu, stdout, stderr))
 }
 
 /// Read `pipe` to its end on a new thread, keeping the last [`STDERR_CAP`]
@@ -330,7 +392,7 @@ mod tests {
                 Err(e) => panic!("spawn failed for a non-ETXTBSY reason: {e:#}"),
             }
         }
-        let (status, _dur, output) = result.expect("script stayed ETXTBSY after 50 tries");
+        let (status, _dur, _cpu, output) = result.expect("script stayed ETXTBSY after 50 tries");
         let _ = std::fs::remove_file(script);
         assert_eq!(status, RunStatus::Failed);
         assert_eq!(output, "panicked at src/lib.rs:3\na warning\n");
@@ -373,11 +435,42 @@ mod tests {
                 Err(e) => panic!("spawn failed for a non-ETXTBSY reason: {e:#}"),
             }
         }
-        let (status, _dur, err) = result.expect("script stayed ETXTBSY after 50 tries");
+        let (status, _dur, _cpu, err) = result.expect("script stayed ETXTBSY after 50 tries");
         assert_eq!(status, RunStatus::Failed);
         assert!(err.len() <= STDERR_CAP, "cap not applied: {}", err.len());
         assert!(err.trim_end().ends_with("line 20000"), "kept head not tail");
         let _ = std::fs::remove_file(script);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deadline_counts_cpu_of_a_live_busy_child() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "sh -c 'while :; do :; done' & wait"]);
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        let mut child = cmd.spawn().unwrap();
+        let (status, cpu) = wait_measured(&mut child, Duration::from_secs(1)).unwrap();
+        assert!(matches!(status, WaitResult::Timeout));
+        // Assert CPU accounting, never elapsed wall time on this shared host.
+        assert!(cpu > 0.0, "live descendant CPU was omitted: {cpu}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_exit_counts_waited_child_cpu() {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args([
+            "-c",
+            "sh -c 'i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done' & wait",
+        ]);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().unwrap();
+        let (status, cpu) = wait_measured(&mut child, Duration::from_secs(60)).unwrap();
+        assert!(matches!(status, WaitResult::Exited(st) if st.success()));
+        assert!(cpu > 0.0);
     }
 
     #[test]

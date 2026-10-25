@@ -134,6 +134,7 @@ pub fn parse_nextest_list(
                     binary_rel: binary_rel.clone(),
                     cwd_rel: cwd_rel.clone(),
                     duration_secs: 0.001,
+                    cpu_secs: None,
                 });
             }
         }
@@ -187,6 +188,7 @@ mod tests {
             binary_rel: "deps/pkg".into(),
             cwd_rel: "pkg".into(),
             duration_secs: dur,
+            cpu_secs: None,
         }
     }
 

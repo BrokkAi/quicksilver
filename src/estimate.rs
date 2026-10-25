@@ -341,6 +341,7 @@ mod tests {
                 binary_rel: "deps/t".into(),
                 cwd_rel: pkg.into(),
                 duration_secs: 0.5,
+                cpu_secs: None,
             }],
             estimated_cost_secs: 1.5,
         }

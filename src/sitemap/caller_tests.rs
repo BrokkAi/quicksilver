@@ -47,6 +47,7 @@ fn map(repo: &Path, sites: Vec<MapSite>) -> SiteMap {
         build_env: BTreeMap::new(),
         tests: Vec::new(),
         hits: BTreeMap::new(),
+        cpu_secs_by_test: Default::default(),
         not_green: Vec::new(),
         skipped_tests: Vec::new(),
         not_green_output: Default::default(),

@@ -230,6 +230,7 @@ mod tests {
             binary_rel: binary_rel.into(),
             cwd_rel: cwd_rel.into(),
             duration_secs: 0.1,
+            cpu_secs: None,
         }
     }
 

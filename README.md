@@ -69,7 +69,7 @@ type, such as `0`, `true`, `None` or `Default::default()`. It prints a
 summary, here for clap's `clap_lex` package:
 
 ```
-outcomes: 67 total — 40 caught (0 by crash, 0 by timeout), 0 missed, 13 not covered, 14 unviable, 0 errored, 0 timeout (51 mutant builds, 2 cargo invocations)
+outcomes: 67 total — 40 caught, 0 missed, 13 not covered, 14 unviable, 0 errored, 0 timeout (51 mutant builds, 2 cargo invocations)
 sandbox: 240 test processes ran with their own HOME and TMPDIR; the largest left 1.7 KiB; all deleted
 ```
 
@@ -263,14 +263,24 @@ removed or renamed shows as gone.
   difference. These are the ones to read.
 - **Not covered**: no test reaches the changed function.
 - **Unviable**: the mutant does not compile.
-- **Caught by timeout**: a test passes quickly without the mutant and runs
-  past its budget with it, twice. The mutant made the code hang or slow
-  down, which the test (or its own deadline) noticed; it counts as caught.
-- **Timeout**: the same, but the test is slow even without the mutant, so
-  load may explain it. `[test-budget]` in `quicksilver.toml` gives named
-  tests a longer budget, for example `"my_crate::tests::waits" = 60.0`.
+- **Caught by timeout**: the mutant uses at least three times the test's
+  recorded CPU time plus one second, or it times out again with four times
+  the wall budget while using less than 5% of a CPU (blocked, for example
+  by a deadlock). These kills appear separately in the caught total.
+- **Timeout**: inconclusive. The test still exceeds four times its budget
+  at a normal CPU rate without using three times its usual CPU. Host load
+  is the likely cause. `[test-budget]` in `quicksilver.toml` gives named
+  tests a longer minimum budget, for example `"my_crate::tests::waits" = 60.0`.
 - **Errored**: a test could not run properly, for example because it fails
   even without the mutant.
+
+Repeat timeout kills and inconclusive timeouts on a quieter host with
+`cargo quicksilver test --again timeouts`. Use `--again errored` for errors,
+or repeat `--again` to select both kinds. `--mutant PREFIX` limits these
+selections to matching ids. Built, untested mutants are also tested. Current
+staged binaries are reused; if their generation is stale or their files are
+missing, run `cargo quicksilver build` first. Old states without saved build
+metadata also need a build before repeating verdicts.
 
 
 ## Choose the tests the map uses

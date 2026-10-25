@@ -65,6 +65,7 @@ struct ResolvedTest {
     /// directory, even when the caller's environment names another one.
     target_dir: PathBuf,
     duration_secs: f64,
+    cpu_secs: f64,
 }
 
 /// The environment every test process gets on top of the caller's: the tree's
@@ -84,40 +85,6 @@ pub struct ObservedRun {
     pub observations: Vec<TestObservation>,
     /// True only when every selected test was executed to a canonical result.
     pub complete: bool,
-}
-
-/// Timeout confirmations are serialized process-wide. One costs up to a
-/// 120s calibration run; letting all test-pool threads do that at once would
-/// both swamp the box and make every measured duration useless. Failure
-/// confirmations re-run a test that just failed fast, so they run in
-/// parallel: serializing them made every caught mutant queue behind every
-/// other (itertools: 90 s of a 147 s run at 3 of 64 cores busy).
-static CONFIRM_LOCK: Mutex<()> = Mutex::new(());
-
-fn confirm_lock() -> std::sync::MutexGuard<'static, ()> {
-    CONFIRM_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Null-run durations that timeout calibration measured in this process, by
-/// test id. Baseline timings come from an unloaded nextest run, so under a
-/// full test pool a test can overrun its budget with no mutant at all. Once
-/// calibrated, a test keeps that duration for every later mutant: on bifrost
-/// one test was calibrated 55 times in one run and 136 first passes timed
-/// out only because of their budget.
-static CALIBRATED: LazyLock<Mutex<HashMap<String, f64>>> = LazyLock::new(Default::default);
-
-fn calibrated_secs(t: &ResolvedTest) -> Option<f64> {
-    CALIBRATED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(&t.id)
-        .copied()
-}
-
-/// What a passing run of `t` is expected to take: its baseline duration, or
-/// its calibrated one when that is longer.
-fn expected_secs(t: &ResolvedTest) -> f64 {
-    calibrated_secs(t).map_or(t.duration_secs, |c| c.max(t.duration_secs))
 }
 
 /// Minimum budgets per test id or name, from `[test-budget]` in
@@ -143,10 +110,14 @@ fn with_minimum(t: &ResolvedTest, budget: Duration) -> Duration {
         .fold(budget, |b, m| b.max(*m))
 }
 
-/// The share of its calibration budget a test must stay under with no
-/// mutant for a timeout under the mutant to count as caught. A test that needs more is
-/// slow on its own, and load could explain the timeout.
-const CAUGHT_BY_TIMEOUT_SHARE: f64 = 1.0 / 3.0;
+/// CPU growth this large establishes extra computation independently of host load.
+const RUNAWAY_CPU_FACTOR: f64 = 3.0;
+/// Allow one second of measurement noise for short tests.
+const RUNAWAY_CPU_ALLOWANCE: f64 = 1.0;
+/// Retry with extra wall time so a loaded host can finish ordinary computation.
+const TIMEOUT_RETRY_FACTOR: u32 = 4;
+/// Below five percent of a CPU, the test is waiting rather than computing.
+const BLOCKED_CPU_SHARE: f64 = 0.05;
 
 /// Cap on the stderr tail copied into an `Outcome` message. The capture
 /// buffer holds 64KB; outcomes.jsonl does not need all of it.
@@ -206,7 +177,7 @@ pub const DIRECT_MUTANT_ENV: &str = "QS_DIRECT_MUTANT";
 
 /// [`run_mutant_tests_observed`] for binaries that always contain the
 /// mutant. `null_run_dir` holds binaries of the same tests without it: the
-/// confirmation runs (a failure's null run, a timeout's calibration) use
+/// confirmation runs (a failure's null run) use
 /// those. `extra_env` must contain [`DIRECT_MUTANT_ENV`].
 pub fn run_mutant_tests_against(
     planned: &PlannedMutant,
@@ -233,7 +204,7 @@ pub fn run_mutant_tests_against(
         }
         None => HashMap::new(),
     };
-    let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, String)> {
+    let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, f64, String)> {
         let mut spec = spec.clone();
         if !null_binary.is_empty() && !spec.env.iter().any(|(k, _)| k == DIRECT_MUTANT_ENV) {
             if let Some(null) = null_binary.get(&spec.binary) {
@@ -250,15 +221,14 @@ pub fn run_mutant_tests_against(
                 &spec.env,
             )
         } else {
-            let started = Instant::now();
-            let status = run_exact_with_env(
+            let (status, wall, cpu) = run_exact_with_env(
                 &spec.binary,
                 &spec.test_name,
                 &spec.cwd,
                 spec.timeout,
                 &spec.env,
             )?;
-            Ok((status, started.elapsed(), String::new()))
+            Ok((status, wall, cpu, String::new()))
         }
     };
     run_selected_tests_observed(
@@ -281,6 +251,7 @@ pub struct SiteRecording {
     /// binary. Mutant budgets in sites mode come from this, not from the
     /// baseline binary's timing times a guessed schema slowdown.
     pub secs_by_test: std::collections::HashMap<String, f64>,
+    pub cpu_secs_by_test: std::collections::HashMap<String, f64>,
     /// Tests that did not pass with no mutant active. They select nothing:
     /// the schema binary cannot judge a mutant with a test that is not green.
     pub not_green: Vec<(String, String)>,
@@ -290,6 +261,12 @@ pub struct SiteRecording {
 }
 
 impl SiteRecording {
+    pub fn recorded_cpu_secs(&self, test: &crate::types::TestInfo) -> Option<f64> {
+        [test.id.as_str(), test.name.as_str()]
+            .iter()
+            .find_map(|key| self.cpu_secs_by_test.get(*key).copied())
+    }
+
     pub fn recorded_secs(&self, test: &crate::types::TestInfo) -> Option<f64> {
         [test.id.as_str(), test.name.as_str()]
             .iter()
@@ -384,7 +361,8 @@ fn record_all(
             t.id.clone()
         };
         match result {
-            Ok((sites, secs)) => {
+            Ok((sites, secs, cpu)) => {
+                recording.cpu_secs_by_test.insert(key.clone(), cpu);
                 recording.secs_by_test.insert(key.clone(), secs);
                 recording.sites_by_test.insert(key, sites);
             }
@@ -492,7 +470,7 @@ impl std::fmt::Display for RecordFailure {
 
 /// One test's recorded sites and wall seconds, or why it selects nothing
 /// with the end of its output.
-type RecordResult = Result<(std::collections::BTreeSet<u32>, f64), (RecordFailure, String)>;
+type RecordResult = Result<(std::collections::BTreeSet<u32>, f64, f64), (RecordFailure, String)>;
 
 fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> RecordResult {
     let other = |why: String| (RecordFailure::Other(why), String::new());
@@ -505,7 +483,7 @@ fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> 
             path.to_string_lossy().into_owned(),
         )],
     );
-    let (status, elapsed, output) =
+    let (status, elapsed, cpu, output) =
         run_exact_capture_output_with_env(&t.binary, &t.name, &t.cwd, timeout, &env)
             .map_err(|err| other(format!("{err:#}")))?;
     let secs = elapsed.as_secs_f64();
@@ -527,6 +505,7 @@ fn record_one(t: &ResolvedTest, index: usize, dir: &Path, timeout: Duration) -> 
     Ok((
         text.lines().filter_map(|l| l.trim().parse().ok()).collect(),
         secs,
+        cpu,
     ))
 }
 
@@ -572,23 +551,33 @@ fn resolve_tests(
 
     Ok(tests
         .into_iter()
-        .map(|t| ResolvedTest {
-            id: t.id.clone(),
-            name: t.name.clone(),
-            binary: run_dir.join(&t.binary),
-            cwd: if t.cwd_rel.is_empty() {
-                tree_root.to_path_buf()
-            } else {
-                tree_root.join(&t.cwd_rel)
-            },
-            target_dir: tree_root.join("target"),
-            duration_secs: planned
+        .map(|t| {
+            let baseline = planned
                 .tests
                 .iter()
                 .find(|p| !p.id.is_empty() && p.id == t.id)
-                .or_else(|| planned.tests.iter().find(|p| p.name == t.name))
-                .map(|p| p.duration_secs)
-                .unwrap_or(0.001),
+                .or_else(|| planned.tests.iter().find(|p| p.name == t.name));
+            ResolvedTest {
+                cpu_secs: baseline
+                    .map(|p| p.cpu_secs.unwrap_or(p.duration_secs))
+                    .unwrap_or(0.001),
+                id: t.id.clone(),
+                name: t.name.clone(),
+                binary: run_dir.join(&t.binary),
+                cwd: if t.cwd_rel.is_empty() {
+                    tree_root.to_path_buf()
+                } else {
+                    tree_root.join(&t.cwd_rel)
+                },
+                target_dir: tree_root.join("target"),
+                duration_secs: planned
+                    .tests
+                    .iter()
+                    .find(|p| !p.id.is_empty() && p.id == t.id)
+                    .or_else(|| planned.tests.iter().find(|p| p.name == t.name))
+                    .map(|p| p.duration_secs)
+                    .unwrap_or(0.001),
+            }
         })
         .collect())
 }
@@ -620,7 +609,7 @@ fn run_selected_tests_observed<R>(
     run: &mut R,
 ) -> Result<ObservedRun>
 where
-    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
+    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, f64, String)>,
 {
     // Running no test at all is not evidence that the mutant survived. An
     // empty selection here means staging or attribution produced nothing (the
@@ -643,9 +632,9 @@ where
     for t in tests {
         let budget = with_minimum(
             t,
-            test_timeout_scaled(expected_secs(t), policy.floor, policy.slowdown),
+            test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown),
         );
-        let (first, first_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
+        let (first, first_secs, first_cpu, _) = run(&spec_for(t, budget, extra_env, false))?;
         if first == RunStatus::Passed {
             observations.push(observation(t, TestVerdict::Passed, first_secs));
             continue;
@@ -684,7 +673,7 @@ where
             t.duration_secs
         );
         let step = if first == RunStatus::Timeout {
-            confirm_timeout(planned, t, policy, extra_env, run)?
+            confirm_timeout(planned, t, budget, first_cpu, extra_env, run)?
         } else {
             confirm_failure(planned, t, first, budget, extra_env, run)?
         };
@@ -746,7 +735,7 @@ fn run_selected_tests<R>(
     run: &mut R,
 ) -> Result<Outcome>
 where
-    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
+    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, f64, String)>,
 {
     Ok(run_selected_tests_observed(planned, tests, policy, extra_env, false, run)?.outcome)
 }
@@ -784,9 +773,9 @@ fn confirm_failure<R>(
     run: &mut R,
 ) -> Result<Step>
 where
-    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
+    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, f64, String)>,
 {
-    let (retry, retry_secs, retry_err) = run(&spec_for(t, budget, extra_env, true))?;
+    let (retry, retry_secs, _retry_cpu, retry_err) = run(&spec_for(t, budget, extra_env, true))?;
     tracing::info!(
         "confirm {}: retry with mutant {:?} in {:.2}s; stderr: {}",
         t.name,
@@ -802,7 +791,7 @@ where
         );
         return Ok(Step::Next);
     }
-    let (null, null_secs, null_err) = run(&spec_for(t, budget, &[], true))?;
+    let (null, null_secs, _null_cpu, null_err) = run(&spec_for(t, budget, &[], true))?;
     tracing::info!(
         "confirm {}: null run {:?} in {:.2}s; stderr: {}",
         t.name,
@@ -858,143 +847,57 @@ where
     }))
 }
 
-/// First pass timed out. The green duration was measured on a normal binary,
-/// so the budget may simply have been too small: measure the test with no
-/// mutant active on this binary, then re-run the mutant against 3× that.
+/// CPU, rather than a cached null wall duration, distinguishes extra work
+/// from host load. A quiet second timeout also detects blocked tests.
 fn confirm_timeout<R>(
     planned: &PlannedMutant,
     t: &ResolvedTest,
-    policy: &TestRunPolicy,
+    budget: Duration,
+    first_cpu: f64,
     extra_env: &[(String, String)],
     run: &mut R,
 ) -> Result<Step>
 where
-    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, String)>,
+    R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, f64, String)>,
 {
-    // Only the calibration can take minutes; the re-run that follows is
-    // budgeted from it, so it runs without the lock. Holding the lock across
-    // both made N hanging mutants cost N full re-runs in series.
-    let calibration = with_minimum(t, policy.floor.max(Duration::from_secs(120)));
-    let null_secs = match calibrated_secs(t) {
-        Some(secs) => {
-            tracing::info!(
-                "confirm {}: null run calibrated earlier in {secs:.2}s",
-                t.name
-            );
-            secs
-        }
-        None => {
-            let (null, null_secs, null_err) = {
-                let _guard = confirm_lock();
-                run(&spec_for(t, calibration, &[], true))?
-            };
-            tracing::info!(
-                "confirm {}: null calibration {:?} in {:.2}s (budget {:.1}s)",
-                t.name,
-                null,
-                null_secs.as_secs_f64(),
-                calibration.as_secs_f64()
-            );
-            if null != RunStatus::Passed {
-                tracing::info!(
-                    "confirm {}: infra-skip ({:?} with no mutant active at {:.1}s budget); next test",
-                    t.name,
-                    null,
-                    calibration.as_secs_f64()
-                );
-                return Ok(Step::Skip(InfraSkip {
-                    test: t.name.clone(),
-                    code: status_code(null),
-                    stderr: tail(&null_err, MESSAGE_TAIL),
-                }));
-            }
-            let secs = null_secs.as_secs_f64();
-            CALIBRATED
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(t.id.clone(), secs);
-            secs
-        }
+    let threshold = RUNAWAY_CPU_FACTOR * t.cpu_secs + RUNAWAY_CPU_ALLOWANCE;
+    let caught = |message| {
+        Step::Done(Outcome::caught_by_timeout(
+            planned.mutant.clone(),
+            t.name.clone(),
+            message,
+        ))
     };
-    let budget = with_minimum(
-        t,
-        duration_from_secs((null_secs * 3.0).max(policy.floor.as_secs_f64())),
-    );
-    let (again, again_secs, _) = run(&spec_for(t, budget, extra_env, false))?;
-    tracing::info!(
-        "confirm {}: re-run with mutant {:?} in {:.2}s (calibrated budget {:.1}s)",
-        t.name,
-        again,
-        again_secs.as_secs_f64(),
-        budget.as_secs_f64()
-    );
+    let runaway = |cpu: f64| {
+        caught(format!(
+            "{}: test {} used {:.2} s of CPU where the test normally uses {:.2} s",
+            crate::types::TIMEOUT_PREFIX,
+            t.name,
+            cpu,
+            t.cpu_secs
+        ))
+    };
+    if first_cpu >= threshold {
+        return Ok(runaway(first_cpu));
+    }
+    let retry_budget = budget.saturating_mul(TIMEOUT_RETRY_FACTOR);
+    let (again, wall, cpu, _) = run(&spec_for(t, retry_budget, extra_env, true))?;
     match again {
+        RunStatus::Passed => Ok(Step::Next),
+        RunStatus::Failed | RunStatus::Error { .. } =>
+            confirm_failure(planned, t, again, retry_budget, extra_env, run),
+        RunStatus::Timeout if cpu >= threshold => Ok(runaway(cpu)),
+        RunStatus::Timeout if cpu / wall.as_secs_f64() < BLOCKED_CPU_SHARE => {
+            Ok(caught(format!(
+                "{}: test {} was blocked: used {:.2} s of CPU in {:.2} s, so it was waiting (for example a deadlock), not computing",
+                crate::types::TIMEOUT_PREFIX, t.name, cpu, wall.as_secs_f64())))
+        }
         RunStatus::Timeout => {
-            let share = null_secs / calibration.as_secs_f64();
-            if share < CAUGHT_BY_TIMEOUT_SHARE {
-                // Twice over its budget with the mutant, and comfortably
-                // inside its calibration without: the mutant made it hang.
-                let message = format!(
-                    "{} ({}): passed without it in {:.2}s, exceeded {:.1}s with it twice",
-                    crate::types::TIMEOUT_PREFIX,
-                    t.name,
-                    null_secs,
-                    budget.as_secs_f64()
-                );
-                tracing::info!("confirm {}: CAUGHT by timeout", t.name);
-                Ok(Step::Done(Outcome::caught_by_timeout(
-                    planned.mutant.clone(),
-                    t.name.clone(),
-                    message,
-                )))
-            } else {
-                tracing::info!(
-                    "confirm {}: TIMEOUT, inconclusive (null run {:.2}s of a {:.1}s calibration budget)",
-                    t.name,
-                    null_secs,
-                    calibration.as_secs_f64()
-                );
-                let mut outcome = Outcome::timeout(planned.mutant.clone(), t.name.clone());
-                outcome.message = Some(format!(
-                    "the test takes {:.2}s without the mutant, {:.0}% of its {:.0}s calibration budget, so load may explain the timeout; [test-budget] in quicksilver.toml can give it more",
-                    null_secs,
-                    share * 100.0,
-                    calibration.as_secs_f64()
-                ));
-                Ok(Step::Done(outcome))
-            }
-        }
-        RunStatus::Failed => {
-            tracing::info!("confirm {}: CAUGHT on the calibrated re-run", t.name);
-            Ok(Step::Done(Outcome::caught(
-                planned.mutant.clone(),
-                t.name.clone(),
-            )))
-        }
-        RunStatus::Passed => {
-            tracing::info!(
-                "confirm {}: passed on the calibrated re-run (first timeout was budget, not mutant); next test",
-                t.name
-            );
-            Ok(Step::Next)
-        }
-        RunStatus::Error { code } => {
-            let message = format!(
-                "{} ({}) on the calibrated re-run; it passed without the mutant in {:.2}s; test {}",
-                crate::types::CRASH_PREFIX,
-                crate::types::describe_exit(code),
-                null_secs,
-                t.name
-            );
-            tracing::info!(
-                "confirm {}: CAUGHT by crash on the calibrated re-run",
-                t.name
-            );
-            Ok(Step::Done(Outcome::caught_by_crash(
-                planned.mutant.clone(),
-                t.name.clone(),
-                message,
-            )))
+            let mut outcome = Outcome::timeout(planned.mutant.clone(), t.name.clone());
+            outcome.message = Some(format!(
+                "test {} ran past {} × its budget at a normal CPU rate without using {} × its usual CPU; the host's load is the likely cause; recheck with `test --again timeouts` on a quieter host",
+                t.name, TIMEOUT_RETRY_FACTOR, RUNAWAY_CPU_FACTOR));
+            Ok(Step::Done(outcome))
         }
     }
 }
@@ -1135,6 +1038,7 @@ mod tests {
             binary_rel: String::new(),
             cwd_rel: "".into(),
             duration_secs: secs,
+            cpu_secs: None,
         };
         let planned = PlannedMutant {
             mutant: fake_mutant(),
@@ -1145,6 +1049,10 @@ mod tests {
             estimated_cost_secs: 0.0,
         };
         let resolved = resolve_tests(&planned, dir.path(), dir.path()).unwrap();
+        assert_eq!(
+            resolved[0].cpu_secs, 0.5,
+            "old plans use recorded wall time as CPU"
+        );
         let got: Vec<(String, String, f64)> = resolved
             .iter()
             .map(|t| {
@@ -1207,6 +1115,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 target_dir: dir.path().join("target"),
                 duration_secs: 0.01,
+                cpu_secs: 0.01,
             }
         };
         let tests = vec![
@@ -1257,16 +1166,32 @@ mod tests {
                 cwd: PathBuf::from("/"),
                 target_dir: PathBuf::from("/target"),
                 duration_secs: 0.41,
+                cpu_secs: 0.41,
             })
             .collect()
     }
 
-    /// Drive the machine with a scripted sequence of run results and return
-    /// the verdict plus every RunSpec the machine asked for.
     fn drive(
         confirm: bool,
         tests: &[ResolvedTest],
         script: &[(RunStatus, f64, &str)],
+    ) -> (Outcome, Vec<RunSpec>) {
+        drive_cpu(
+            confirm,
+            tests,
+            &script
+                .iter()
+                .map(|(s, w, e)| (*s, *w, 0.0, *e))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Drive the machine with a scripted sequence of run results and return
+    /// the verdict plus every RunSpec the machine asked for.
+    fn drive_cpu(
+        confirm: bool,
+        tests: &[ResolvedTest],
+        script: &[(RunStatus, f64, f64, &str)],
     ) -> (Outcome, Vec<RunSpec>) {
         let planned = PlannedMutant {
             mutant: fake_mutant(),
@@ -1282,13 +1207,18 @@ mod tests {
         let mut seen: Vec<RunSpec> = Vec::new();
         let mut next = 0usize;
         let outcome = {
-            let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, String)> {
+            let mut run = |spec: &RunSpec| -> Result<(RunStatus, Duration, f64, String)> {
                 seen.push(spec.clone());
-                let (status, secs, err) = script
+                let (status, secs, cpu, err) = script
                     .get(next)
                     .unwrap_or_else(|| panic!("unscripted run #{next}: {}", spec.test_name));
                 next += 1;
-                Ok((*status, Duration::from_secs_f64(*secs), (*err).to_string()))
+                Ok((
+                    *status,
+                    Duration::from_secs_f64(*secs),
+                    *cpu,
+                    (*err).to_string(),
+                ))
             };
             run_selected_tests(&planned, tests, &policy, &env, &mut run).unwrap()
         };
@@ -1345,148 +1275,148 @@ mod tests {
     }
 
     #[test]
-    fn confirm_timeout_with_fast_null_and_second_timeout_is_caught_by_timeout() {
-        let (outcome, seen) = drive(
+    fn timeout_runaway_on_first_pass_is_caught_without_a_null_run() {
+        let (outcome, seen) = drive_cpu(
             true,
-            &fake_tests(&["timeout-rerun"]),
-            &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Passed, 12.0, ""),
-                (RunStatus::Timeout, 36.0, ""),
-            ],
+            &fake_tests(&["t"]),
+            &[(RunStatus::Timeout, 30.0, 2.23, "")],
         );
-        // 12s is well inside the 120s calibration: the mutant made it hang.
         assert_eq!(outcome.kind, VerdictKind::Caught);
-        let msg = outcome.message.unwrap();
-        assert!(msg.starts_with(crate::types::TIMEOUT_PREFIX), "{msg}");
-        assert_eq!(seen.len(), 3);
-        assert_eq!(seen[1].timeout, Duration::from_secs(120), "calibration");
-        assert!(!has_mutant(&seen[1]));
-        // 3 × the 12s null run beats the 30s floor.
-        assert_eq!(seen[2].timeout, Duration::from_secs(36));
-        assert!(has_mutant(&seen[2]));
+        assert!(outcome.message.unwrap().contains("normally uses 0.41 s"));
+        assert_eq!(seen.len(), 1);
     }
 
     #[test]
-    fn a_timeout_whose_null_run_is_slow_stays_a_timeout() {
-        let (outcome, _) = drive(
+    fn timeout_second_pass_runaway_is_caught() {
+        let (outcome, seen) = drive_cpu(
             true,
-            &fake_tests(&["timeout-slow-null"]),
+            &fake_tests(&["t"]),
             &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Passed, 50.0, ""),
-                (RunStatus::Timeout, 150.0, ""),
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Timeout, 120.0, 3.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        assert!(outcome
+            .message
+            .unwrap()
+            .starts_with(crate::types::TIMEOUT_PREFIX));
+        assert_eq!(seen[1].timeout, Duration::from_secs(120));
+        assert!(has_mutant(&seen[1]));
+    }
+
+    #[test]
+    fn timeout_with_little_cpu_on_retry_is_blocked() {
+        let (outcome, seen) = drive_cpu(
+            true,
+            &fake_tests(&["t"]),
+            &[
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Timeout, 120.0, 2.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        assert!(outcome.message.unwrap().contains("blocked"));
+        assert_eq!(seen.len(), 2);
+    }
+
+    #[test]
+    fn timeout_with_normal_cpu_rate_under_load_is_inconclusive() {
+        let mut tests = fake_tests(&["t"]);
+        tests[0].cpu_secs = 20.0;
+        let (outcome, _) = drive_cpu(
+            true,
+            &tests,
+            &[
+                (RunStatus::Timeout, 30.0, 5.0, ""),
+                (RunStatus::Timeout, 120.0, 20.0, ""),
             ],
         );
         assert_eq!(outcome.kind, VerdictKind::Timeout);
-        let msg = outcome.message.unwrap();
-        assert!(msg.contains("load may explain"), "{msg}");
+        assert!(outcome.message.unwrap().contains("test --again timeouts"));
     }
 
     #[test]
-    fn a_configured_budget_raises_every_budget_of_that_test() {
+    fn timeout_retry_pass_moves_to_next_test() {
+        let (outcome, seen) = drive_cpu(
+            true,
+            &fake_tests(&["t", "next"]),
+            &[
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Passed, 40.0, 1.0, ""),
+                (RunStatus::Passed, 1.0, 0.1, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Missed);
+        assert_eq!(seen[2].test_name, "next");
+    }
+
+    #[test]
+    fn timeout_retry_failure_goes_through_failure_confirmation() {
+        let (outcome, seen) = drive_cpu(
+            true,
+            &fake_tests(&["t"]),
+            &[
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Failed, 40.0, 1.0, ""),
+                (RunStatus::Failed, 40.0, 1.0, "assertion"),
+                (RunStatus::Passed, 40.0, 1.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        assert_eq!(seen.len(), 4);
+        assert!(!has_mutant(&seen[3]));
+    }
+
+    #[test]
+    fn timeout_retry_crash_goes_through_failure_confirmation() {
+        let (outcome, seen) = drive_cpu(
+            true,
+            &fake_tests(&["t"]),
+            &[
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Error { code: None }, 40.0, 1.0, ""),
+                (RunStatus::Error { code: None }, 40.0, 1.0, ""),
+                (RunStatus::Passed, 40.0, 1.0, ""),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Caught);
+        assert!(outcome
+            .message
+            .unwrap()
+            .starts_with(crate::types::CRASH_PREFIX));
+        assert_eq!(seen.len(), 4);
+    }
+
+    #[test]
+    fn a_configured_budget_raises_first_and_retry_budgets() {
         set_test_budgets(&[("budgeted".to_string(), 90.0)].into_iter().collect());
-        let (outcome, seen) = drive(
+        let (outcome, seen) = drive_cpu(
             true,
             &fake_tests(&["budgeted"]),
-            &[(RunStatus::Passed, 0.4, "")],
+            &[
+                (RunStatus::Timeout, 90.0, 1.0, ""),
+                (RunStatus::Passed, 100.0, 1.0, ""),
+            ],
         );
         assert_eq!(outcome.kind, VerdictKind::Missed);
         assert_eq!(seen[0].timeout, Duration::from_secs(90));
+        assert_eq!(seen[1].timeout, Duration::from_secs(360));
     }
 
     #[test]
-    fn confirm_timeout_then_crash_on_the_rerun_is_caught_by_crash() {
-        // A runaway mutant: the first pass times out, the test passes with no
-        // mutant, and the calibrated re-run is killed (an OOM kill shows up
-        // as a signal, code None).
-        let (outcome, seen) = drive(
-            true,
-            &fake_tests(&["timeout-crash"]),
-            &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Passed, 0.5, ""),
-                (RunStatus::Error { code: None }, 4.0, ""),
-            ],
-        );
-        assert_eq!(outcome.kind, VerdictKind::Caught);
-        let msg = outcome.message.unwrap();
-        assert!(msg.starts_with(crate::types::CRASH_PREFIX), "{msg}");
-        assert!(msg.contains("killed by a signal"), "{msg}");
-        assert_eq!(seen.len(), 3);
-    }
-
-    #[test]
-    fn confirm_timeout_with_null_timeout_is_infra_skip() {
-        let (outcome, seen) = drive(
-            true,
-            &fake_tests(&["timeout-null"]),
-            &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Timeout, 120.0, ""),
-            ],
-        );
-        assert_eq!(seen.len(), 2, "no mutant re-run once the null run hangs");
-        assert_eq!(outcome.kind, VerdictKind::Errored);
-        let msg = outcome.message.unwrap();
-        assert!(msg.contains("unusable under schema binary"), "{msg}");
-        assert!(msg.contains("exited None"), "{msg}");
-    }
-
-    #[test]
-    fn confirm_timeout_calibrated_pass_moves_on_to_the_next_test() {
-        let (outcome, seen) = drive(
-            true,
-            &fake_tests(&["timeout-pass", "t2"]),
-            &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Passed, 12.0, ""),
-                (RunStatus::Passed, 13.0, ""),
-                (RunStatus::Passed, 0.5, ""),
-            ],
-        );
-        assert_eq!(outcome.kind, VerdictKind::Missed);
-        assert_eq!(seen.len(), 4);
-        assert_eq!(seen[3].test_name, "t2");
-    }
-
-    /// A test whose baseline budget is too tight under load is calibrated
-    /// once; later mutants get a first-pass budget from the calibrated
-    /// duration and skip the calibration run.
-    #[test]
-    fn a_calibrated_test_keeps_its_duration_for_later_mutants() {
-        let tests = fake_tests(&["calibrated-once"]);
-        let (outcome, seen) = drive(
+    fn later_mutants_keep_the_recorded_budget_without_calibration() {
+        let tests = fake_tests(&["stable-budget"]);
+        let _ = drive_cpu(
             true,
             &tests,
             &[
-                (RunStatus::Timeout, 30.0, ""),
-                (RunStatus::Passed, 40.0, ""),
-                (RunStatus::Passed, 41.0, ""),
+                (RunStatus::Timeout, 30.0, 1.0, ""),
+                (RunStatus::Passed, 80.0, 1.0, ""),
             ],
         );
-        assert_eq!(outcome.kind, VerdictKind::Missed);
-        assert_eq!(seen[1].timeout, Duration::from_secs(120), "calibration");
-
-        // 3 x 40s x slowdown 3 = 360s, instead of the 30s floor.
-        let (outcome, seen) = drive(true, &tests, &[(RunStatus::Passed, 41.0, "")]);
-        assert_eq!(outcome.kind, VerdictKind::Missed);
-        assert_eq!(seen[0].timeout, Duration::from_secs(360));
-
-        // A real hang still times out, and is confirmed without recalibrating:
-        // the re-run is budgeted from the stored 40s.
-        let (outcome, seen) = drive(
-            true,
-            &tests,
-            &[
-                (RunStatus::Timeout, 360.0, ""),
-                (RunStatus::Timeout, 120.0, ""),
-            ],
-        );
-        assert_eq!(outcome.kind, VerdictKind::Timeout);
-        assert_eq!(seen.len(), 2, "no second calibration");
-        assert_eq!(seen[1].timeout, Duration::from_secs(120));
-        assert!(has_mutant(&seen[1]));
+        let (_, seen) = drive(true, &tests, &[(RunStatus::Passed, 41.0, "")]);
+        assert_eq!(seen[0].timeout, Duration::from_secs(30));
     }
 
     #[test]

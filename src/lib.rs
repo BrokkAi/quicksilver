@@ -281,7 +281,13 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let paths = cfg.paths();
     paths.ensure()?;
-    let results = exec::edited::test(&cfg, &paths, &args.mutants, args.proptest_cases)?;
+    let results = exec::edited::test(
+        &cfg,
+        &paths,
+        &args.mutants,
+        args.proptest_cases,
+        &args.again,
+    )?;
     // Every verdict of this map, not only this run's: a run that continues
     // a stopped one still writes the whole set.
     let state = exec::edited::State::load(&paths)?;
@@ -289,7 +295,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
         .records
         .iter()
         .filter_map(|r| match &r.status {
-            exec::edited::Status::Tested { verdict } => Some((&r.mutant, verdict)),
+            exec::edited::Status::Tested { verdict, .. } => Some((&r.mutant, verdict)),
             _ => None,
         })
         .collect();

@@ -61,14 +61,21 @@ impl From<&OutcomeCounts> for CountReport {
     }
 }
 
+/// Keep edited and run mode summaries consistent, and omit empty details.
+pub(crate) fn caught_details(timeouts: usize, crashes: usize) -> String {
+    if timeouts == 0 && crashes == 0 {
+        return String::new();
+    }
+    format!(" ({timeouts} by timeout, {crashes} by crash)")
+}
+
 pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
     let c = OutcomeCounts::from_outcomes(outcomes);
     eprintln!(
-        "outcomes: {} total — {} caught ({} by crash, {} by timeout), {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
+        "outcomes: {} total — {} caught{}, {} missed, {} not covered, {} unviable, {} errored, {} timeout ({} mutant builds, {} cargo invocations)",
         c.total(),
         c.caught,
-        c.caught_by_crash,
-        c.caught_by_timeout,
+        caught_details(c.caught_by_timeout, c.caught_by_crash),
         c.missed,
         c.not_covered,
         c.unviable,
