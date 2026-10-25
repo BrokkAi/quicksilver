@@ -437,6 +437,33 @@ fn ranks_omitted_packages_by_whole_names_at_map_commit() {
     assert!(fallback.contains("tests of few, many, none may enter"));
 }
 
+/// A package at the workspace root holds every member's directory; only
+/// files outside the members are its own.
+#[test]
+fn a_root_package_counts_only_its_own_files() {
+    let dir = repository(&[
+        ("Cargo.toml", b"[package]\nname = 'root'\nversion = '0.1.0'\n[dependencies]\nbase = { path = 'base' }\n[workspace]\nmembers = ['base']\nresolver = '2'\n"),
+        ("src/lib.rs", b""),
+        ("tests/suite.rs", b"fn t() { base::alpha(); }\n"),
+        ("base/Cargo.toml", b"[package]\nname = 'base'\nversion = '0.1.0'\n"),
+        ("base/src/lib.rs", b"pub fn alpha() {}\npub fn beta() {}\n"),
+    ]);
+    let map = map(
+        dir.path(),
+        vec![
+            site(1, "base/src/lib.rs", "alpha", 1, 1),
+            site(2, "base/src/lib.rs", "beta", 2, 2),
+        ],
+    );
+    let sites: Vec<_> = map.sites.iter().collect();
+    let ranked = rank_test_dependents(dir.path(), &map, &sites, &["root".to_string()]).unwrap();
+    assert_eq!(
+        ranked,
+        [("root".into(), 1)],
+        "base's own `beta` is not root's"
+    );
+}
+
 #[test]
 fn ranked_hint_limits_matches_and_reports_zero_counts() {
     let ranked: Vec<_> = (0..8)

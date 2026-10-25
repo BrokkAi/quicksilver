@@ -807,6 +807,9 @@ pub fn omitted_test_dependents(root: &Path, mapped: &[String], tested: &[String]
 
 /// Count listed sites whose whole name appears in each omitted package's code.
 /// Paths in the tree are relative to the repository, including the map prefix.
+/// A file belongs to the package with the deepest directory that holds it,
+/// so a package at the workspace root does not count its members' files
+/// (the mapped package's own sources among them).
 pub(crate) fn rank_test_dependents(
     root: &Path,
     map: &SiteMap,
@@ -816,21 +819,30 @@ pub(crate) fn rank_test_dependents(
     use std::collections::{HashMap, HashSet};
 
     let meta = crate::cargo_cmd::load_metadata(root)?;
-    let mut dirs = Vec::new();
-    for name in omitted {
-        let package = meta
-            .workspace_packages()
-            .into_iter()
-            .find(|p| p.name.as_str() == name)
-            .context("omitted package missing from metadata")?;
+    // Every workspace package's directory, deepest first, with its index in
+    // `omitted` when it is one of them.
+    let mut owners: Vec<(PathBuf, Option<usize>)> = Vec::new();
+    for package in meta.workspace_packages() {
         let dir = package
             .manifest_path
             .as_std_path()
             .parent()
             .context("package manifest directory")?
             .strip_prefix(root)?;
-        dirs.push(PathBuf::from(&map.prefix).join(dir));
+        let index = omitted.iter().position(|n| n == package.name.as_str());
+        owners.push((PathBuf::from(&map.prefix).join(dir), index));
     }
+    anyhow::ensure!(
+        (0..omitted.len()).all(|i| owners.iter().any(|(_, o)| *o == Some(i))),
+        "omitted package missing from metadata"
+    );
+    owners.sort_by_key(|(dir, _)| std::cmp::Reverse(dir.components().count()));
+    let owner = |path: &str| {
+        owners
+            .iter()
+            .find(|(dir, _)| Path::new(path).starts_with(dir))
+            .and_then(|(_, i)| *i)
+    };
     let mut names: HashMap<&str, usize> = HashMap::new();
     for site in sites {
         let name = site.fqn.rsplit('.').next().unwrap_or("");
@@ -838,25 +850,20 @@ pub(crate) fn rank_test_dependents(
             *names.entry(name).or_default() += 1;
         }
     }
-    let mut found = vec![HashSet::new(); dirs.len()];
-    if !names.is_empty() && !dirs.is_empty() {
+    let mut found = vec![HashSet::new(); omitted.len()];
+    if !names.is_empty() && !omitted.is_empty() {
         scan_rust_blobs(
             map,
             root,
-            |path| dirs.iter().any(|dir| Path::new(path).starts_with(dir)),
+            |path| owner(path).is_some(),
             |path, bytes| {
-                let packages: Vec<_> = dirs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, dir)| Path::new(path).starts_with(dir))
-                    .map(|(i, _)| i)
-                    .collect();
+                let Some(i) = owner(path) else {
+                    return true;
+                };
                 let text = String::from_utf8_lossy(bytes);
                 for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
                     if let Some((&name, _)) = names.get_key_value(word) {
-                        for &i in &packages {
-                            found[i].insert(name);
-                        }
+                        found[i].insert(name);
                     }
                 }
                 true
