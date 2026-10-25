@@ -33,9 +33,21 @@ pub struct Survivor {
     pub edits: Vec<EditView>,
 }
 
+/// A unified diff of one body, with the file's line numbers (`line` is the
+/// body's first line) and 3 lines of context. A stored body ends at its
+/// `}`; in the file a newline follows, so both texts get one, and the diff
+/// applies to the file.
 pub fn unified_diff(old: &str, new: &str, line: usize, path: &str, prefix: &str) -> String {
-    let a = crate::linediff::lines(old);
-    let b = crate::linediff::lines(new);
+    let with_newline = |s: &str| {
+        if s.ends_with('\n') {
+            s.to_string()
+        } else {
+            format!("{s}\n")
+        }
+    };
+    let (old, new) = (with_newline(old), with_newline(new));
+    let a = crate::linediff::lines(&old);
+    let b = crate::linediff::lines(&new);
     let mut out = format!("--- a/{prefix}{path}\n+++ b/{prefix}{path}\n");
     let hunks = crate::linediff::diff(&a, &b);
     let mut groups: Vec<Vec<crate::linediff::Hunk>> = Vec::new();
@@ -97,6 +109,9 @@ fn push_diff_line(out: &mut String, prefix: char, line: &str) {
     }
 }
 
+/// Whether the function still exists at `head`: a function with the same
+/// name in the same file, and for a method, in an `impl` of the same type.
+/// `None` when the file at `head` does not parse.
 fn still_at_head(
     map: &SiteMap,
     root: &Path,
@@ -115,31 +130,55 @@ fn still_at_head(
             Ok(bytes) => String::from_utf8(bytes)
                 .ok()
                 .and_then(|src| syn::parse_file(&src).ok())
-                .map(|file| {
-                    use syn::visit::Visit;
-                    struct Names(BTreeSet<String>);
-                    impl<'ast> Visit<'ast> for Names {
-                        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-                            self.0.insert(i.sig.ident.to_string());
-                            syn::visit::visit_item_fn(self, i);
-                        }
-                        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-                            self.0.insert(i.sig.ident.to_string());
-                            syn::visit::visit_impl_item_fn(self, i);
-                        }
-                    }
-                    let mut names = Names(BTreeSet::new());
-                    names.visit_file(&file);
-                    names.0
-                }),
+                .map(|file| defined_names(&file)),
         };
         file_cache.insert(key.clone(), parsed);
     }
-    let terminal = fqn.rsplit('.').next().unwrap_or(fqn);
-    file_cache
-        .get(&key)
-        .and_then(|n| n.as_ref())
-        .map(|n| n.contains(terminal))
+    file_cache.get(&key).and_then(|n| n.as_ref()).map(|names| {
+        names
+            .iter()
+            .any(|n| fqn == n || fqn.ends_with(&format!(".{n}")))
+    })
+}
+
+/// The functions a file defines, as `name` for free functions and
+/// `Type.name` for methods in an `impl` of `Type`, the way the map's full
+/// names end.
+fn defined_names(file: &syn::File) -> BTreeSet<String> {
+    use syn::visit::Visit;
+    struct Names {
+        names: BTreeSet<String>,
+        self_type: Vec<Option<String>>,
+    }
+    impl<'ast> Visit<'ast> for Names {
+        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
+            self.names.insert(i.sig.ident.to_string());
+            syn::visit::visit_item_fn(self, i);
+        }
+        fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
+            let ty = match &*i.self_ty {
+                syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+                _ => None,
+            };
+            self.self_type.push(ty);
+            syn::visit::visit_item_impl(self, i);
+            self.self_type.pop();
+        }
+        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
+            let name = i.sig.ident.to_string();
+            match self.self_type.last() {
+                Some(Some(ty)) => self.names.insert(format!("{ty}.{name}")),
+                _ => self.names.insert(name),
+            };
+            syn::visit::visit_impl_item_fn(self, i);
+        }
+    }
+    let mut names = Names {
+        names: BTreeSet::new(),
+        self_type: Vec::new(),
+    };
+    names.visit_file(file);
+    names.names
 }
 
 pub fn collect(
@@ -311,8 +350,28 @@ mod tests {
     fn unified_diff_formats_single_and_edge_changes() {
         assert_eq!(
             unified_diff("{\n old\n}", "{\n new\n}", 1, "x.rs", ""),
-            "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n {\n- old\n+ new\n }\n\\ No newline at end of file\n"
+            "--- a/x.rs\n+++ b/x.rs\n@@ -1,3 +1,3 @@\n {\n- old\n+ new\n }\n"
         );
+    }
+
+    #[test]
+    fn methods_at_head_are_matched_with_their_type() {
+        let file: syn::File = syn::parse_str(
+            "fn free() {}\nimpl Scope { fn new() {} fn get(&self) {} }\nimpl<T> Holder<T> { fn new() {} }",
+        )
+        .unwrap();
+        let names = defined_names(&file);
+        let at = |fqn: &str| {
+            names
+                .iter()
+                .any(|n| fqn == n || fqn.ends_with(&format!(".{n}")))
+        };
+        assert!(at("k.mod.free"));
+        assert!(at("k.Scope.new"));
+        assert!(at("k.Holder.new"));
+        // A `new` of another type that a later commit removed is gone.
+        assert!(!at("k.Registry.new"));
+        assert!(!at("k.Scope.renamed"));
     }
     #[test]
     fn unified_diff_keeps_context_at_body_edges() {

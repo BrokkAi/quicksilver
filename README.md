@@ -250,7 +250,10 @@ diffs, how many tests ran and were selected (with a short sample), and
 whether the function remains at `HEAD`. `--json FILE` saves the same records
 as JSON. `--split N --out DIR` writes `survivors-1.txt` through
 `survivors-N.txt`, balancing survivor counts while keeping each source file
-in one list.
+in one list. "Still at `HEAD`" compares the function's name, and for a
+method its type, with the file at `HEAD`, so a function a later commit
+removed or renamed shows as gone.
+
 
 ## What the results mean
 
