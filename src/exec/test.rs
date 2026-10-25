@@ -911,8 +911,14 @@ where
         RunStatus::Timeout => {
             let mut outcome = Outcome::timeout(planned.mutant.clone(), t.name.clone());
             outcome.message = Some(format!(
-                "test {} ran past {} × its budget at a normal CPU rate without using {} × its usual CPU; the host's load is the likely cause; recheck with `test --again timeouts` on a quieter host",
-                t.name, TIMEOUT_RETRY_FACTOR, RUNAWAY_CPU_FACTOR));
+                "test {} ran past {} × its budget ({:.1} s, using {:.2} s of CPU where it normally uses {:.2} s) at a normal CPU rate without using {} × its usual CPU; the host's load is the likely cause; recheck with `test --again timeouts` on a quieter host",
+                t.name,
+                TIMEOUT_RETRY_FACTOR,
+                wall.as_secs_f64(),
+                cpu,
+                t.cpu_secs,
+                RUNAWAY_CPU_FACTOR
+            ));
             Ok(Step::Done(outcome))
         }
     }

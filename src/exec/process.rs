@@ -86,8 +86,10 @@ fn wait_measured(child: &mut std::process::Child, timeout: Duration) -> Result<(
             let snapshot = group_cpu_secs(pid);
             kill_tree(child);
             let (_, cpu) = rx.recv().context("wait4 reaper stopped")??;
+            // Without the snapshot, the reaped CPU still counts the test
+            // process and the children it had waited for.
             #[cfg(target_os = "linux")]
-            let cpu = snapshot?.max(cpu);
+            let cpu = snapshot.map_or(cpu, |s| s.max(cpu));
             Ok((WaitResult::Timeout, cpu))
         }
         Err(err) => Err(err).context("wait4 reaper stopped"),
