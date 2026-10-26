@@ -64,6 +64,14 @@ pub fn repo_of(dir: &Path) -> Result<Repo> {
     })
 }
 
+pub fn resolve_commit(dir: &Path, revision: &str) -> Result<String> {
+    git(
+        dir,
+        &["rev-parse", "--verify", &format!("{revision}^{{commit}}")],
+    )
+    .with_context(|| format!("unknown commit revision {revision:?}"))
+}
+
 pub fn head(dir: &Path) -> Result<String> {
     git(dir, &["rev-parse", "HEAD"])
 }

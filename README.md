@@ -243,16 +243,20 @@ After `test`, list mutants that no selected test caught:
 ```
 cargo quicksilver survivors --package my_crate --file 'src/**/*.rs'
 cargo quicksilver survivors --split 4 --out survivor-lanes
+cargo quicksilver survivors --at master
 ```
 
 Each record shows the mutant id and intent, its function and unified body
 diffs, how many tests ran and were selected (with a short sample), and
 whether the function remains at `HEAD`. `--json FILE` saves the same records
-as JSON. `--split N --out DIR` writes `survivors-1.txt` through
+as JSON. `--at REV` compares the first edited function against that commit
+(default: HEAD), reporting `unchanged`, `changed`, `gone`, or `unknown` when
+the file cannot be parsed. The summary counts changed and gone survivors.
+JSON includes `at_commit` and `at_status`, and retains `at_head` as a function
+existence check. `--split N --out DIR` writes `survivors-1.txt` through
 `survivors-N.txt`, balancing survivor counts while keeping each source file
-in one list. "Still at `HEAD`" compares the function's name, and for a
-method its type, with the file at `HEAD`, so a function a later commit
-removed or renamed shows as gone.
+in one list. Functions match by name and methods by type and name; body
+comparisons use the exact original text saved by the map.
 
 
 ## What the results mean

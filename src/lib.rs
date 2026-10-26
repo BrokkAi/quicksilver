@@ -11,6 +11,7 @@ pub mod exec;
 pub mod higher_order;
 pub mod index;
 pub mod linediff;
+pub mod locate;
 pub mod outcome;
 pub mod pending;
 pub mod plan;

@@ -268,6 +268,9 @@ pub struct PendingArgs {
 
 #[derive(Args, Debug)]
 pub struct SurvivorsArgs {
+    /// Compare survivors against this Git revision (default: HEAD).
+    #[arg(long, value_name = "REV")]
+    pub at: Option<String>,
     /// Write this many lists, keeping each source file together.
     #[arg(long, requires = "out", value_parser = parse_positive_split)]
     pub split: Option<usize>,

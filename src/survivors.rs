@@ -30,6 +30,8 @@ pub struct Survivor {
     pub tests_selected: usize,
     pub tests_sample: Vec<String>,
     pub at_head: Option<bool>,
+    pub at_commit: String,
+    pub at_status: AtStatus,
     pub edits: Vec<EditView>,
 }
 
@@ -109,76 +111,60 @@ fn push_diff_line(out: &mut String, prefix: char, line: &str) {
     }
 }
 
-/// Whether the function still exists at `head`: a function with the same
-/// name in the same file, and for a method, in an `impl` of the same type.
-/// `None` when the file at `head` does not parse.
-fn still_at_head(
-    map: &SiteMap,
-    root: &Path,
-    head: &str,
-    file_cache: &mut BTreeMap<String, Option<BTreeSet<String>>>,
-    fqn: &str,
-    path: &str,
-) -> Option<bool> {
-    if head == map.commit {
-        return Some(true);
-    }
-    let key = format!("{}{}", map.prefix, path);
-    if !file_cache.contains_key(&key) {
-        let parsed = match crate::worktree::show(root, head, &key) {
-            Err(_) => Some(BTreeSet::new()),
-            Ok(bytes) => String::from_utf8(bytes)
-                .ok()
-                .and_then(|src| syn::parse_file(&src).ok())
-                .map(|file| defined_names(&file)),
-        };
-        file_cache.insert(key.clone(), parsed);
-    }
-    file_cache.get(&key).and_then(|n| n.as_ref()).map(|names| {
-        names
-            .iter()
-            .any(|n| fqn == n || fqn.ends_with(&format!(".{n}")))
-    })
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AtStatus {
+    Unchanged,
+    Changed,
+    Gone,
+    Unknown,
 }
 
-/// The functions a file defines, as `name` for free functions and
-/// `Type.name` for methods in an `impl` of `Type`, the way the map's full
-/// names end.
-fn defined_names(file: &syn::File) -> BTreeSet<String> {
-    use syn::visit::Visit;
-    struct Names {
-        names: BTreeSet<String>,
-        self_type: Vec<Option<String>>,
-    }
-    impl<'ast> Visit<'ast> for Names {
-        fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
-            self.names.insert(i.sig.ident.to_string());
-            syn::visit::visit_item_fn(self, i);
-        }
-        fn visit_item_impl(&mut self, i: &'ast syn::ItemImpl) {
-            let ty = match &*i.self_ty {
-                syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
-                _ => None,
-            };
-            self.self_type.push(ty);
-            syn::visit::visit_item_impl(self, i);
-            self.self_type.pop();
-        }
-        fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
-            let name = i.sig.ident.to_string();
-            match self.self_type.last() {
-                Some(Some(ty)) => self.names.insert(format!("{ty}.{name}")),
-                _ => self.names.insert(name),
-            };
-            syn::visit::visit_impl_item_fn(self, i);
+impl AtStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Unchanged => "unchanged",
+            Self::Changed => "changed",
+            Self::Gone => "gone",
+            Self::Unknown => "unknown",
         }
     }
-    let mut names = Names {
-        names: BTreeSet::new(),
-        self_type: Vec::new(),
+}
+
+type FileCache = BTreeMap<String, Option<(String, Vec<crate::locate::Located>)>>;
+
+fn status_at(
+    prefix: &str,
+    root: &Path,
+    commit: &str,
+    cache: &mut FileCache,
+    edit: &crate::capture::BodyEdit,
+) -> AtStatus {
+    let key = format!("{}{}", prefix, edit.path);
+    let file = cache.entry(key.clone()).or_insert_with(|| {
+        match crate::worktree::show(root, commit, &key) {
+            Err(_) => Some((String::new(), vec![])),
+            Ok(bytes) => String::from_utf8(bytes).ok().and_then(|src| {
+                crate::locate::functions(&src)
+                    .ok()
+                    .map(|functions| (src, functions))
+            }),
+        }
+    });
+    let Some((source, functions)) = file else {
+        return AtStatus::Unknown;
     };
-    names.visit_file(file);
-    names.names
+    let matches: Vec<_> = functions.iter().filter(|f| f.matches(&edit.fqn)).collect();
+    if matches.is_empty() {
+        AtStatus::Gone
+    } else if matches
+        .iter()
+        .any(|f| source[f.body.clone()] == edit.original)
+    {
+        AtStatus::Unchanged
+    } else {
+        AtStatus::Changed
+    }
 }
 
 pub fn collect(
@@ -235,7 +221,12 @@ pub fn collect(
                 ),
             })
             .collect();
-        let at_head = still_at_head(map, root, head, &mut cache, &first.fqn, &first.path);
+        let at_status = status_at(&map.prefix, root, head, &mut cache, first);
+        let at_head = match at_status {
+            AtStatus::Unchanged | AtStatus::Changed => Some(true),
+            AtStatus::Gone => Some(false),
+            AtStatus::Unknown => None,
+        };
         out.push(Survivor {
             id: record.mutant.id.clone(),
             fqns: record.mutant.fqns(),
@@ -247,6 +238,8 @@ pub fn collect(
             tests_selected: selected.len(),
             tests_sample: selected.iter().take(5).map(|t| t.id.clone()).collect(),
             at_head,
+            at_commit: head.to_string(),
+            at_status,
             edits,
         });
     }
@@ -260,15 +253,12 @@ pub fn text_block(s: &Survivor) -> String {
         out.push_str(&format!("  intent: {intent}\n"));
     }
     out.push_str(&format!(
-        "  tests: {} ran, {} selected; sample: {}\n  still at HEAD: {}\n",
+        "  tests: {} ran, {} selected; sample: {}\n  at {}: {}\n",
         s.tests_run,
         s.tests_selected,
         s.tests_sample.join(", "),
-        match s.at_head {
-            Some(true) => "yes",
-            Some(false) => "no",
-            None => "unknown",
-        }
+        &s.at_commit[..12.min(s.at_commit.len())],
+        s.at_status.as_str()
     ));
     for edit in &s.edits {
         out.push_str(&edit.diff);
@@ -297,9 +287,12 @@ pub fn split(survivors: &[Survivor], n: usize) -> Vec<Vec<usize>> {
 
 pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
     let (cfg, _) = crate::engine::config_from_cli(common, ConfigExtras::default())?;
-    let head = crate::worktree::head(&cfg.repo_root)?;
+    let head =
+        crate::worktree::resolve_commit(&cfg.repo_root, args.at.as_deref().unwrap_or("HEAD"))?;
     let paths = cfg.paths();
-    let map = crate::exec::edited::map_at(&paths, &head)?;
+    let map = SiteMap::load(&paths)?.ok_or_else(|| {
+        anyhow::anyhow!("no map for this repository; run `cargo quicksilver map` first")
+    })?;
     let state = State::load(&paths)?;
     let files = crate::discover::file_globset(&cfg.files)?;
     let records = collect(
@@ -310,13 +303,22 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
         &cfg.packages,
         files.as_ref(),
     );
-    let no_head = records.iter().filter(|s| s.at_head == Some(false)).count();
+    let gone = records
+        .iter()
+        .filter(|s| s.at_status == AtStatus::Gone)
+        .count();
+    let changed = records
+        .iter()
+        .filter(|s| s.at_status == AtStatus::Changed)
+        .count();
     let source_files: BTreeSet<_> = records.iter().map(|s| s.path.as_str()).collect();
     eprintln!(
-        "{} survivors in {} files; {} no longer at HEAD",
+        "{} survivors in {} files; {} gone, {} changed at {}",
         records.len(),
         source_files.len(),
-        no_head
+        gone,
+        changed,
+        &head[..12.min(head.len())]
     );
     for s in &records {
         print!("{}", text_block(s));
@@ -347,6 +349,83 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
 mod tests {
     use super::*;
     #[test]
+    fn revision_compares_bodies_and_caches_each_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q"]);
+        let source = "fn changed() { 1; } fn gone() { 1; } fn same() { 1; }";
+        std::fs::write(root.join("lib.rs"), source).unwrap();
+        git(&["add", "lib.rs"]);
+        git(&[
+            "-c",
+            "user.name=QS",
+            "-c",
+            "user.email=qs@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "map commit",
+        ]);
+        let first = crate::worktree::head(root).unwrap();
+        std::fs::write(root.join("lib.rs"), "fn changed() { 2; } fn same() { 1; }").unwrap();
+        git(&["add", "lib.rs"]);
+        git(&[
+            "-c",
+            "user.name=QS",
+            "-c",
+            "user.email=qs@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "later commit",
+        ]);
+        git(&["tag", "review"]);
+        let at = crate::worktree::resolve_commit(root, "review").unwrap();
+        assert_ne!(at, first);
+        let mut cache = FileCache::new();
+        for (name, expected) in [
+            ("changed", AtStatus::Changed),
+            ("gone", AtStatus::Gone),
+            ("same", AtStatus::Unchanged),
+        ] {
+            let edit = crate::capture::BodyEdit {
+                site_id: 1,
+                package: "p".into(),
+                path: "lib.rs".into(),
+                fqn: format!("p.{name}"),
+                line: 1,
+                original: "{ 1; }".into(),
+                body: "{}".into(),
+            };
+            assert_eq!(status_at("", root, &at, &mut cache, &edit), expected);
+            assert_eq!(
+                status_at("", root, &first, &mut FileCache::new(), &edit),
+                AtStatus::Unchanged
+            );
+        }
+        assert_eq!(cache.len(), 1);
+        assert!(crate::worktree::resolve_commit(root, "missing-revision")
+            .unwrap_err()
+            .to_string()
+            .contains("unknown commit revision"));
+    }
+
+    #[test]
     fn unified_diff_formats_single_and_edge_changes() {
         assert_eq!(
             unified_diff("{\n old\n}", "{\n new\n}", 1, "x.rs", ""),
@@ -354,25 +433,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn methods_at_head_are_matched_with_their_type() {
-        let file: syn::File = syn::parse_str(
-            "fn free() {}\nimpl Scope { fn new() {} fn get(&self) {} }\nimpl<T> Holder<T> { fn new() {} }",
-        )
-        .unwrap();
-        let names = defined_names(&file);
-        let at = |fqn: &str| {
-            names
-                .iter()
-                .any(|n| fqn == n || fqn.ends_with(&format!(".{n}")))
-        };
-        assert!(at("k.mod.free"));
-        assert!(at("k.Scope.new"));
-        assert!(at("k.Holder.new"));
-        // A `new` of another type that a later commit removed is gone.
-        assert!(!at("k.Registry.new"));
-        assert!(!at("k.Scope.renamed"));
-    }
     #[test]
     fn unified_diff_keeps_context_at_body_edges() {
         let old = "a\nb\nc\nd\ne\nf\ng\nh\ni\n";
@@ -403,6 +463,8 @@ mod tests {
             tests_selected: 0,
             tests_sample: vec![],
             at_head: None,
+            at_commit: "abc".into(),
+            at_status: AtStatus::Unknown,
             edits: vec![],
         };
         let v = vec![
