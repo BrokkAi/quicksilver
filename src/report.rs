@@ -93,10 +93,12 @@ pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
                     o.mutant.package,
                     o.mutant.fqn,
                     o.mutant.replacement,
-                    if o.message.as_deref() == Some(crate::proptest::NOTE) {
-                        "  (proptest properties only; may vary between runs)"
-                    } else {
-                        ""
+                    match o.message.as_deref() {
+                        Some(crate::proptest::NOTE) => {
+                            "  (proptest properties only; may vary between runs)".to_string()
+                        }
+                        Some(m) => format!("  ({m})"),
+                        None => String::new(),
                     }
                 );
             }

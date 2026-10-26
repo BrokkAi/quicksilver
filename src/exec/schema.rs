@@ -307,6 +307,7 @@ fn run_triage(
         floor: cfg.timeout_floor.max(Duration::from_secs(30)),
         slowdown: SCHEMA_SLOWDOWN,
         confirm: true,
+        unusable: Default::default(),
     };
     let mut experiments = Vec::new();
     let mut rows = Vec::new();
@@ -422,6 +423,7 @@ fn run_second_order(
         floor: cfg.timeout_floor.max(Duration::from_secs(30)),
         slowdown: SCHEMA_SLOWDOWN,
         confirm: true,
+        unusable: Default::default(),
     };
     let mut experiments = Vec::new();
     let mut rows = Vec::new();
@@ -991,12 +993,14 @@ fn mutant_pool_policy(cfg: &Config, full_suite: bool) -> TestRunPolicy {
             floor: cfg.timeout_floor.max(Duration::from_secs(30)),
             slowdown: SCHEMA_SLOWDOWN,
             confirm: true,
+            unusable: Default::default(),
         }
     } else {
         TestRunPolicy {
             floor: cfg.timeout_floor,
             slowdown: 1.0,
             confirm: true,
+            unusable: Default::default(),
         }
     }
 }
@@ -1053,6 +1057,7 @@ pub(crate) fn null_schema_gate(
         floor: cfg.timeout_floor.max(Duration::from_secs(30)),
         slowdown: 1.0,
         confirm: false,
+        unusable: Default::default(),
     };
     // Every sampled test runs. The gate is for a schema binary that breaks
     // tests across the board (a runtime that deadlocks in every test), so
@@ -1112,6 +1117,7 @@ fn record_sites(
         floor: cfg.timeout_floor.max(Duration::from_secs(30)),
         slowdown: SCHEMA_SLOWDOWN,
         confirm: false,
+        unusable: Default::default(),
     };
     let recording = crate::exec::test::record_site_hits(
         &union,

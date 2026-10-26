@@ -102,6 +102,11 @@ pub struct Verdict {
     /// only by properties, when `test --proptest-cases` ran one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proptest_rerun_cases: Option<u32>,
+    /// Selected tests that could not judge the mutant, because they fail
+    /// under the schema binary with no mutant active. A missed mutant with
+    /// such tests survived every other selected test.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unusable_tests: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,6 +629,7 @@ fn recording_policy(cfg: &Config) -> TestRunPolicy {
         floor: cfg.timeout_floor.max(Duration::from_secs(30)),
         slowdown: SCHEMA_SLOWDOWN,
         confirm: false,
+        unusable: Default::default(),
     }
 }
 
@@ -1481,6 +1487,12 @@ fn verdict_from(
         secs,
         note: None,
         proptest_rerun_cases: None,
+        unusable_tests: run
+            .observations
+            .iter()
+            .filter(|o| o.verdict == crate::types::TestVerdict::Infrastructure)
+            .map(id)
+            .collect(),
     }
 }
 
@@ -1512,6 +1524,12 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
                     .join(", "),
                 if v.tests_run.len() > 4 { ", ..." } else { "" }
             );
+            if !v.unusable_tests.is_empty() {
+                line.push_str(&format!(
+                    "\n      could not be judged by (they fail with no mutant active): {}",
+                    v.unusable_tests.join(", ")
+                ));
+            }
             if v.note.is_some() {
                 line.push_str(&match v.proptest_rerun_cases {
                     Some(n) => format!(
@@ -1766,6 +1784,7 @@ pub fn test(
         floor: cfg.timeout_floor,
         slowdown: 1.0,
         confirm: true,
+        unusable: Default::default(),
     };
     // Each verdict is appended as soon as it is decided, so a run that is
     // stopped keeps what it decided: the next `test` skips those mutants.
@@ -1817,6 +1836,7 @@ pub fn test(
                         secs: 0.0,
                         note: None,
                         proptest_rerun_cases: None,
+                        unusable_tests: Vec::new(),
                     }
                 } else {
                     let planned = PlannedMutant {
@@ -1864,6 +1884,7 @@ pub fn test(
                                 secs: started.elapsed().as_secs_f64(),
                                 note: None,
                                 proptest_rerun_cases: None,
+                                unusable_tests: Vec::new(),
                             }
                         }
                     };
@@ -1971,6 +1992,24 @@ pub fn test(
         count(VerdictKind::Errored)
     ));
     results.sort_by(|a, b| a.0.id.cmp(&b.0.id));
+    // Tests that could not judge some mutants: worth leaving out of the map.
+    let mut unusable: BTreeMap<&str, usize> = BTreeMap::new();
+    for (_, v) in &results {
+        for t in &v.unusable_tests {
+            *unusable.entry(t.as_str()).or_default() += 1;
+        }
+    }
+    if !unusable.is_empty() {
+        eprintln!(
+            "tests that fail under the schema binary with no mutant active, so they judged none of the mutants that selected them:"
+        );
+        for (t, n) in &unusable {
+            eprintln!("  {t}: selected by {n} mutant(s)");
+        }
+        eprintln!(
+            "to leave them out of the map, add them to [map] skip-tests in quicksilver.toml and map again"
+        );
+    }
     let errored: Vec<_> = results
         .iter()
         .filter(|(_, v)| v.kind == VerdictKind::Errored)
@@ -2181,6 +2220,7 @@ mod tests {
             secs: 0.0,
             note: None,
             proptest_rerun_cases: None,
+            unusable_tests: Vec::new(),
         }
     }
 
@@ -2506,6 +2546,46 @@ mod tests {
         assert_eq!(tally.decided(VerdictKind::Caught, 1.0, 400.0), None);
         assert_eq!(time_left(10.0, 0.0, 5.0), None);
         assert_eq!(time_left(10.0, 5.0, 5.0), Some(0.0));
+    }
+
+    #[test]
+    fn a_missed_verdict_names_the_tests_that_could_not_judge_it() {
+        let mutant = Mutant {
+            id: "m".into(),
+            package: "p".into(),
+            path: "src/lib.rs".into(),
+            fqn: "p.f".into(),
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            end_line: 1,
+            body_start_byte: 0,
+            body_end_byte: 1,
+            replacement: "{}".into(),
+            return_kind: "unit".into(),
+        };
+        let mut outcome = Outcome::missed(mutant);
+        outcome.message = Some("1 selected test(s) could not judge it".into());
+        let run = crate::exec::test::ObservedRun {
+            outcome,
+            observations: vec![
+                observed("p::ok", "ok", TestVerdict::Passed),
+                observed("p::watchdog", "watchdog", TestVerdict::Infrastructure),
+            ],
+            complete: true,
+        };
+        let v = verdict_from(&run.outcome, &run, 1.0);
+        assert_eq!(v.unusable_tests, vec!["p::watchdog".to_string()]);
+        let m = EditedMutant {
+            id: "m".into(),
+            edits: vec![],
+            intent: None,
+        };
+        let line = verdict_line(&m, &v);
+        assert!(
+            line.contains("could not be judged by (they fail with no mutant active): p::watchdog"),
+            "{line}"
+        );
     }
 
     #[test]

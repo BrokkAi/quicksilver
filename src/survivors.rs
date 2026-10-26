@@ -29,6 +29,9 @@ pub struct Survivor {
     pub tests_run: usize,
     pub tests_selected: usize,
     pub tests_sample: Vec<String>,
+    /// Selected tests that could not judge the mutant: they fail under the
+    /// schema binary with no mutant active.
+    pub unusable_tests: Vec<String>,
     pub at_head: Option<bool>,
     pub at_commit: String,
     pub at_status: AtStatus,
@@ -237,6 +240,7 @@ pub fn collect(
             tests_run: verdict.tests_run.len(),
             tests_selected: selected.len(),
             tests_sample: selected.iter().take(5).map(|t| t.id.clone()).collect(),
+            unusable_tests: verdict.unusable_tests.clone(),
             at_head,
             at_commit: head.to_string(),
             at_status,
@@ -260,6 +264,12 @@ pub fn text_block(s: &Survivor) -> String {
         &s.at_commit[..12.min(s.at_commit.len())],
         s.at_status.as_str()
     ));
+    if !s.unusable_tests.is_empty() {
+        out.push_str(&format!(
+            "  could not be judged by (they fail with no mutant active): {}\n",
+            s.unusable_tests.join(", ")
+        ));
+    }
     for edit in &s.edits {
         out.push_str(&edit.diff);
     }
@@ -462,6 +472,7 @@ mod tests {
             tests_run: 0,
             tests_selected: 0,
             tests_sample: vec![],
+            unusable_tests: vec![],
             at_head: None,
             at_commit: "abc".into(),
             at_status: AtStatus::Unknown,

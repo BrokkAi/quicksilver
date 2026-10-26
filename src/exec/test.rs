@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,6 +36,26 @@ pub struct TestRunPolicy {
     /// Re-run a non-passing test, then run it with no mutant active, before
     /// attributing the result to the mutant.
     pub confirm: bool,
+    /// Tests found unusable (failing with no mutant active) during this run,
+    /// so later mutants skip them instead of checking them again.
+    pub unusable: UnusableMemo,
+}
+
+/// Tests found unusable under the schema binary, by staged binary and name.
+/// Shared by the clones of one policy, and so by one run's mutants.
+#[derive(Debug, Clone, Default)]
+pub struct UnusableMemo(Arc<Mutex<HashMap<(PathBuf, String), InfraSkip>>>);
+
+impl UnusableMemo {
+    fn get(&self, t: &ResolvedTest) -> Option<InfraSkip> {
+        let memo = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        memo.get(&(t.binary.clone(), t.name.clone())).cloned()
+    }
+
+    fn remember(&self, t: &ResolvedTest, skip: &InfraSkip) {
+        let mut memo = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        memo.insert((t.binary.clone(), t.name.clone()), skip.clone());
+    }
 }
 
 /// One `--exact` invocation. `capture` pipes stderr; it stays off for the
@@ -133,6 +153,7 @@ pub fn run_mutant_tests_with_env(
         floor: timeout_floor,
         slowdown: 1.0,
         confirm: false,
+        unusable: Default::default(),
     };
     run_mutant_tests_policy(planned, run_dir, tree_root, &policy, extra_env)
 }
@@ -585,7 +606,7 @@ fn resolve_tests(
 /// A test that does not pass even with no mutant active. The mutant tells us
 /// nothing about it, so it is skipped rather than charged to the mutant.
 #[derive(Debug, Clone)]
-struct InfraSkip {
+pub struct InfraSkip {
     test: String,
     reason: String,
     stderr: String,
@@ -630,6 +651,13 @@ where
     let mut observations = Vec::new();
     let mut decisive: Option<Outcome> = None;
     for t in tests {
+        // Unusable for an earlier mutant of this run: it fails with no mutant
+        // active, so it cannot judge this one either.
+        if let Some(skip) = policy.unusable.get(t) {
+            observations.push(observation(t, TestVerdict::Infrastructure, Duration::ZERO));
+            skipped.push(skip);
+            continue;
+        }
         let budget = with_minimum(
             t,
             test_timeout_scaled(t.duration_secs, policy.floor, policy.slowdown),
@@ -681,6 +709,7 @@ where
         match step {
             Step::Next => observations.push(observation(t, TestVerdict::Passed, first_secs)),
             Step::Skip(s) => {
+                policy.unusable.remember(t, &s);
                 observations.push(observation(t, TestVerdict::Infrastructure, first_secs));
                 skipped.push(s);
             }
@@ -712,6 +741,26 @@ where
         });
     }
     let first = &skipped[0];
+    // Every test that could judge the mutant passed: it survived them, and
+    // the rest could not judge it. Without any such test there is no
+    // evidence either way.
+    if observations
+        .iter()
+        .any(|o| o.verdict == TestVerdict::Passed)
+    {
+        let mut outcome = Outcome::missed(planned.mutant.clone());
+        outcome.message = Some(format!(
+            "{} selected test(s) could not judge it: they fail under the schema binary with no mutant active; first: {} {}",
+            skipped.len(),
+            first.test,
+            first.reason
+        ));
+        return Ok(ObservedRun {
+            outcome,
+            observations,
+            complete: true,
+        });
+    }
     let message = format!(
         "{} selected test(s) unusable under schema binary (fail with no mutant active); first: {} {}; stderr: {}",
         skipped.len(),
@@ -1144,6 +1193,7 @@ mod tests {
             floor: Duration::from_millis(500),
             slowdown: 1.0,
             confirm: false,
+            unusable: Default::default(),
         };
         let recording = record_all(&tests, &hits, &policy, 2, None);
         assert!(
@@ -1206,15 +1256,26 @@ mod tests {
         tests: &[ResolvedTest],
         script: &[(RunStatus, f64, f64, &str)],
     ) -> (Outcome, Vec<RunSpec>) {
-        let planned = PlannedMutant {
-            mutant: fake_mutant(),
-            tests: Vec::new(),
-            estimated_cost_secs: 0.0,
-        };
         let policy = TestRunPolicy {
             floor: Duration::from_secs(30),
             slowdown: 3.0,
             confirm,
+            unusable: Default::default(),
+        };
+        drive_with(&policy, tests, script)
+    }
+
+    /// [`drive_cpu`] with a given policy, so that several mutants can share
+    /// one run's memo of unusable tests.
+    fn drive_with(
+        policy: &TestRunPolicy,
+        tests: &[ResolvedTest],
+        script: &[(RunStatus, f64, f64, &str)],
+    ) -> (Outcome, Vec<RunSpec>) {
+        let planned = PlannedMutant {
+            mutant: fake_mutant(),
+            tests: Vec::new(),
+            estimated_cost_secs: 0.0,
         };
         let env = vec![("QS_MUTANT".to_string(), "site:variant".to_string())];
         let mut seen: Vec<RunSpec> = Vec::new();
@@ -1233,9 +1294,56 @@ mod tests {
                     (*err).to_string(),
                 ))
             };
-            run_selected_tests(&planned, tests, &policy, &env, &mut run).unwrap()
+            run_selected_tests(&planned, tests, policy, &env, &mut run).unwrap()
         };
         (outcome, seen)
+    }
+
+    /// #34: a deadlock watchdog that cannot meet its deadline under the
+    /// schema binary fails with no mutant active for every mutant.
+    #[test]
+    fn a_mutant_surviving_every_usable_test_is_missed_and_unusable_tests_are_remembered() {
+        let policy = TestRunPolicy {
+            floor: Duration::from_secs(30),
+            slowdown: 3.0,
+            confirm: true,
+            unusable: Default::default(),
+        };
+        let tests = fake_tests(&["ok", "watchdog"]);
+        let (outcome, seen) = drive_with(
+            &policy,
+            &tests,
+            &[
+                (RunStatus::Passed, 0.5, 0.5, ""),
+                (RunStatus::Failed, 61.0, 60.0, ""),
+                (RunStatus::Failed, 61.0, 60.0, "too slow"),
+                (RunStatus::Failed, 61.0, 60.0, "too slow"),
+                (RunStatus::Failed, 61.0, 60.0, "too slow"),
+            ],
+        );
+        assert_eq!(outcome.kind, VerdictKind::Missed, "{outcome:?}");
+        let message = outcome.message.unwrap();
+        assert!(
+            message.contains("could not judge it") && message.contains("watchdog"),
+            "{message}"
+        );
+        assert_eq!(seen.len(), 5);
+        // A later mutant of the same run does not run the watchdog again.
+        let (outcome, seen) = drive_with(&policy, &tests, &[(RunStatus::Passed, 0.5, 0.5, "")]);
+        assert_eq!(outcome.kind, VerdictKind::Missed);
+        assert!(outcome.message.unwrap().contains("watchdog"));
+        assert_eq!(seen.len(), 1, "only `ok` runs");
+        // With no test able to judge it, there is no evidence either way.
+        let (outcome, seen) = drive_with(&policy, &fake_tests(&["watchdog"]), &[]);
+        assert_eq!(outcome.kind, VerdictKind::Errored);
+        assert!(seen.is_empty());
+        // Another run starts with an empty memo.
+        let (_, seen) = drive_cpu(
+            true,
+            &fake_tests(&["watchdog"]),
+            &[(RunStatus::Passed, 0.5, 0.5, "")],
+        );
+        assert_eq!(seen.len(), 1);
     }
 
     #[test]

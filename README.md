@@ -298,7 +298,13 @@ which `prove` shows, before you count the kill.
 - **Caught**: a test fails with the mutant and passes without it.
 - **Missed**: every test that reaches the changed code still passes. Either
   the tests do not check this behavior, or the change makes no observable
-  difference. These are the ones to read.
+  difference. These are the ones to read. A selected test that fails even
+  without the mutant (such as a wall-clock watchdog the slower instrumented
+  build cannot meet) cannot judge it; if every other selected test passed,
+  the mutant is still missed, and its verdict names the tests that could
+  not judge it. Within one `test` run, such a test is not run again for
+  later mutants, and the run ends with a list of these tests to add to
+  `[map] skip-tests`.
 - **Not covered**: no test reaches the changed function.
 - **Unviable**: the mutant does not compile.
 - **Caught by timeout**: the mutant uses at least three times the test's
@@ -309,8 +315,8 @@ which `prove` shows, before you count the kill.
   at a normal CPU rate without using three times its usual CPU. Host load
   is the likely cause. `[test-budget]` in `quicksilver.toml` gives named
   tests a longer minimum budget, for example `"my_crate::tests::waits" = 60.0`.
-- **Errored**: a test could not run properly, for example because it fails
-  twice even without the mutant. The final list gives each mutant id and
+- **Errored**: a test could not run properly, for example because every
+  selected test fails twice even without the mutant. The final list gives each mutant id and
   reason. Signal exits name the signal (for example `9 (SIGKILL)`); a test
   stopped at its deadline says `stopped by quicksilver`.
 
