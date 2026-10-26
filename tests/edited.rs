@@ -760,6 +760,80 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert_eq!(survivor.at_head, Some(true));
     assert!(survivor.edits[0].diff.contains("-    true"));
     assert!(survivor.edits[0].diff.contains("+    false"));
+
+    // Apply and prove the real captured survivor in the author's checkout.
+    // Scope grep to always_ok: maybe_hang has a false body even at baseline.
+    assert_eq!(missed_m.edits.len(), 1);
+    assert_eq!(missed_m.edits[0].original, "{\n    true\n}");
+    assert_eq!(missed_m.edits[0].body, "{\n    false\n}");
+    let before_apply = fs::read(&lib).unwrap();
+    let qs = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(repo.path())
+            .args(args)
+            .output()
+            .expect("run QS")
+    };
+    let check_output = |output: &std::process::Output| {
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let scoped_command =
+        r#"! sed -n "/pub fn always_ok()/,/^}/p" crate_a/src/lib.rs | grep -q "    false""#;
+    let grep_exit = || {
+        std::process::Command::new("sh")
+            .args(["-c", scoped_command])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .code()
+    };
+    assert_eq!(grep_exit(), Some(0), "original must pass before prove");
+    let applied = qs(&["apply", &missed_m.id[..8]]);
+    check_output(&applied);
+    assert!(String::from_utf8_lossy(&applied.stdout)
+        .contains(&format!("applied {} to crate_a/src/lib.rs", missed_m.id)));
+    assert_ne!(fs::read(&lib).unwrap(), before_apply);
+    assert_eq!(grep_exit(), Some(1), "mutant must fail before prove");
+    check_output(&qs(&["apply", &missed_m.id, "--revert"]));
+    assert_eq!(fs::read(&lib).unwrap(), before_apply);
+    let proven = qs(&["prove", &missed_m.id, "--", "sh", "-c", scoped_command]);
+    check_output(&proven);
+    let final_line = format!(
+        "caught: {} {}: the command fails with the mutant and passes without it",
+        missed_m.id,
+        missed_m.fqns()
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&proven.stdout).lines().last(),
+        Some(final_line.as_str())
+    );
+    assert_eq!(fs::read(&lib).unwrap(), before_apply);
+
+    // A command spawn error uses exit 3 and still restores the checkout.
+    let spawn_error = qs(&["prove", &missed_m.id, "--", "./missing-qs-proof-command"]);
+    assert_eq!(spawn_error.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&spawn_error.stderr).contains("start command"));
+    assert_eq!(fs::read(&lib).unwrap(), before_apply);
+
+    // The command sends the first Ctrl-C to QS while the mutant is active.
+    // QS must stay alive, revert, and run the clean check again.
+    #[cfg(unix)]
+    {
+        let signal_command = r#"if sed -n "/pub fn always_ok()/,/^}/p" crate_a/src/lib.rs | grep -q "    false"; then kill -INT "$PPID"; exit 1; fi"#;
+        let interrupted = qs(&["prove", &missed_m.id, "--", "sh", "-c", signal_command]);
+        check_output(&interrupted);
+        assert_eq!(
+            String::from_utf8_lossy(&interrupted.stdout).lines().last(),
+            Some(final_line.as_str())
+        );
+        assert_eq!(fs::read(&lib).unwrap(), before_apply);
+    }
+
     let split_dir = tempfile::tempdir().unwrap();
     let buckets = cargo_quicksilver::survivors::split(&survivors, 3);
     for (lane, bucket) in buckets.iter().enumerate() {
@@ -901,5 +975,111 @@ fn a_crate_with_its_own_global_allocator_records_its_tests() {
         map.hits.values().any(|hits| hits.contains(&repeat)),
         "the test that calls repeat was recorded: {:?}",
         map.hits
+    );
+}
+
+/// A checkout at another commit reads the same captured state and matches
+/// function bodies after surrounding text has moved.
+#[test]
+fn apply_uses_shared_state_in_another_checkout_at_a_newer_commit() {
+    let repo = support::setup_tiny();
+    let cfg = support::cfg_for(repo.path());
+    let state = cargo_quicksilver::exec::edited::State {
+        commit: cargo_quicksilver::worktree::head(repo.path()).unwrap(),
+        records: vec![cargo_quicksilver::exec::edited::Record {
+            mutant: EditedMutant {
+                id: "0123456789abcdef".into(),
+                edits: vec![cargo_quicksilver::capture::BodyEdit {
+                    site_id: 1,
+                    package: "tiny_a".into(),
+                    path: "crate_a/src/lib.rs".into(),
+                    fqn: "tiny_a.always_ok".into(),
+                    line: 9,
+                    original: "{\n    true\n}".into(),
+                    body: "{\n    false\n}".into(),
+                }],
+                intent: None,
+            },
+            status: Status::Pending,
+            captured_at: String::new(),
+        }],
+        ..Default::default()
+    };
+    state.save(&cfg.paths()).unwrap();
+    let checkout = tempfile::tempdir().unwrap();
+    let git = |root: &Path, args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            checkout.path().to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let lib = checkout.path().join("crate_a/src/lib.rs");
+    let original = fs::read_to_string(&lib).unwrap();
+    let newer = format!("// moved after the map\n{original}");
+    fs::write(&lib, &newer).unwrap();
+    git(checkout.path(), &["add", "crate_a/src/lib.rs"]);
+    git(
+        checkout.path(),
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "move functions",
+        ],
+    );
+    assert_ne!(
+        cargo_quicksilver::worktree::head(checkout.path()).unwrap(),
+        state.commit
+    );
+    for args in [
+        vec!["apply", "01234567"],
+        vec!["apply", "01234567", "--revert"],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(checkout.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = if args.len() == 2 {
+            assert!(String::from_utf8_lossy(&output.stdout).contains("crate_a/src/lib.rs:10"));
+            newer.replacen(
+                "pub fn always_ok() -> bool {\n    true\n}",
+                "pub fn always_ok() -> bool {\n    false\n}",
+                1,
+            )
+        } else {
+            newer.clone()
+        };
+        assert_eq!(fs::read_to_string(&lib).unwrap(), expected);
+        assert_eq!(
+            fs::read_to_string(repo.path().join("crate_a/src/lib.rs")).unwrap(),
+            original
+        );
+    }
+    git(
+        repo.path(),
+        &["worktree", "remove", checkout.path().to_str().unwrap()],
     );
 }

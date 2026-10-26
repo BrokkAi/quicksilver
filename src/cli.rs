@@ -126,6 +126,10 @@ pub enum Command {
     Pending(PendingArgs),
     /// Review mutants that no selected test caught.
     Survivors(SurvivorsArgs),
+    /// Apply a captured mutant to this checkout, or undo it with --revert.
+    Apply(ApplyArgs),
+    /// Check that a command fails with a mutant and passes after reverting it.
+    Prove(ProveArgs),
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
@@ -264,6 +268,24 @@ pub struct PendingArgs {
     /// Directory for pending-1.txt through pending-N.txt.
     #[arg(long, requires = "split", value_name = "DIR")]
     pub out: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct ApplyArgs {
+    /// Mutant id or unique id prefix from the shared captured state.
+    pub id: String,
+    /// Restore the captured original body instead of applying the mutant.
+    #[arg(long)]
+    pub revert: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ProveArgs {
+    /// Mutant id or unique id prefix from the shared captured state.
+    pub id: String,
+    /// Command and arguments, after --, run in the caller's checkout.
+    #[arg(last = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Args, Debug)]

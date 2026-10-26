@@ -248,15 +248,44 @@ cargo quicksilver survivors --at master
 
 Each record shows the mutant id and intent, its function and unified body
 diffs, how many tests ran and were selected (with a short sample), and
-whether the function remains at `HEAD`. `--json FILE` saves the same records
-as JSON. `--at REV` compares the first edited function against that commit
-(default: HEAD), reporting `unchanged`, `changed`, `gone`, or `unknown` when
+the function's body status at the chosen revision. `--json FILE` saves the
+same records as JSON. `--at REV` compares the first edited function against
+that commit (default: HEAD), reporting `unchanged`, `changed`, `gone`, or `unknown` when
 the file cannot be parsed. The summary counts changed and gone survivors.
 JSON includes `at_commit` and `at_status`, and retains `at_head` as a function
 existence check. `--split N --out DIR` writes `survivors-1.txt` through
 `survivors-N.txt`, balancing survivor counts while keeping each source file
 in one list. Functions match by name and methods by type and name; body
 comparisons use the exact original text saved by the map.
+
+
+## Prove a kill in another checkout
+
+Run these commands in your own workspace checkout or Git worktree of the
+same repository. They read the repository's shared captured mutant state,
+so the checkout may be at a different commit from the map:
+
+```
+cargo quicksilver apply <ID>
+cargo quicksilver apply <ID> --revert
+cargo quicksilver prove <ID> -- cargo test test_that_should_catch_it
+```
+
+`ID` can be the full mutant id or a unique prefix. `apply` locates each
+function by name and matches its original body byte for byte before
+replacing it. It validates every edit before writing; if a function has
+changed since the map, it refuses and shows a diff. Changes outside the
+matched bodies stay in place. Repeating an apply or revert reports that
+there is nothing to change. QS refuses to edit its own managed worktrees.
+
+`prove` applies the mutant, runs your command with your environment and
+stdio, reverts, then runs the command again. It also reverts if the command
+cannot start or you press Ctrl-C. The final result is `caught` (exit 0) when
+the command fails with the mutant and passes without it, `not caught`
+(exit 1) when both runs pass, or `inconclusive` (exit 2) when the command
+fails without the mutant too. Errors such as a refused apply or a command
+that cannot start use exit 3. You can also apply, run your checks manually,
+and revert; reverting needs no record of the earlier apply.
 
 
 ## What the results mean

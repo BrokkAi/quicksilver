@@ -56,6 +56,21 @@ pub(crate) fn functions(source: &str) -> Result<Vec<Located>> {
             syn::visit::visit_item_impl(self, i);
             self.types.pop();
         }
+        fn visit_item_trait(&mut self, i: &'ast syn::ItemTrait) {
+            self.types.push(Some(i.ident.to_string()));
+            syn::visit::visit_item_trait(self, i);
+            self.types.pop();
+        }
+        fn visit_trait_item_fn(&mut self, i: &'ast syn::TraitItemFn) {
+            if let Some(block) = &i.default {
+                let name = match self.types.last() {
+                    Some(Some(ty)) => format!("{ty}.{}", i.sig.ident),
+                    _ => i.sig.ident.to_string(),
+                };
+                self.add(name, i.span().start().line, block);
+            }
+            syn::visit::visit_trait_item_fn(self, i);
+        }
         fn visit_impl_item_fn(&mut self, i: &'ast syn::ImplItemFn) {
             let name = match self.types.last() {
                 Some(Some(ty)) => format!("{ty}.{}", i.sig.ident),
@@ -78,6 +93,25 @@ pub(crate) fn functions(source: &str) -> Result<Vec<Located>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trait_default_method_has_an_exact_body_and_required_method_has_none() {
+        let src = "trait Answer { fn answer(&self) -> bool { true } fn required(&self); }";
+        let functions = functions_named(src, "pkg.Answer.answer").unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "Answer.answer");
+        assert_eq!(&src[functions[0].body.clone()], "{ true }");
+        assert!(functions_named(src, "pkg.Answer.required")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn body_offsets_count_utf8_bytes_with_unicode_on_the_same_line() {
+        let src = r#"/* é */ fn f() -> &'static str { "é" }"#;
+        let function = functions_named(src, "pkg.f").unwrap().remove(0);
+        assert_eq!(&src[function.body], r#"{ "é" }"#);
+    }
+
     #[test]
     fn free_function_and_exact_body() {
         let src = "// é\nfn free() -> bool { true }\n";

@@ -1,3 +1,4 @@
+pub mod apply;
 pub mod baseline;
 pub mod capture;
 pub mod cargo_cmd;
@@ -59,6 +60,8 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Uncovered(args) => cmd_uncovered(&cli.common, args),
         cli::Command::Pending(args) => pending::run(&cli.common, args),
         cli::Command::Survivors(args) => survivors::run(&cli.common, args),
+        cli::Command::Apply(args) => apply::run_apply(&cli.common, args),
+        cli::Command::Prove(args) => apply::run_prove(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
     };
     if let Some(line) = sandbox::summary() {
