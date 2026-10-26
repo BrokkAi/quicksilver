@@ -821,16 +821,20 @@ fn edited_mutants_are_captured_built_and_judged() {
     assert_eq!(fs::read(&lib).unwrap(), before_apply);
 
     // The command sends the first Ctrl-C to QS while the mutant is active.
-    // QS must stay alive, revert, and run the clean check again.
+    // QS must stay alive long enough to revert, then stop: an interrupted
+    // command's exit status proves nothing.
     #[cfg(unix)]
     {
         let signal_command = r#"if sed -n "/pub fn always_ok()/,/^}/p" crate_a/src/lib.rs | grep -q "    false"; then kill -INT "$PPID"; exit 1; fi"#;
         let interrupted = qs(&["prove", &missed_m.id, "--", "sh", "-c", signal_command]);
-        check_output(&interrupted);
-        assert_eq!(
-            String::from_utf8_lossy(&interrupted.stdout).lines().last(),
-            Some(final_line.as_str())
+        assert_eq!(interrupted.status.code(), Some(3));
+        assert!(
+            String::from_utf8_lossy(&interrupted.stderr)
+                .contains("interrupted; the mutant is reverted"),
+            "{}",
+            String::from_utf8_lossy(&interrupted.stderr)
         );
+        assert!(String::from_utf8_lossy(&interrupted.stdout).contains("reverted"));
         assert_eq!(fs::read(&lib).unwrap(), before_apply);
     }
 

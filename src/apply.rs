@@ -226,7 +226,7 @@ pub fn prove(
     argv: &[String],
 ) -> Result<(i32, String)> {
     ensure!(!argv.is_empty(), "prove requires a command after --");
-    let _stop = crate::engine::install_ctrlc();
+    let stop = crate::engine::install_ctrlc();
     let messages = apply(root, managed, mutant, commit, false)?;
     let mut guard = RevertGuard {
         root,
@@ -242,6 +242,11 @@ pub fn prove(
     // Restore before propagating a spawn error; Drop also covers unwinding.
     guard.restore()?;
     let with_mutant = with_mutant?;
+    // An interrupt stopped the command; its exit status proves nothing.
+    ensure!(
+        !stop.load(std::sync::atomic::Ordering::SeqCst),
+        "interrupted; the mutant is reverted"
+    );
     let without_mutant = command(root, argv)?;
     let (code, label, reason) = if !without_mutant.success() {
         (

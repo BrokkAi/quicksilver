@@ -280,12 +280,17 @@ there is nothing to change. QS refuses to edit its own managed worktrees.
 
 `prove` applies the mutant, runs your command with your environment and
 stdio, reverts, then runs the command again. It also reverts if the command
-cannot start or you press Ctrl-C. The final result is `caught` (exit 0) when
+cannot start, and if you press Ctrl-C, after which it stops (exit 3). The final result is `caught` (exit 0) when
 the command fails with the mutant and passes without it, `not caught`
 (exit 1) when both runs pass, or `inconclusive` (exit 2) when the command
 fails without the mutant too. Errors such as a refused apply or a command
 that cannot start use exit 3. You can also apply, run your checks manually,
 and revert; reverting needs no record of the earlier apply.
+
+`prove` judges only the command's exit status. If the mutant does not
+compile in this checkout (code elsewhere changed since the map), a cargo
+command fails as well, and `prove` says `caught`: read the command's output,
+which `prove` shows, before you count the kill.
 
 
 ## What the results mean
