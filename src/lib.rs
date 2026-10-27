@@ -179,10 +179,33 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     Ok(if unviable > 0 { 1 } else { 0 })
 }
 
+/// Every test the map found not green: its id and why, then the end of its
+/// output, indented.
+fn not_green_report(map: &sitemap::SiteMap) -> String {
+    let mut out = String::new();
+    for (test, why) in &map.not_green {
+        out.push_str(&format!("{test}: {why}\n"));
+        if let Some(tail) = map.not_green_output.get(test) {
+            for line in tail.lines() {
+                out.push_str(&format!("    | {line}\n"));
+            }
+        }
+    }
+    out
+}
+
 fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let head = worktree::head(&cfg.repo_root)?;
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
+    if args.not_green {
+        print!("{}", not_green_report(&map));
+        eprintln!(
+            "{} test(s) failed with no mutant active and select no mutants",
+            map.not_green.len()
+        );
+        return Ok(0);
+    }
     let files = crate::discover::file_globset(&cfg.files)?;
     let in_scope = |s: &sitemap::MapSite| {
         (cfg.packages.is_empty() || cfg.packages.contains(&s.package))
@@ -245,7 +268,7 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
     }
     if !map.not_green.is_empty() {
         eprintln!(
-            "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed. `map` printed why; the map's JSON (`map --json FILE`) keeps the end of each one's output under `not_green_output`",
+            "{} test(s) failed without any mutant and count for nothing; a function only they reach is listed. `uncovered --not-green` lists them with why and the end of their output",
             map.not_green.len()
         );
     }

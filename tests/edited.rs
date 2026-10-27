@@ -83,6 +83,24 @@ fn edited_mutants_are_captured_built_and_judged() {
         "{output}"
     );
     assert_eq!(map.not_green.len(), 1, "{:?}", map.not_green);
+    // `uncovered --not-green` lists it with why and the end of its output.
+    let listed = std::process::Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+        .current_dir(repo.path())
+        .args(["quicksilver", "uncovered", "--not-green"])
+        .output()
+        .expect("run uncovered --not-green");
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    assert!(
+        stdout.contains("red_only_when_asked: failed with no mutant active")
+            && stdout.contains("    | ")
+            && stdout.contains("asked to fail by FIXTURE_NOT_GREEN"),
+        "{stdout}"
+    );
     assert_eq!(
         map.skipped_tests,
         vec!["tiny_schema::tests::timing_guard_red_under_quicksilver".to_string()]

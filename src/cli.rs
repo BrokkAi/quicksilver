@@ -205,6 +205,11 @@ pub struct UncoveredArgs {
     /// `*_for_test`, or under a `cfg` that mentions `test`.
     #[arg(long)]
     pub scaffolding: bool,
+    /// Instead, list every test that failed with no mutant active when the
+    /// map was built, with why and the end of its output. Such tests select
+    /// no mutants.
+    #[arg(long)]
+    pub not_green: bool,
 }
 
 #[derive(Args, Debug)]
