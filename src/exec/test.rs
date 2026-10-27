@@ -908,7 +908,7 @@ where
     R: FnMut(&RunSpec) -> Result<(RunStatus, Duration, f64, String)>,
 {
     let (retry, retry_secs, _retry_cpu, retry_err) = run(&spec_for(t, budget, extra_env, true))?;
-    tracing::info!(
+    tracing::debug!(
         "confirm {}: retry with mutant {:?} in {:.2}s; output: {}",
         t.name,
         retry,
@@ -924,7 +924,7 @@ where
         return Ok(Step::Next);
     }
     let (mut null, mut null_secs, _, mut null_err) = run(&spec_for(t, budget, &[], true))?;
-    tracing::info!(
+    tracing::debug!(
         "confirm {}: null run {:?} in {:.2}s; output: {}",
         t.name,
         null,
@@ -938,7 +938,7 @@ where
         null = status;
         null_secs = wall;
         null_err = stderr;
-        tracing::info!(
+        tracing::debug!(
             "confirm {}: second null run {}",
             t.name,
             null.describe(null_secs)
