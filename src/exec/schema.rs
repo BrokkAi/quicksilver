@@ -2,26 +2,20 @@
 
 use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
 use crate::config::Config;
-use crate::coupling::CouplingRow;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
     run_mutant_tests_observed, run_mutant_tests_with_env, BinariesManifest, ManifestTest,
-    ObservedRun, TestRunPolicy,
+    TestRunPolicy,
 };
 use crate::exec::{append_outcome, load_resume, ExecResult};
-use crate::higher_order::{
-    choose_second_order_pairs, choose_triage_pairs, classify_triage,
-    implied_first_order_probability, pair_id, summarize_vector, union_tests, RunnableMutant,
-    SecondOrderExperiment, SecondOrderReport, TriageFinding, TriageReport,
-};
 use crate::plan::Plan;
 use crate::schema::{
     apply_schema_to_tree, attribute_spans, build_sites, chunk_sites, disable_attributed,
     disable_sites, inject_runtime, lookup_variant, parse_compiler_error_spans, qs_mutant_env,
-    qs_mutants_env, restore_files, snapshot_sources, Site,
+    restore_files, snapshot_sources, Site,
 };
 use crate::scratch::{ensure_worker, remove_extra_workers};
-use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo, VerdictKind};
+use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo};
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::{BTreeSet, HashMap};
@@ -42,8 +36,6 @@ struct SchemaReady {
     /// child programs it starts can see the active mutant.
     tree: PathBuf,
     env: Vec<(String, String)>,
-    site_id: u32,
-    variant: u32,
     /// Dropped once this mutant has a verdict. The build thread waits for
     /// every token of a batch before it restores the original source.
     _batch: Sender<()>,
@@ -93,8 +85,7 @@ pub fn execute(
     }
 
     let cargo_invocations = Arc::new(AtomicU64::new(0));
-    let runnable = Arc::new(Mutex::new(Vec::<RunnableMutant>::new()));
-    let coupling_rows = Arc::new(Mutex::new(Vec::<CouplingRow>::new()));
+    let selected_test_ids = Arc::new(Mutex::new(HashMap::<String, Vec<String>>::new()));
     let jobs: Vec<(String, Vec<PlannedMutant>)> = by_pkg.into_iter().collect();
     let n_mutants: usize = jobs.iter().map(|(_, v)| v.len()).sum();
     info!(
@@ -127,7 +118,6 @@ pub fn execute(
             let paths = Arc::clone(&paths);
             let cancel = Arc::clone(&cancel);
             let cargo_invocations = Arc::clone(&cargo_invocations);
-            let runnable = Arc::clone(&runnable);
             scope.spawn(move || {
                 let mut worker: Option<PathBuf> = None;
                 while let Ok((package, planned)) = job_rx.recv() {
@@ -148,15 +138,7 @@ pub fn execute(
                         },
                     };
                     let planned_for_err = planned.clone();
-                    let dispatch = |r: SchemaReady| -> bool {
-                        runnable.lock().unwrap().push(RunnableMutant {
-                            planned: r.planned.clone(),
-                            run_dir: r.run_dir.clone(),
-                            site_id: r.site_id,
-                            variant: r.variant,
-                        });
-                        ready_tx.send(r).is_ok()
-                    };
+                    let dispatch = |r: SchemaReady| -> bool { ready_tx.send(r).is_ok() };
                     match run_crate(
                         &cfg,
                         &paths,
@@ -195,7 +177,7 @@ pub fn execute(
             let out_tx: Sender<Outcome> = out_tx.clone();
             let cfg = Arc::clone(&cfg);
             let cancel = Arc::clone(&cancel);
-            let coupling_rows = Arc::clone(&coupling_rows);
+            let selected_test_ids = Arc::clone(&selected_test_ids);
             scope.spawn(move || {
                 while let Ok(ready) = ready_rx.recv() {
                     if cancel.load(Ordering::Relaxed) {
@@ -212,12 +194,21 @@ pub fn execute(
                     );
                     match observed {
                         Ok(run) => {
-                            coupling_rows.lock().unwrap().push(row_from_run(
+                            selected_test_ids.lock().unwrap().insert(
                                 ready.planned.mutant.id.clone(),
-                                vec![ready.planned.mutant.id.clone()],
-                                &ready.planned,
-                                &run,
-                            ));
+                                ready
+                                    .planned
+                                    .tests
+                                    .iter()
+                                    .map(|test| {
+                                        if test.id.is_empty() {
+                                            test.name.clone()
+                                        } else {
+                                            test.id.clone()
+                                        }
+                                    })
+                                    .collect(),
+                            );
                             let _ = out_tx.send(run.outcome);
                         }
                         Err(err) => {
@@ -250,266 +241,22 @@ pub fn execute(
         progress.elapsed_secs()
     ));
     remove_extra_workers(&paths);
-    let mut evidence_rows = coupling_rows.lock().unwrap().clone();
-    let triage = if cfg.triage {
-        let (report, rows) =
-            run_triage(&cfg, &paths.baseline, &outcomes, &runnable.lock().unwrap())?;
-        evidence_rows.extend(rows);
-        Some(report)
-    } else {
-        None
-    };
-    let second_order = if cfg.second_order_pairs > 0 {
-        let (report, rows) =
-            run_second_order(&cfg, &paths.baseline, &outcomes, &runnable.lock().unwrap())?;
-        evidence_rows.extend(rows);
-        Some(report)
-    } else {
-        None
-    };
     // QS_KEEP_RUNS=1 keeps staged schema binaries for debugging.
     if std::env::var_os("QS_KEEP_RUNS").is_none() {
         let _ = fs::remove_dir_all(paths.runs.join("schema"));
     }
 
+    let selected_test_ids = selected_test_ids.lock().unwrap().clone();
     Ok(ExecResult {
         cargo_invocations: cargo_invocations.load(Ordering::SeqCst),
         outcomes,
-        triage,
-        second_order,
-        coupling_rows: evidence_rows,
-        coupling: None,
+        selected_test_ids,
     })
 }
 
 struct CrateDone {
     unviable: Vec<Outcome>,
     keep: Vec<PathBuf>,
-}
-
-fn run_triage(
-    cfg: &Config,
-    baseline: &Path,
-    outcomes: &[Outcome],
-    runnable: &[RunnableMutant],
-) -> Result<(TriageReport, Vec<CouplingRow>)> {
-    let pairs = choose_triage_pairs(runnable, outcomes, cfg.triage_neighbors);
-    let survivors = outcomes
-        .iter()
-        .filter(|outcome| outcome.kind == VerdictKind::Missed)
-        .count();
-    info!(
-        "triage: {} survivor(s), {} survivor/control experiment(s)",
-        survivors,
-        pairs.len()
-    );
-    let policy = TestRunPolicy {
-        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
-        slowdown: SCHEMA_SLOWDOWN,
-        confirm: true,
-        unusable: Default::default(),
-    };
-    let mut experiments = Vec::new();
-    let mut rows = Vec::new();
-    for pair in pairs {
-        let tests = union_tests(&pair.survivor.planned, &pair.control.planned);
-        let survivor_plan = PlannedMutant {
-            mutant: pair.survivor.planned.mutant.clone(),
-            tests: tests.clone(),
-            estimated_cost_secs: 0.0,
-        };
-        let control_plan = PlannedMutant {
-            mutant: pair.control.planned.mutant.clone(),
-            tests: tests.clone(),
-            estimated_cost_secs: 0.0,
-        };
-        let pair_plan = PlannedMutant {
-            mutant: pair.survivor.planned.mutant.clone(),
-            tests,
-            estimated_cost_secs: 0.0,
-        };
-        let survivor_env = vec![qs_mutant_env(pair.survivor.site_id, pair.survivor.variant)];
-        let control_env = vec![qs_mutant_env(pair.control.site_id, pair.control.variant)];
-        let pair_env = vec![qs_mutants_env(&[
-            (pair.survivor.site_id, pair.survivor.variant),
-            (pair.control.site_id, pair.control.variant),
-        ])];
-        let survivor_run = run_mutant_tests_observed(
-            &survivor_plan,
-            &pair.survivor.run_dir,
-            baseline,
-            &policy,
-            &survivor_env,
-            true,
-        )?;
-        let control_run = run_mutant_tests_observed(
-            &control_plan,
-            &pair.control.run_dir,
-            baseline,
-            &policy,
-            &control_env,
-            true,
-        )?;
-        let pair_run = run_mutant_tests_observed(
-            &pair_plan,
-            &pair.survivor.run_dir,
-            baseline,
-            &policy,
-            &pair_env,
-            true,
-        )?;
-        let (classification, survivor, control, pair_summary) = classify_triage(
-            &survivor_run.observations,
-            survivor_run.complete,
-            &control_run.observations,
-            control_run.complete,
-            &pair_run.observations,
-            pair_run.complete,
-        );
-        let survivor_id = pair.survivor.planned.mutant.id.clone();
-        let control_id = pair.control.planned.mutant.id.clone();
-        rows.push(row_from_run(
-            survivor_id.clone(),
-            vec![survivor_id.clone()],
-            &survivor_plan,
-            &survivor_run,
-        ));
-        rows.push(row_from_run(
-            control_id.clone(),
-            vec![control_id.clone()],
-            &control_plan,
-            &control_run,
-        ));
-        rows.push(row_from_run(
-            pair_id(&survivor_id, &control_id),
-            vec![survivor_id.clone(), control_id.clone()],
-            &pair_plan,
-            &pair_run,
-        ));
-        experiments.push(TriageFinding {
-            survivor_id,
-            survivor_fqn: pair.survivor.planned.mutant.fqn.clone(),
-            control_id,
-            control_fqn: pair.control.planned.mutant.fqn.clone(),
-            classification,
-            survivor,
-            control,
-            pair: pair_summary,
-        });
-    }
-    Ok((
-        TriageReport {
-            survivors,
-            experiments,
-        },
-        rows,
-    ))
-}
-
-fn run_second_order(
-    cfg: &Config,
-    baseline: &Path,
-    outcomes: &[Outcome],
-    runnable: &[RunnableMutant],
-) -> Result<(SecondOrderReport, Vec<CouplingRow>)> {
-    let (eligible_mutants, pairs) =
-        choose_second_order_pairs(runnable, outcomes, cfg.second_order_pairs, cfg.sample_seed);
-    info!(
-        "second-order estimate: {} pair(s) from {} eligible mutant(s)",
-        pairs.len(),
-        eligible_mutants
-    );
-    let policy = TestRunPolicy {
-        floor: cfg.timeout_floor.max(Duration::from_secs(30)),
-        slowdown: SCHEMA_SLOWDOWN,
-        confirm: true,
-        unusable: Default::default(),
-    };
-    let mut experiments = Vec::new();
-    let mut rows = Vec::new();
-    for pair in pairs {
-        let tests = union_tests(&pair.left.planned, &pair.right.planned);
-        let plan = PlannedMutant {
-            mutant: pair.left.planned.mutant.clone(),
-            tests,
-            estimated_cost_secs: 0.0,
-        };
-        let env = vec![qs_mutants_env(&[
-            (pair.left.site_id, pair.left.variant),
-            (pair.right.site_id, pair.right.variant),
-        ])];
-        let run =
-            run_mutant_tests_observed(&plan, &pair.left.run_dir, baseline, &policy, &env, true)?;
-        let vector = summarize_vector(&run.observations, run.complete);
-        let left = pair.left.planned.mutant.id.clone();
-        let right = pair.right.planned.mutant.id.clone();
-        let activation_id = pair_id(&left, &right);
-        rows.push(row_from_run(
-            activation_id.clone(),
-            vec![left.clone(), right.clone()],
-            &plan,
-            &run,
-        ));
-        experiments.push(SecondOrderExperiment {
-            pair_id: activation_id,
-            mutant_ids: [left, right],
-            vector,
-        });
-    }
-    let completed_pairs = experiments
-        .iter()
-        .filter(|experiment| experiment.vector.complete && experiment.vector.comparable)
-        .count();
-    let caught_pairs = experiments
-        .iter()
-        .filter(|experiment| {
-            experiment.vector.complete
-                && experiment.vector.comparable
-                && !experiment.vector.killed_test_ids.is_empty()
-        })
-        .count();
-    let higher_order_kill_rate = if completed_pairs == 0 {
-        0.0
-    } else {
-        caught_pairs as f64 / completed_pairs as f64
-    };
-    Ok((SecondOrderReport {
-        requested_pairs: cfg.second_order_pairs,
-        eligible_mutants,
-        completed_pairs,
-        caught_pairs,
-        higher_order_kill_rate,
-        implied_first_order_kill_probability: implied_first_order_probability(
-            higher_order_kill_rate,
-        ),
-        experiments,
-        assumption: "p = 1 - sqrt(1 - h) assumes independently killable, equally distributed first-order constituents within this paired sample; it supplements rather than replaces first-order verdicts".into(),
-    }, rows))
-}
-
-fn row_from_run(
-    activation_id: String,
-    mutant_ids: Vec<String>,
-    planned: &PlannedMutant,
-    run: &ObservedRun,
-) -> CouplingRow {
-    CouplingRow::new(
-        activation_id,
-        mutant_ids,
-        planned
-            .tests
-            .iter()
-            .map(|test| {
-                if test.id.is_empty() {
-                    test.name.clone()
-                } else {
-                    test.id.clone()
-                }
-            })
-            .collect(),
-        run.observations.clone(),
-        run.complete,
-    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -669,8 +416,6 @@ fn run_crate(
                     run_dir: run_dir.clone(),
                     tree: worker.to_path_buf(),
                     env: vec![qs_mutant_env(site.site_id, variant)],
-                    site_id: site.site_id,
-                    variant,
                     _batch: batch_tx.clone(),
                 });
             }

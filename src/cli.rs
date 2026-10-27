@@ -22,12 +22,6 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub test_jobs: Option<usize>,
 
-    /// Parallelism assumed for the cargo-mutants comparison baseline (J_cm).
-    /// Defaults to the same RAM/CPU formula as --build-jobs: cargo-mutants
-    /// workers each run a full rustc and will not actually use all cores.
-    #[arg(long, global = true)]
-    pub cm_jobs: Option<usize>,
-
     /// Restrict mutants to these packages.
     #[arg(long = "package", short = 'p', global = true)]
     pub packages: Vec<String>,
@@ -59,7 +53,7 @@ pub struct CommonOpts {
     #[arg(long, global = true)]
     pub in_diff: Option<String>,
 
-    /// Machine-readable outcomes / estimate.
+    /// Machine-readable outcomes.
     #[arg(long, global = true)]
     pub json: Option<PathBuf>,
 
@@ -68,7 +62,7 @@ pub struct CommonOpts {
     pub resume: bool,
 
     /// Cross-machine sharding, locality-preserving slices (`K/N`).
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub shard: Option<String>,
 
     /// Workspace root (directory containing Cargo.toml).
@@ -80,11 +74,11 @@ pub struct CommonOpts {
     pub max_build_memory: Option<String>,
 
     /// Abort if free space where QS keeps its state falls below this many bytes.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub max_scratch: Option<u64>,
 
     /// How many times to run the baseline suite. >1 catches flakes.
-    #[arg(long, global = true, default_value_t = 1)]
+    #[arg(long, global = true, default_value_t = 1, hide = true)]
     pub baseline_runs: u32,
 
     /// Floor for per-mutant test timeouts, in milliseconds.
@@ -92,15 +86,12 @@ pub struct CommonOpts {
     pub timeout_floor_ms: u64,
 
     /// Hold the build slot until selected tests finish, so tests never see a later mutant's source.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub strict_source_isolation: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Sample mutation outcomes and extrapolate exhaustive-run wall clock.
-    /// Needs a map of HEAD from `cargo quicksilver map`.
-    Estimate(EstimateArgs),
     /// Execute mutants with the schema engine.
     Run(RunArgs),
     /// Print the mutant catalog and exit.
@@ -135,38 +126,6 @@ pub enum Command {
     Clean,
 }
 
-#[derive(Args, Debug)]
-pub struct EstimateArgs {
-    /// Mutants to run end to end.
-    #[arg(long, default_value_t = 150)]
-    pub sample: usize,
-    /// Reproducible sampling.
-    #[arg(long, default_value_t = 1)]
-    pub sample_seed: u64,
-    /// Skip the green-suite / rebuild-cost measurements (tests only).
-    #[arg(long, hide = true)]
-    pub skip_baseline: bool,
-    /// Deprecated: schemata is the only engine; this flag is accepted and ignored.
-    #[arg(long, global = false, hide = true)]
-    pub schema: bool,
-    /// Isolation rebuilds that map rustc diagnostics back to sites.
-    #[arg(long, default_value_t = 5)]
-    pub schema_max_rounds: u32,
-    /// Split a crate's sites when this many are exceeded. 0 = one batch per crate.
-    #[arg(long, default_value_t = 0)]
-    pub schema_batch_size: usize,
-    /// Prior run's `--json` report to compare verdicts against (differential gate).
-    #[arg(long)]
-    pub diff_against: Option<PathBuf>,
-    /// Identity-mutant gate: sites to activate with the original-body variant.
-    /// 0 means every site in the batch.
-    #[arg(long, default_value_t = 8)]
-    pub identity_sample: usize,
-    /// Execute this many disjoint second-order mutant pairs after the sample.
-    #[arg(long, default_value_t = 0)]
-    pub second_order_pairs: usize,
-}
-
 #[derive(Args, Debug, Default)]
 pub struct RunArgs {
     /// Maximum mutants to execute (after NotCovered filtering). 0 means no cap.
@@ -174,28 +133,19 @@ pub struct RunArgs {
     pub limit: usize,
     #[arg(long, hide = true)]
     pub skip_baseline: bool,
-    /// Deprecated: schemata is the only engine; this flag is accepted and ignored.
-    #[arg(long, global = false, hide = true)]
-    pub schema: bool,
     /// Isolation rebuilds that map rustc diagnostics back to sites.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 5, hide = true)]
     pub schema_max_rounds: u32,
     /// Split a crate's sites when this many are exceeded. 0 = one batch per crate.
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, hide = true)]
     pub schema_batch_size: usize,
     /// Prior run's `--json` report to compare verdicts against (differential gate).
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub diff_against: Option<PathBuf>,
     /// Identity-mutant gate: sites to activate with the original-body variant.
     /// 0 means every site in the batch.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, hide = true)]
     pub identity_sample: usize,
-    /// Run higher-order survivor triage after first-order verdicts.
-    #[arg(long)]
-    pub triage: bool,
-    /// Nearby caught controls to combine with each survivor.
-    #[arg(long, default_value_t = 1)]
-    pub triage_neighbors: usize,
 }
 
 #[derive(Args, Debug)]
@@ -212,11 +162,11 @@ pub struct AuditSelectionArgs {
 #[derive(Args, Debug, Default)]
 pub struct MapArgs {
     /// Isolation rebuilds that map rustc diagnostics back to sites.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 5, hide = true)]
     pub schema_max_rounds: u32,
     /// Sites to check with the identity variant active after recording.
     /// 0 means every entered site.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8, hide = true)]
     pub identity_sample: usize,
 }
 
@@ -242,7 +192,7 @@ pub struct BuildArgs {
     #[arg(long, value_name = "FILE")]
     pub intents: Option<std::path::PathBuf>,
     /// Isolation rebuilds that map rustc diagnostics back to variants.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 5, hide = true)]
     pub schema_max_rounds: u32,
 }
 
@@ -342,4 +292,109 @@ pub fn parse_cli() -> Cli {
         args.remove(1);
     }
     Cli::parse_from(args)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn release_help_and_developer_options() {
+        let mut command = Cli::command();
+        let visible: Vec<_> = command
+            .get_subcommands()
+            .filter(|c| !c.is_hide_set())
+            .map(|c| c.get_name())
+            .collect();
+        assert_eq!(
+            visible,
+            [
+                "run",
+                "list",
+                "map",
+                "build",
+                "test",
+                "uncovered",
+                "pending",
+                "survivors",
+                "apply",
+                "prove",
+                "clean"
+            ]
+        );
+        let help = command.render_long_help().to_string();
+        for flag in [
+            "--shard",
+            "--max-scratch",
+            "--baseline-runs",
+            "--strict-source-isolation",
+            "--cm-jobs",
+        ] {
+            assert!(!help.contains(flag), "{flag} leaked into help");
+        }
+        for subcommand in ["run", "map", "build"] {
+            let help = command
+                .find_subcommand_mut(subcommand)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            for flag in [
+                "--diff-against",
+                "--schema-max-rounds",
+                "--schema-batch-size",
+                "--identity-sample",
+            ] {
+                assert!(!help.contains(flag), "{flag} leaked into {subcommand} help");
+            }
+        }
+        let parsed = Cli::try_parse_from([
+            "qs",
+            "run",
+            "--shard",
+            "1/2",
+            "--max-scratch",
+            "100",
+            "--baseline-runs",
+            "2",
+            "--strict-source-isolation",
+            "--schema-max-rounds",
+            "3",
+            "--schema-batch-size",
+            "7",
+            "--identity-sample",
+            "4",
+            "--diff-against",
+            "prior.json",
+            "--skip-baseline",
+        ])
+        .unwrap();
+        assert_eq!(parsed.common.shard.as_deref(), Some("1/2"));
+        assert_eq!(parsed.common.max_scratch, Some(100));
+        assert_eq!(parsed.common.baseline_runs, 2);
+        assert!(parsed.common.strict_source_isolation);
+        let Command::Run(args) = parsed.command else {
+            panic!("expected run")
+        };
+        assert_eq!(args.schema_max_rounds, 3);
+        assert_eq!(args.schema_batch_size, 7);
+        assert_eq!(args.identity_sample, 4);
+        assert_eq!(args.diff_against, Some(PathBuf::from("prior.json")));
+        assert!(args.skip_baseline);
+        for subcommand in ["map", "build"] {
+            assert!(Cli::try_parse_from(["qs", subcommand, "--schema-max-rounds", "3"]).is_ok());
+        }
+        assert!(Cli::try_parse_from(["qs", "map", "--identity-sample", "4"]).is_ok());
+        assert!(Cli::try_parse_from(["qs", "audit-selection", "--skip-baseline"]).is_ok());
+        for args in [
+            vec!["qs", "estimate"],
+            vec!["qs", "run", "--schema"],
+            vec!["qs", "run", "--triage"],
+            vec!["qs", "run", "--triage-neighbors", "1"],
+            vec!["qs", "run", "--second-order-pairs", "1"],
+            vec!["qs", "--cm-jobs", "2", "run"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
 }

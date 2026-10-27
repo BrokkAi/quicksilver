@@ -27,23 +27,6 @@ pub fn covering_seeds(cfg: &Config) -> Vec<String> {
     cfg.packages.clone()
 }
 
-/// Packages whose incremental `cargo build --tests -p` we time for t_build.
-///
-/// A scoped estimate rebuilds the mutant's crate, not the whole workspace.
-/// Timing every member serializes a rustc on a shared box and then averages
-/// in unrelated crates, which both wastes cores and biases t_build.
-pub fn packages_for_rebuild_timing(packages: &[String], meta: &Metadata) -> Vec<String> {
-    let seeds = packages.to_vec();
-    if seeds.is_empty() {
-        meta.workspace_packages()
-            .iter()
-            .map(|p| p.name.to_string())
-            .collect()
-    } else {
-        seeds
-    }
-}
-
 /// The packages whose tests QS builds, lists, times and runs; empty means
 /// the whole workspace. With `--package`, only the named packages' own
 /// tests, unless `--reverse-dependents` adds every workspace package that
@@ -654,18 +637,6 @@ mod tests {
             "tiny_a does not depend on tiny_b: {php_like:?}"
         );
         assert!(!php_like.contains("tiny_c"));
-    }
-
-    #[test]
-    fn rebuild_timing_uses_seeds_not_the_whole_workspace() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
-        let meta = load_metadata(&root).expect("tiny metadata");
-        let scoped = packages_for_rebuild_timing(&["tiny_a".into()], &meta);
-        assert_eq!(scoped, vec!["tiny_a".to_string()]);
-        let unscoped = packages_for_rebuild_timing(&[], &meta);
-        assert!(unscoped.len() >= 3, "{unscoped:?}");
-        assert!(unscoped.iter().any(|p| p == "tiny_a"));
-        assert!(unscoped.iter().any(|p| p == "tiny_b"));
     }
 
     #[test]

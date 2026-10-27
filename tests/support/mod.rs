@@ -99,7 +99,6 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         skip_tests: Vec::new(),
         build_jobs: 2,
         test_jobs: 4,
-        cm_jobs: 8,
         max_build_memory_frac: 0.7,
         max_scratch: None,
         packages: Vec::new(),
@@ -109,8 +108,6 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         json: None,
         resume: false,
         shard: None,
-        sample: 0,
-        sample_seed: 1,
         baseline_runs: 1,
         timeout_floor: std::time::Duration::from_millis(800),
         strict_source_isolation: false,
@@ -120,8 +117,5 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         schema_batch_size: 0,
         diff_against: None,
         identity_sample: 0,
-        triage: false,
-        triage_neighbors: 1,
-        second_order_pairs: 0,
     }
 }

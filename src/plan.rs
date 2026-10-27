@@ -67,7 +67,7 @@ pub struct Plan {
 pub enum TestMode {
     /// Tests the coverage index claims execute this mutant.
     Impact,
-    /// Every catalogued test (the cargo-mutants full-suite ground truth).
+    /// Every catalogued test, for the full-suite ground truth.
     FullSuite,
 }
 
@@ -256,4 +256,19 @@ pub fn unique_packages(plan: &Plan) -> usize {
 
 pub fn scoped_len(plan: &Plan) -> usize {
     plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>() + plan.not_covered.len()
+}
+
+/// Choose a reproducible sample for the selection audit.
+pub fn sample_mutants(mutants: &[Mutant], n: usize, seed: u64) -> Vec<Mutant> {
+    use rand::seq::SliceRandom;
+    use rand::{Rng, SeedableRng};
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut v = mutants.to_vec();
+    v.shuffle(&mut rng);
+    if n == 0 || n >= v.len() {
+        return v;
+    }
+    v.truncate(n);
+    let _ = rng.gen::<u64>();
+    v
 }

@@ -2,7 +2,6 @@ use crate::baseline::{preflight_recompile_count, prepare_baseline};
 use crate::cargo_cmd::load_metadata;
 use crate::config::{merge_config, Config, ConfigExtras, FileConfig};
 use crate::discover::DiscoverFilter;
-use crate::estimate::{self, EstimateReport};
 use crate::index;
 use crate::plan::{self, Plan};
 use crate::scratch;
@@ -81,8 +80,6 @@ pub struct Prepared {
     pub mutants: Vec<Mutant>,
     /// Every listed test, with baseline durations attached.
     pub tests: Vec<TestInfo>,
-    /// The commit under test; keys evidence that depends on the source.
-    pub source_key: String,
     /// Candidate tests per package. The executor narrows each mutant to the
     /// tests its recording run saw enter the mutated function.
     pub selector: plan::PackageSelector,
@@ -97,12 +94,12 @@ impl Prepared {
     }
 }
 
-pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<Prepared> {
+pub fn prepare(cfg: Config, skip_baseline: bool) -> Result<Prepared> {
     let paths = cfg.paths();
-    let baseline = if !skip_baseline && !for_estimate {
+    let baseline = if !skip_baseline {
         crate::baseline::prepare_baseline_reusing_timings(&cfg, &paths)?
     } else {
-        prepare_baseline(&cfg, &paths, skip_baseline, for_estimate)?
+        prepare_baseline(&cfg, &paths, skip_baseline)?
     };
     scratch::check_free_space(&paths.session, cfg.max_scratch)?;
 
@@ -162,7 +159,6 @@ pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<P
         plan.batches.iter().map(|b| b.mutants.len()).sum::<usize>(),
         plan.not_covered.len()
     );
-    let source_key = crate::worktree::head(&paths.main_tree())?;
 
     Ok(Prepared {
         cfg,
@@ -170,7 +166,6 @@ pub fn prepare(cfg: Config, skip_baseline: bool, for_estimate: bool) -> Result<P
         baseline,
         mutants,
         tests,
-        source_key,
         selector,
         property_tests,
         plan,
@@ -205,31 +200,20 @@ pub fn run_schema_detailed(
     };
     let mut exec =
         crate::exec::schema::execute(&prepared.cfg, &prepared.paths, plan, cancel, limit)?;
-    let rows = std::mem::take(&mut exec.coupling_rows);
     // A survivor that only proptest properties judged may be caught on
     // another run, with other random cases.
     if !prepared.property_tests.is_empty() {
-        let tests_of: std::collections::HashMap<&str, &Vec<String>> = rows
-            .iter()
-            .filter(|r| r.mutant_ids.len() == 1)
-            .map(|r| (r.mutant_ids[0].as_str(), &r.selected_test_ids))
-            .collect();
         for o in &mut exec.outcomes {
             if o.kind != crate::types::VerdictKind::Missed {
                 continue;
             }
-            if tests_of.get(o.mutant.id.as_str()).is_some_and(|ids| {
+            if exec.selected_test_ids.get(&o.mutant.id).is_some_and(|ids| {
                 !ids.is_empty() && ids.iter().all(|i| prepared.property_tests.contains(i))
             }) {
                 o.message = Some(crate::proptest::NOTE.to_string());
             }
         }
     }
-    exec.coupling = Some(crate::coupling::merge_and_save(
-        &prepared.paths,
-        &prepared.source_key,
-        rows,
-    )?);
     Ok(exec)
 }
 
@@ -283,63 +267,10 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
     }
 }
 
-/// The estimate for a full run, from the executed sample and a census of
-/// every discovered mutant against `map`: a mutant whose function no test
-/// entered needs neither a build nor a test run, and the others run the tests
-/// that entered their function, with the durations the map recorded.
-pub fn estimate_from(
-    prepared: &Prepared,
-    map: &crate::sitemap::SiteMap,
-    sample_size: usize,
-    outcomes: &[Outcome],
-) -> EstimateReport {
-    let scope = if prepared.cfg.packages.is_empty() {
-        "workspace".to_string()
-    } else {
-        prepared.cfg.packages.join(", ")
-    };
-    let selector = crate::sitemap::MapSelector::new(map);
-    let census = plan::plan(
-        &prepared.mutants,
-        &selector,
-        &prepared.baseline,
-        prepared.cfg.shard,
-        prepared.cfg.build_jobs,
-    );
-    estimate::compute(
-        prepared.mutants.len(),
-        &census,
-        &census,
-        &prepared.baseline,
-        outcomes,
-        prepared.cfg.build_jobs,
-        prepared.cfg.test_jobs,
-        prepared.cfg.cm_jobs,
-        scope,
-        sample_size,
-    )
-}
-
-pub fn write_outputs(
-    cfg: &Config,
-    outcomes: &[Outcome],
-    estimate: Option<&EstimateReport>,
-    cargo_invocations: u64,
-    triage: Option<&crate::higher_order::TriageReport>,
-    second_order: Option<&crate::higher_order::SecondOrderReport>,
-    coupling: Option<&crate::coupling::CouplingSummary>,
-) -> Result<()> {
+pub fn write_outputs(cfg: &Config, outcomes: &[Outcome], cargo_invocations: u64) -> Result<()> {
     crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json_with_evidence(
-            path,
-            outcomes,
-            estimate,
-            cargo_invocations,
-            triage,
-            second_order,
-            coupling,
-        )?;
+        crate::report::write_json(path, outcomes, cargo_invocations)?;
     }
     Ok(())
 }

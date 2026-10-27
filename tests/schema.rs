@@ -82,7 +82,7 @@ fn schema_gates_and_differential_self_consistent() {
     let repo = support::setup_tiny();
     let scratch = tempfile::tempdir().unwrap();
     let cfg = schema_cfg(repo.path());
-    let prepared = prepare(cfg, false, false).expect("prepare tiny_schema");
+    let prepared = prepare(cfg, false).expect("prepare tiny_schema");
 
     let (v2, cargo_invocations) = run_schema(&prepared, 0, None).expect("schema run");
     assert!(!v2.is_empty(), "expected outcomes for tiny_schema");
@@ -145,7 +145,7 @@ fn schema_gates_and_differential_self_consistent() {
     // itself. Serialize run one as the `--json` report shape and gate run two
     // against it.
     let reference = scratch.path().join("reference.json");
-    cargo_quicksilver::report::write_json(&reference, &v2, None, cargo_invocations)
+    cargo_quicksilver::report::write_json(&reference, &v2, cargo_invocations)
         .expect("write reference report");
 
     // Fresh state, same scratch so the coverage index and baseline are cached.
@@ -153,7 +153,7 @@ fn schema_gates_and_differential_self_consistent() {
     // rather than reading back run one's outcomes.jsonl.
     let cfg2 = schema_cfg(repo.path());
     assert!(!cfg2.resume, "run two must not resume run one's verdicts");
-    let prepared2 = prepare(cfg2, false, false).expect("prepare schema again");
+    let prepared2 = prepare(cfg2, false).expect("prepare schema again");
     let (v2b, _) = run_schema(&prepared2, 0, None).expect("second schema run");
     assert_eq!(
         v2b.len(),

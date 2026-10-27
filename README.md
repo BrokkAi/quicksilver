@@ -417,7 +417,7 @@ for the repository:
 cargo quicksilver clean
 ```
 
-`cargo quicksilver --help` lists the other commands, such as `estimate`.
+`cargo quicksilver --help` lists the other commands.
 
 
 ## License

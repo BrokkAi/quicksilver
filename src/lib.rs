@@ -4,12 +4,9 @@ pub mod capture;
 pub mod cargo_cmd;
 pub mod cli;
 pub mod config;
-pub mod coupling;
 pub mod discover;
 pub mod engine;
-pub mod estimate;
 pub mod exec;
-pub mod higher_order;
 pub mod index;
 pub mod linediff;
 pub mod locate;
@@ -33,8 +30,8 @@ pub mod worktree;
 use anyhow::Result;
 use config::ConfigExtras;
 use discover::discover;
-use estimate::sample_mutants;
 use outcome::OutcomeCounts;
+use plan::sample_mutants;
 use types::VerdictKind;
 
 pub fn init_tracing() {
@@ -52,7 +49,6 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     let result = match cli.command {
         cli::Command::List(_) => cmd_list(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
-        cli::Command::Estimate(args) => cmd_estimate(&cli.common, args),
         cli::Command::AuditSelection(args) => cmd_audit_selection(&cli.common, args),
         cli::Command::Map(args) => cmd_map(&cli.common, args),
         cli::Command::Build(args) => cmd_build(&cli.common, args),
@@ -390,26 +386,15 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
         schema_batch_size: args.schema_batch_size,
         diff_against: args.diff_against.clone(),
         identity_sample: args.identity_sample,
-        triage: args.triage,
-        triage_neighbors: args.triage_neighbors,
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
-    let prepared = engine::prepare(cfg, args.skip_baseline, false)?;
+    let prepared = engine::prepare(cfg, args.skip_baseline)?;
     let _ = engine::maybe_preflight(&prepared)?;
     let exec = engine::run_schema_detailed(&prepared, args.limit, None)?;
     let outcomes = &exec.outcomes;
     let cargo_invocations = exec.cargo_invocations;
     crate::report::print_exhaustive(outcomes);
-    if let Some(triage) = &exec.triage {
-        crate::report::print_triage(triage);
-    }
-    if let Some(second_order) = &exec.second_order {
-        crate::report::print_second_order(second_order);
-    }
-    if let Some(coupling) = &exec.coupling {
-        crate::report::print_coupling(coupling);
-    }
     if let Some(path) = &prepared.cfg.diff_against {
         let diffs = crate::schema::gate_differential(path, outcomes)?;
         if !diffs.is_empty() {
@@ -420,15 +405,7 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
                     d.mutant_id, d.fqn, d.v1, d.v2
                 );
             }
-            engine::write_outputs(
-                &prepared.cfg,
-                outcomes,
-                None,
-                cargo_invocations,
-                exec.triage.as_ref(),
-                exec.second_order.as_ref(),
-                exec.coupling.as_ref(),
-            )?;
+            engine::write_outputs(&prepared.cfg, outcomes, cargo_invocations)?;
             return Ok(2);
         }
         eprintln!(
@@ -436,28 +413,18 @@ fn cmd_run(common: &cli::CommonOpts, args: cli::RunArgs) -> Result<i32> {
             outcomes.len()
         );
     }
-    engine::write_outputs(
-        &prepared.cfg,
-        outcomes,
-        None,
-        cargo_invocations,
-        exec.triage.as_ref(),
-        exec.second_order.as_ref(),
-        exec.coupling.as_ref(),
-    )?;
+    engine::write_outputs(&prepared.cfg, outcomes, cargo_invocations)?;
     let missed = outcomes.iter().any(|o| o.kind == VerdictKind::Missed);
     Ok(if missed { 1 } else { 0 })
 }
 
 fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) -> Result<i32> {
     let extras = ConfigExtras {
-        sample: args.sample,
-        sample_seed: args.sample_seed,
         resume: false,
         ..ConfigExtras::default()
     };
     let (cfg, _) = engine::config_from_cli(common, extras)?;
-    let mut prepared = engine::prepare(cfg, args.skip_baseline, false)?;
+    let mut prepared = engine::prepare(cfg, args.skip_baseline)?;
     if !args.skip_baseline {
         let _ = engine::maybe_preflight(&prepared)?;
     }
@@ -488,80 +455,6 @@ fn cmd_audit_selection(common: &cli::CommonOpts, args: cli::AuditSelectionArgs) 
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     }
     Ok(if report.lost_kills > 0 { 1 } else { 0 })
-}
-
-fn cmd_estimate(common: &cli::CommonOpts, args: cli::EstimateArgs) -> Result<i32> {
-    let extras = ConfigExtras {
-        sample: args.sample,
-        sample_seed: args.sample_seed,
-        schema_max_rounds: args.schema_max_rounds,
-        schema_batch_size: args.schema_batch_size,
-        diff_against: args.diff_against.clone(),
-        identity_sample: args.identity_sample,
-        second_order_pairs: args.second_order_pairs,
-        ..ConfigExtras::default()
-    };
-    let (cfg, _) = engine::config_from_cli(common, extras)?;
-    // Which functions any test enters, for every mutant, comes from the map
-    // of this commit. Check for it before the long preparation.
-    let map = exec::edited::map_at(&cfg.paths(), &worktree::head(&cfg.repo_root)?)?;
-    let prepared = engine::prepare(cfg, args.skip_baseline, true)?;
-    if !args.skip_baseline {
-        let _ = engine::maybe_preflight(&prepared)?;
-    }
-    let sample = sample_mutants(&prepared.mutants, args.sample, args.sample_seed);
-    eprintln!(
-        "running sample of {} mutants through the pipeline",
-        sample.len()
-    );
-    let exec = engine::run_schema_detailed(&prepared, 0, Some(&sample))?;
-    let outcomes = &exec.outcomes;
-    let cargo_invocations = exec.cargo_invocations;
-    if let Some(path) = &prepared.cfg.diff_against {
-        let diffs = crate::schema::gate_differential(path, outcomes)?;
-        if !diffs.is_empty() {
-            eprintln!("differential gate failed: {} disagreements", diffs.len());
-            for d in &diffs {
-                eprintln!(
-                    "  {}  {}  reference={:?} this run={:?}",
-                    d.mutant_id, d.fqn, d.v1, d.v2
-                );
-            }
-            engine::write_outputs(
-                &prepared.cfg,
-                outcomes,
-                None,
-                cargo_invocations,
-                None,
-                exec.second_order.as_ref(),
-                exec.coupling.as_ref(),
-            )?;
-            return Ok(2);
-        }
-        eprintln!(
-            "differential gate: {} reference verdicts matched",
-            outcomes.len()
-        );
-    }
-    let mut report = engine::estimate_from(&prepared, &map, sample.len(), outcomes);
-    report.sample_counts.cargo_invocations = cargo_invocations as usize;
-    print!("{}", estimate::render(&report));
-    if let Some(second_order) = &exec.second_order {
-        crate::report::print_second_order(second_order);
-    }
-    if let Some(coupling) = &exec.coupling {
-        crate::report::print_coupling(coupling);
-    }
-    engine::write_outputs(
-        &prepared.cfg,
-        outcomes,
-        Some(&report),
-        cargo_invocations,
-        None,
-        exec.second_order.as_ref(),
-        exec.coupling.as_ref(),
-    )?;
-    Ok(0)
 }
 
 pub fn counts(outcomes: &[types::Outcome]) -> OutcomeCounts {

@@ -13,8 +13,6 @@ pub struct FileConfig {
     pub build_jobs: Option<usize>,
     #[serde(rename = "test-jobs")]
     pub test_jobs: Option<usize>,
-    #[serde(rename = "cm-jobs")]
-    pub cm_jobs: Option<usize>,
     #[serde(rename = "build-env", default)]
     pub build_env: BTreeMap<String, String>,
     /// Test binaries from other packages to run with `--package`.
@@ -72,8 +70,6 @@ pub struct Config {
     pub prefix: String,
     pub build_jobs: usize,
     pub test_jobs: usize,
-    /// Comparison baseline width for cargo-mutants (J_cm). Not the QS build pool.
-    pub cm_jobs: usize,
     pub max_build_memory_frac: f64,
     pub max_scratch: Option<u64>,
     pub packages: Vec<String>,
@@ -98,8 +94,6 @@ pub struct Config {
     pub json: Option<PathBuf>,
     pub resume: bool,
     pub shard: Option<(u32, u32)>,
-    pub sample: usize,
-    pub sample_seed: u64,
     pub baseline_runs: u32,
     pub timeout_floor: Duration,
     pub strict_source_isolation: bool,
@@ -111,9 +105,6 @@ pub struct Config {
     pub diff_against: Option<PathBuf>,
     /// Identity-mutant gate sample per schema batch. 0 means every site.
     pub identity_sample: usize,
-    pub triage: bool,
-    pub triage_neighbors: usize,
-    pub second_order_pairs: usize,
 }
 
 impl Config {
@@ -162,13 +153,6 @@ pub fn merge_config(
         .or(file.build_jobs)
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
-    // cargo-mutants workers are RAM-bound the same way the QS build pool is.
-    // Defaulting to nproc (120 here) would overstate the competitor.
-    let cm_jobs = cli
-        .cm_jobs
-        .or(file.cm_jobs)
-        .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
-
     let mut build_env = file.build_env;
     if let Ok(v) = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE") {
         build_env
@@ -195,7 +179,6 @@ pub fn merge_config(
         prefix: repo.prefix,
         build_jobs: build_jobs.max(1),
         test_jobs: test_jobs.max(1),
-        cm_jobs: cm_jobs.max(1),
         max_build_memory_frac,
         max_scratch: cli.max_scratch,
         packages: extras.packages,
@@ -220,8 +203,6 @@ pub fn merge_config(
         json: extras.json,
         resume: extras.resume,
         shard: extras.shard,
-        sample: extras.sample,
-        sample_seed: extras.sample_seed,
         baseline_runs: extras.baseline_runs,
         timeout_floor: Duration::from_millis(extras.timeout_floor_ms),
         strict_source_isolation: extras.strict_source_isolation,
@@ -235,9 +216,6 @@ pub fn merge_config(
         schema_batch_size: extras.schema_batch_size,
         diff_against: extras.diff_against,
         identity_sample: extras.identity_sample,
-        triage: extras.triage,
-        triage_neighbors: extras.triage_neighbors.max(1),
-        second_order_pairs: extras.second_order_pairs,
     })
 }
 
@@ -249,8 +227,6 @@ pub struct ConfigExtras {
     pub json: Option<PathBuf>,
     pub resume: bool,
     pub shard: Option<(u32, u32)>,
-    pub sample: usize,
-    pub sample_seed: u64,
     pub baseline_runs: u32,
     pub timeout_floor_ms: u64,
     pub strict_source_isolation: bool,
@@ -259,9 +235,6 @@ pub struct ConfigExtras {
     pub schema_batch_size: usize,
     pub diff_against: Option<PathBuf>,
     pub identity_sample: usize,
-    pub triage: bool,
-    pub triage_neighbors: usize,
-    pub second_order_pairs: usize,
 }
 
 #[cfg(test)]

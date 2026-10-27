@@ -1,4 +1,3 @@
-use crate::estimate::EstimateReport;
 use crate::outcome::OutcomeCounts;
 use crate::types::{Outcome, VerdictKind};
 use anyhow::Result;
@@ -14,15 +13,7 @@ pub struct JsonReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
     pub outcomes: Vec<Outcome>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub estimate: Option<EstimateReport>,
     pub counts: CountReport,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub triage: Option<crate::higher_order::TriageReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub second_order: Option<crate::higher_order::SecondOrderReport>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub coupling: Option<crate::coupling::CouplingSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,98 +115,16 @@ pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
     }
 }
 
-pub fn write_json(
-    path: &Path,
-    outcomes: &[Outcome],
-    estimate: Option<&EstimateReport>,
-    cargo_invocations: u64,
-) -> Result<()> {
-    write_json_with_evidence(
-        path,
-        outcomes,
-        estimate,
-        cargo_invocations,
-        None,
-        None,
-        None,
-    )
-}
-
-pub fn write_json_with_evidence(
-    path: &Path,
-    outcomes: &[Outcome],
-    estimate: Option<&EstimateReport>,
-    cargo_invocations: u64,
-    triage: Option<&crate::higher_order::TriageReport>,
-    second_order: Option<&crate::higher_order::SecondOrderReport>,
-    coupling: Option<&crate::coupling::CouplingSummary>,
-) -> Result<()> {
+pub fn write_json(path: &Path, outcomes: &[Outcome], cargo_invocations: u64) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
     let mut report = JsonReport {
         target: crate::target::host_triple(Path::new(".")).ok(),
         outcomes: outcomes.to_vec(),
-        estimate: estimate.cloned(),
         counts: CountReport::from(&counts),
-        triage: triage.cloned(),
-        second_order: second_order.cloned(),
-        coupling: coupling.cloned(),
     };
     report.counts.cargo_invocations = cargo_invocations;
     crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;
     Ok(())
-}
-
-pub fn print_triage(report: &crate::higher_order::TriageReport) {
-    eprintln!("=== cargo-quicksilver survivor triage ===");
-    eprintln!(
-        "survivors: {}  experiments: {}",
-        report.survivors,
-        report.experiments.len()
-    );
-    for finding in &report.experiments {
-        eprintln!(
-            "  {} + {}  {:?}  kills survivor/control/pair={}/{}/{}",
-            finding.survivor_id,
-            finding.control_id,
-            finding.classification,
-            finding.survivor.killed_test_ids.len(),
-            finding.control.killed_test_ids.len(),
-            finding.pair.killed_test_ids.len()
-        );
-    }
-}
-
-pub fn print_second_order(report: &crate::higher_order::SecondOrderReport) {
-    eprintln!("=== cargo-quicksilver second-order estimate ===");
-    eprintln!(
-        "pairs: {}/{} completed ({} caught); h={:.3}; implied first-order p={:.3}",
-        report.completed_pairs,
-        report.requested_pairs,
-        report.caught_pairs,
-        report.higher_order_kill_rate,
-        report.implied_first_order_kill_probability
-    );
-    eprintln!("assumption: {}", report.assumption);
-}
-
-pub fn print_coupling(report: &crate::coupling::CouplingSummary) {
-    eprintln!(
-        "coupling artifact: {} row(s), {} complete, {} test column(s), {} subsumption relation(s) at {}",
-        report.rows,
-        report.complete_rows,
-        report.test_columns,
-        report.subsumptions.len(),
-        report.path.display()
-    );
-    if report.invalidated_for_source_change {
-        eprintln!("  prior coupling rows invalidated because the source cache key changed");
-    }
-    for relation in &report.subsumptions {
-        eprintln!(
-            "  {} subsumes {}",
-            relation.dominator_id, relation.subsumed_id
-        );
-    }
 }
 
 pub fn print_exhaustive(outcomes: &[Outcome]) {

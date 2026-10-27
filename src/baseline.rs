@@ -1,15 +1,15 @@
 use crate::cargo_cmd::{
-    apply_build_env, count_compiling_units, crate_root_source, dump_metadata_json, load_metadata,
-    nextest_available, write_nextest_config, BuildResult,
+    apply_build_env, count_compiling_units, dump_metadata_json, load_metadata, nextest_available,
+    write_nextest_config, BuildResult,
 };
 use crate::config::Config;
 use crate::discover::{apply_mutant, restore_file};
-use crate::types::{BaselineReport, Mutant, PackageCost, Paths, TestInfo};
+use crate::types::{BaselineReport, Mutant, Paths, TestInfo};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
 use std::process::Stdio;
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 use tracing::info;
 
 /// Check out the checkout's HEAD in QS's main worktree (creating it the
@@ -238,48 +238,6 @@ fn attr(tag: &str, key: &str) -> Option<String> {
     Some(rest[..j].to_string())
 }
 
-pub fn measure_package_costs(cfg: &Config, paths: &Paths) -> Result<Vec<PackageCost>> {
-    let meta = load_metadata(&paths.baseline)?;
-    let target = paths.baseline.join("target");
-    let names = crate::cargo_cmd::packages_for_rebuild_timing(&cfg.packages, &meta);
-    let mut costs = Vec::new();
-    for name in names {
-        let Some(src) = crate_root_source(&meta, &name) else {
-            continue;
-        };
-        if !src.is_file() {
-            continue;
-        }
-        touch(&src)?;
-        info!("timing incremental rebuild of {name}");
-        let start = Instant::now();
-        match crate::cargo_cmd::build_tests(
-            &paths.baseline,
-            &target,
-            cfg,
-            std::slice::from_ref(&name),
-            false,
-        ) {
-            Ok(_) => {
-                costs.push(PackageCost {
-                    package: name,
-                    rebuild_secs: start.elapsed().as_secs_f64(),
-                });
-            }
-            Err(err) => {
-                tracing::warn!("rebuild of {name} failed: {err}");
-            }
-        }
-    }
-    Ok(costs)
-}
-
-fn touch(path: &Path) -> Result<()> {
-    let f = fs::OpenOptions::new().write(true).open(path)?;
-    f.set_modified(SystemTime::now())?;
-    Ok(())
-}
-
 /// Mutate one throwaway function, rebuild, count how many units recompiled.
 pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -> Result<u64> {
     let original = apply_mutant(&paths.baseline, mutant)?;
@@ -384,17 +342,10 @@ pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<B
             return Ok(earlier);
         }
     }
-    prepare_baseline(cfg, paths, false, false)
+    prepare_baseline(cfg, paths, false)
 }
 
-/// `measure_costs` times one incremental rebuild per package. Only `estimate`
-/// uses those costs; `run` skips them.
-pub fn prepare_baseline(
-    cfg: &Config,
-    paths: &Paths,
-    skip: bool,
-    measure_costs: bool,
-) -> Result<BaselineReport> {
+pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<BaselineReport> {
     let _meta = materialize_and_metadata(cfg, paths)?;
     if skip {
         if let Some(existing) = load_baseline_report(paths)? {
@@ -410,15 +361,10 @@ pub fn prepare_baseline(
     }
     build_baseline(cfg, paths)?;
     let (suite_secs, tests, failed_test_ids) = run_green_suite(cfg, paths)?;
-    let package_costs = if measure_costs {
-        measure_package_costs(cfg, paths)?
-    } else {
-        Vec::new()
-    };
     let report = BaselineReport {
         suite_secs,
         tests,
-        package_costs,
+        package_costs: Vec::new(),
         preflight_recompiled: None,
         failed_test_ids,
     };

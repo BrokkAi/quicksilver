@@ -104,7 +104,7 @@ pub fn write_atomic(path: &Path, data: impl AsRef<[u8]>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Unique tmp per process. Parallel estimate shards share an index dir;
+    // Unique tmp per process. Parallel run shards share an index dir;
     // `foo.json` → `foo.tmp` raced: one rename unlinked the other's tmp and
     // the next rename returned ENOENT.
     let tmp = unique_tmp_path(path);

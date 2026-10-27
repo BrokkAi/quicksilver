@@ -1,8 +1,7 @@
 mod support;
 
 use cargo_quicksilver::discover::{discover, mutant_id, DiscoverFilter};
-use cargo_quicksilver::engine::{prepare, run_schema, run_schema_detailed};
-use cargo_quicksilver::higher_order::TriageClassification;
+use cargo_quicksilver::engine::{prepare, run_schema};
 use cargo_quicksilver::types::VerdictKind;
 use std::fs;
 
@@ -90,10 +89,9 @@ fn caught_missed_notcovered_timeout() {
         return;
     }
     let repo = support::setup_tiny();
-    let scratch = tempfile::tempdir().unwrap();
     let mut cfg = support::cfg_for(repo.path());
     cfg.timeout_floor = std::time::Duration::from_millis(800);
-    let mut prepared = prepare(cfg, false, false).expect("prepare");
+    let prepared = prepare(cfg, false).expect("prepare");
 
     let uncovered = prepared
         .mutants
@@ -140,59 +138,6 @@ fn caught_missed_notcovered_timeout() {
         missed
     );
 
-    prepared.cfg.triage = true;
-    prepared.cfg.triage_neighbors = 1;
-    prepared.cfg.second_order_pairs = 1;
-    let triaged = run_schema_detailed(
-        &prepared,
-        0,
-        Some(&[add0_for_triage(&prepared), always_false.clone()]),
-    )
-    .expect("triage survivor against add control");
-    let triage = triaged.triage.as_ref().expect("triage report");
-    assert_eq!(triage.survivors, 1);
-    assert_eq!(triage.experiments.len(), 1);
-    assert_eq!(
-        triage.experiments[0].classification,
-        TriageClassification::LikelyEquivalent
-    );
-    let second_order = triaged.second_order.as_ref().expect("second-order report");
-    assert_eq!(second_order.requested_pairs, 1);
-    assert_eq!(second_order.completed_pairs, 1);
-    assert_eq!(second_order.caught_pairs, 1);
-    assert_eq!(second_order.implied_first_order_kill_probability, 1.0);
-    let coupling = triaged.coupling.as_ref().expect("coupling summary");
-    assert!(
-        coupling.path.is_file(),
-        "artifact path: {}",
-        coupling.path.display()
-    );
-    assert!(coupling.rows >= 3, "single and pair rows: {coupling:?}");
-    assert!(
-        coupling.complete_rows >= 3,
-        "triage completes all three vectors"
-    );
-    assert!(
-        coupling.test_columns >= 2,
-        "union tests must become columns"
-    );
-    let evidence_json = scratch.path().join("evidence.json");
-    cargo_quicksilver::report::write_json_with_evidence(
-        &evidence_json,
-        &triaged.outcomes,
-        None,
-        triaged.cargo_invocations,
-        triaged.triage.as_ref(),
-        triaged.second_order.as_ref(),
-        triaged.coupling.as_ref(),
-    )
-    .expect("write evidence JSON");
-    let evidence: serde_json::Value =
-        serde_json::from_slice(&fs::read(evidence_json).unwrap()).unwrap();
-    assert!(evidence["triage"].is_object());
-    assert!(evidence["second_order"].is_object());
-    assert!(evidence["coupling"].is_object());
-
     let hang = prepared
         .mutants
         .iter()
@@ -212,17 +157,6 @@ fn caught_missed_notcovered_timeout() {
     );
 }
 
-fn add0_for_triage(
-    prepared: &cargo_quicksilver::engine::Prepared,
-) -> cargo_quicksilver::types::Mutant {
-    prepared
-        .mutants
-        .iter()
-        .find(|m| m.fqn.contains("add") && m.replacement.contains('0'))
-        .cloned()
-        .expect("add -> 0")
-}
-
 /// Selecting tests by recorded site hits must not lose a kill: every
 /// fixture mutant gets the same verdict with the selected tests as with every
 /// candidate test, and no test reaches the functions selection calls
@@ -237,7 +171,7 @@ fn selection_loses_no_kill_against_the_full_suite() {
     let mut cfg = support::cfg_for(repo.path());
     cfg.timeout_floor = std::time::Duration::from_millis(800);
     cfg.identity_sample = 0;
-    let prepared = prepare(cfg, false, false).expect("prepare");
+    let prepared = prepare(cfg, false).expect("prepare");
     let (selected, _) = run_schema(&prepared, 0, None).expect("selected run");
     let full_plan = cargo_quicksilver::plan::plan_full_suite(
         &prepared.mutants,
@@ -284,7 +218,7 @@ fn a_child_process_built_from_the_workspace_sees_the_mutant() {
     let mut cfg = support::cfg_for(repo.path());
     // The first run in a tree compiles the example; later runs only start it.
     cfg.timeout_floor = std::time::Duration::from_secs(60);
-    let prepared = prepare(cfg, false, false).expect("prepare");
+    let prepared = prepare(cfg, false).expect("prepare");
     let (outcomes, _) = run_schema(&prepared, 0, None).expect("schema run");
     let greeting: Vec<_> = outcomes
         .iter()
@@ -346,14 +280,14 @@ fn sites_mode_reuses_baseline_timings_within_a_session() {
         let cfg = support::cfg_for(repo.path());
         cfg
     };
-    let first = prepare(cfg(), false, false).expect("first prepare");
+    let first = prepare(cfg(), false).expect("first prepare");
     let report = first.paths.index.join("baseline.json");
     let saved = fs::metadata(&report).unwrap().modified().unwrap();
     let first_tests = first.baseline.tests.len();
     assert!(first_tests > 0, "the first run times the suite");
     drop(first);
 
-    let second = prepare(cfg(), false, false).expect("second prepare");
+    let second = prepare(cfg(), false).expect("second prepare");
     assert_eq!(
         fs::metadata(&report).unwrap().modified().unwrap(),
         saved,
@@ -464,7 +398,7 @@ fn extra_tests_add_one_downstream_binary_to_a_package_run() {
         cfg.packages = vec!["tiny_a".into()];
         cfg.extra_tests = extra.iter().map(|s| s.to_string()).collect();
         cfg.timeout_floor = std::time::Duration::from_millis(800);
-        let prepared = prepare(cfg, false, false).expect("prepare");
+        let prepared = prepare(cfg, false).expect("prepare");
         let packages: std::collections::BTreeSet<String> =
             prepared.tests.iter().map(|t| t.package.clone()).collect();
         let always_false = prepared

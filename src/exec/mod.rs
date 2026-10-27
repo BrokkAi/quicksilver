@@ -13,10 +13,8 @@ pub struct ExecResult {
     pub outcomes: Vec<Outcome>,
     /// Real `cargo` invocations, not per-mutant Outcome.build flags.
     pub cargo_invocations: u64,
-    pub triage: Option<crate::higher_order::TriageReport>,
-    pub second_order: Option<crate::higher_order::SecondOrderReport>,
-    pub(crate) coupling_rows: Vec<crate::coupling::CouplingRow>,
-    pub coupling: Option<crate::coupling::CouplingSummary>,
+    /// Selected tests for each executed mutant, used for proptest survivor notes.
+    pub(crate) selected_test_ids: std::collections::HashMap<String, Vec<String>>,
 }
 
 pub(crate) fn append_outcome(path: &std::path::Path, outcome: &Outcome) -> Result<()> {

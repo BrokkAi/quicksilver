@@ -678,7 +678,7 @@ fn all_tests_planned(map_tests: &[TestInfo]) -> PlannedMutant {
 /// Build the map: baseline, sites, one workspace build with identity-only
 /// prologues, staged binaries, gates, and the recording run.
 pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
-    let baseline = crate::baseline::prepare_baseline(cfg, paths, false, false)?;
+    let baseline = crate::baseline::prepare_baseline(cfg, paths, false)?;
     let mut tests = crate::index::list_tests_plain(cfg, paths)?;
     let timing = crate::index::attach_timings(&mut tests, &baseline.tests);
     info!(
