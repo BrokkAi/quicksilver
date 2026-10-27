@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Format, lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # rust-toolchain.toml pins the toolchain and its components.
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --lib
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        run: rustup toolchain install
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+      # quicksilver runs every build through mbx. This is mbx's documented
+      # install from a release archive, checked against its SHA256SUMS.
+      - name: Install mbx
+        run: |
+          mkdir -p ~/.local/bin
+          archive=mbx-x86_64-unknown-linux-gnu.tar.gz
+          release=https://github.com/jdx/mr-boxington/releases/latest/download
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "$release/$archive"
+          curl -fsSLO "$release/SHA256SUMS"
+          grep "  $archive$" SHA256SUMS | sha256sum --check --strict -
+          tar -xzf "$archive" -C ~/.local/bin
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Check the tools
+        run: |
+          mbx --version
+          cargo nextest --version
+      # Run each suite on its own, so one failure does not hide the others.
+      - name: End-to-end tests
+        if: ${{ !cancelled() }}
+        run: cargo test --test edited
+      - name: Engine tests
+        if: ${{ !cancelled() }}
+        run: cargo test --test engine
+      - name: Schema tests
+        if: ${{ !cancelled() }}
+        run: cargo test --test schema

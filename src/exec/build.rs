@@ -72,12 +72,10 @@ pub(crate) fn resolve_binary(
         return Ok(candidate);
     }
     if let Some(key) = &exact_name {
-        // cargo uses the profile dir name
-        for dir in ["debug"] {
-            let p = target_dir.join(dir).join("deps").join(key);
-            if p.is_file() {
-                return Ok(p);
-            }
+        // cargo uses the profile dir name; tests build in `debug`.
+        let p = target_dir.join("debug").join("deps").join(key);
+        if p.is_file() {
+            return Ok(p);
         }
     }
     anyhow::bail!(
