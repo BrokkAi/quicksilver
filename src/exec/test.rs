@@ -1,6 +1,4 @@
-use crate::exec::process::{
-    run_exact_capture_output_with_env, run_exact_capture_with_env, run_exact_with_env, RunStatus,
-};
+use crate::exec::process::{run_exact_capture_output_with_env, run_exact_with_env, RunStatus};
 use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
 use anyhow::Result;
@@ -58,6 +56,12 @@ impl UnusableMemo {
     fn get(&self, t: &ResolvedTest) -> Option<InfraSkip> {
         let memo = self.0.lock().unwrap_or_else(|e| e.into_inner());
         memo.get(&(t.binary.clone(), t.name.clone())).cloned()
+    }
+
+    /// The ids of the tests found unusable so far in this run.
+    pub fn ids(&self) -> std::collections::HashSet<String> {
+        let memo = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        memo.values().map(|s| s.id.clone()).collect()
     }
 
     fn remember(&self, t: &ResolvedTest, skip: &InfraSkip) {
@@ -306,8 +310,10 @@ pub fn run_mutant_tests_against(
             }
         }
         let spec = &spec;
+        // libtest prints a failing test's panic and output on stdout, so a
+        // confirmation run keeps stdout as well as stderr.
         if spec.capture {
-            run_exact_capture_with_env(
+            run_exact_capture_output_with_env(
                 &spec.binary,
                 &spec.test_name,
                 &spec.cwd,
@@ -683,8 +689,9 @@ fn resolve_tests(
 #[derive(Debug, Clone)]
 pub struct InfraSkip {
     test: String,
+    id: String,
     reason: String,
-    stderr: String,
+    output: String,
 }
 
 enum Step {
@@ -837,11 +844,11 @@ where
         });
     }
     let message = format!(
-        "{} selected test(s) unusable under schema binary (fail with no mutant active); first: {} {}; stderr: {}",
+        "{} selected test(s) unusable under schema binary (fail with no mutant active); first: {} {}; output: {}",
         skipped.len(),
         first.test,
         first.reason,
-        first.stderr
+        first.output
     );
     tracing::info!("confirm: {}", message);
     Ok(ObservedRun {
@@ -902,7 +909,7 @@ where
 {
     let (retry, retry_secs, _retry_cpu, retry_err) = run(&spec_for(t, budget, extra_env, true))?;
     tracing::info!(
-        "confirm {}: retry with mutant {:?} in {:.2}s; stderr: {}",
+        "confirm {}: retry with mutant {:?} in {:.2}s; output: {}",
         t.name,
         retry,
         retry_secs.as_secs_f64(),
@@ -918,7 +925,7 @@ where
     }
     let (mut null, mut null_secs, _, mut null_err) = run(&spec_for(t, budget, &[], true))?;
     tracing::info!(
-        "confirm {}: null run {:?} in {:.2}s; stderr: {}",
+        "confirm {}: null run {:?} in {:.2}s; output: {}",
         t.name,
         null,
         null_secs.as_secs_f64(),
@@ -958,7 +965,7 @@ where
         // non-101 exit) under the mutant, on the same schema binary that
         // passes without it, is a test detecting the mutant.
         let message = format!(
-            "{} ({}) and passes without it; test {}; stderr: {}",
+            "{} ({}) and passes without it; test {}; output: {}",
             crate::types::CRASH_PREFIX,
             exit,
             t.name,
@@ -982,8 +989,9 @@ where
     );
     Ok(Step::Skip(InfraSkip {
         test: t.name.clone(),
+        id: t.id.clone(),
         reason: null.describe(null_secs),
-        stderr: tail(&null_err, MESSAGE_TAIL),
+        output: tail(&null_err, MESSAGE_TAIL),
     }))
 }
 
@@ -1752,7 +1760,7 @@ mod tests {
         assert!(msg.starts_with(crate::types::CRASH_PREFIX), "{msg}");
         assert!(msg.contains("(exit 1)"), "{msg}");
         assert!(
-            msg.contains("stderr: error while loading shared libraries"),
+            msg.contains("output: error while loading shared libraries"),
             "{msg}"
         );
     }

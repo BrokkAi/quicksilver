@@ -1573,6 +1573,35 @@ pub fn verdict_line(m: &EditedMutant, v: &Verdict) -> String {
 /// own.
 type BuiltMutant = (EditedMutant, Vec<(u32, u32)>, bool);
 
+/// Kills by a test that later in the run failed with no mutant active
+/// cannot be trusted: such a test also fails at random, and may have done so
+/// under the mutant while passing its run without it. They become errored,
+/// so `test --again errored` checks them again. Returns a line for each.
+fn unconfirm_kills(
+    results: &mut [(EditedMutant, Verdict)],
+    unusable: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (m, v) in results.iter_mut() {
+        let Some(test) = v.test.clone() else {
+            continue;
+        };
+        if v.kind != VerdictKind::Caught || !unusable.contains(&test) {
+            continue;
+        }
+        lines.push(format!(
+            "  UNCONFIRMED {} {}: caught by {test}, which later in this run failed with no mutant active; counted as errored",
+            m.id,
+            m.fqns()
+        ));
+        v.kind = VerdictKind::Errored;
+        v.message = Some(format!(
+            "unconfirmed kill: {test} failed with this mutant, but later in this run it failed with no mutant active, so the failure may be chance; retest with `cargo quicksilver test --again errored`"
+        ));
+    }
+    lines
+}
+
 /// How often a long `test` reports how far it is.
 const STATUS_EVERY: Duration = Duration::from_secs(300);
 /// Seconds added per selected test for starting its process.
@@ -1970,6 +1999,9 @@ pub fn test(
         }
     });
     let mut results = results.into_inner().unwrap();
+    for line in unconfirm_kills(&mut results, &policy.unusable.ids()) {
+        progress.println(&line);
+    }
     if stop.load(Ordering::SeqCst) {
         eprintln!(
             "stopped after {} of {} mutant(s); run `cargo quicksilver test` again to test the rest",
@@ -2548,6 +2580,37 @@ mod tests {
         assert_eq!(tally.decided(VerdictKind::Caught, 1.0, 400.0), None);
         assert_eq!(time_left(10.0, 0.0, 5.0), None);
         assert_eq!(time_left(10.0, 5.0, 5.0), Some(0.0));
+    }
+
+    #[test]
+    fn kills_by_a_test_later_found_unusable_become_errored() {
+        let mutant = |id: &str| EditedMutant {
+            id: id.into(),
+            edits: vec![],
+            intent: None,
+        };
+        let caught_by = |test: &str| Verdict {
+            test: Some(test.into()),
+            ..verdict(VerdictKind::Caught)
+        };
+        let mut results = vec![
+            (mutant("a"), caught_by("p::flaky")),
+            (mutant("b"), caught_by("p::solid")),
+            (mutant("c"), verdict(VerdictKind::Missed)),
+        ];
+        let unusable = ["p::flaky".to_string()].into_iter().collect();
+        let lines = unconfirm_kills(&mut results, &unusable);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("UNCONFIRMED a"), "{}", lines[0]);
+        assert_eq!(results[0].1.kind, VerdictKind::Errored);
+        assert!(results[0]
+            .1
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("unconfirmed kill: p::flaky"));
+        assert_eq!(results[1].1.kind, VerdictKind::Caught);
+        assert_eq!(results[2].1.kind, VerdictKind::Missed);
     }
 
     #[test]
