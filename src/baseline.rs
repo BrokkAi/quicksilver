@@ -93,30 +93,32 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
             last_tests = parse_junit(&xml, &meta)?;
             let seeds = crate::cargo_cmd::covering_seeds(cfg);
             let failed = junit_failures(&xml);
-            let seed_fails: Vec<_> = failed
-                .iter()
-                .filter(|f| seeds.is_empty() || seeds.iter().any(|s| s == &f.package))
-                .cloned()
-                .collect();
+            let skip = crate::index::skip_globs(&cfg.skip_tests)?;
+            let (seed_fails, skipped) = blocking_failures(&failed, &seeds, skip.as_ref());
             if !seed_fails.is_empty() {
                 bail!(
-                    "red baseline: {} failing tests in {:?}: {} … Mutation results are meaningless against a failing suite.",
+                    "red baseline: {} failing test(s) in {}: {} … Mutation results are meaningless against a failing suite. A test that cannot pass here can be left out with [map] skip-tests in quicksilver.toml.",
                     seed_fails.len(),
-                    seeds,
+                    scope_text(&seeds),
                     seed_fails
                         .iter()
                         .take(5)
-                        .map(|f| f.name.as_str())
+                        .map(|f| f.id.as_str())
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
             }
-            if !failed.is_empty() {
+            if skipped > 0 {
+                tracing::info!(
+                    "{skipped} failing test(s) in the baseline run are left out by [map] skip-tests"
+                );
+            }
+            if failed.len() > skipped {
                 tracing::warn!(
-                    "{} workspace tests failed (not in {:?}); keeping timings. first: {}",
-                    failed.len(),
-                    seeds,
-                    failed[0].name
+                    "{} other workspace test(s) failed (outside {}); keeping timings. first: {}",
+                    failed.len() - skipped,
+                    scope_text(&seeds),
+                    failed[0].id
                 );
             }
             last_failed_ids = failed.into_iter().map(|f| f.id).collect();
@@ -161,6 +163,32 @@ pub struct JunitFailure {
     pub id: String,
     pub package: String,
     pub name: String,
+}
+
+/// The baseline failures that stop QS: those in the mutated packages
+/// (`seeds`; all of them when empty) that `[map] skip-tests` does not leave
+/// out. Also returns how many failures skip-tests left out.
+fn blocking_failures<'a>(
+    failed: &'a [JunitFailure],
+    seeds: &[String],
+    skip: Option<&globset::GlobSet>,
+) -> (Vec<&'a JunitFailure>, usize) {
+    let skipped = |f: &JunitFailure| skip.is_some_and(|g| g.is_match(&f.id));
+    let blocking = failed
+        .iter()
+        .filter(|f| !skipped(f))
+        .filter(|f| seeds.is_empty() || seeds.iter().any(|s| s == &f.package))
+        .collect();
+    (blocking, failed.iter().filter(|f| skipped(f)).count())
+}
+
+/// The packages a run is about, as a person reads them.
+fn scope_text(seeds: &[String]) -> String {
+    if seeds.is_empty() {
+        "the workspace".to_string()
+    } else {
+        seeds.join(", ")
+    }
 }
 
 /// Testcases that contain a failure or error.
@@ -394,6 +422,35 @@ mod tests {
         assert_eq!(tests[2].package, "tiny_a");
         assert_eq!(tests[2].id, "tiny_a::integration::it_works");
         assert_eq!(tests[2].duration_secs, 1.5);
+    }
+
+    #[test]
+    fn skipped_tests_do_not_make_the_baseline_red() {
+        let fail = |id: &str, package: &str| JunitFailure {
+            id: id.into(),
+            package: package.into(),
+            name: id.rsplit("::").next().unwrap().into(),
+        };
+        let failed = vec![
+            fail("my-core::flaky_ctime_order", "my-core"),
+            fail("my-app::suite::large_input_completes_in_time", "my-app"),
+            fail("other::broken", "other"),
+        ];
+        let skip = crate::index::skip_globs(&["my-core::flaky_*".to_string()])
+            .unwrap()
+            .unwrap();
+        // The whole workspace: the skipped test no longer counts.
+        let (blocking, skipped) = blocking_failures(&failed, &[], Some(&skip));
+        assert_eq!(skipped, 1);
+        assert_eq!(blocking.len(), 2);
+        // Only my-core's own tests count, and its failure is skipped.
+        let (blocking, _) = blocking_failures(&failed, &["my-core".to_string()], Some(&skip));
+        assert!(blocking.is_empty());
+        // Without skip-tests it would stop the map.
+        let (blocking, skipped) = blocking_failures(&failed, &["my-core".to_string()], None);
+        assert_eq!((blocking.len(), skipped), (1, 0));
+        assert_eq!(scope_text(&[]), "the workspace");
+        assert_eq!(scope_text(&["a".into(), "b".into()]), "a, b");
     }
 
     #[test]
