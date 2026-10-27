@@ -123,6 +123,14 @@ fn nextest_like_env(
         .unwrap_or_default();
     if let Some(cargo) = &manifest.cargo {
         env.push(("CARGO".into(), cargo.clone()));
+        // `cargo` (and `rustc`) on PATH mean the toolchain's too, whatever
+        // wrapper (such as mbx's) comes first in the caller's PATH; a test
+        // that clears its environment but keeps PATH still finds them.
+        if let Some(bin) = Path::new(cargo).parent() {
+            if let Some(path) = path_with_first(bin, std::env::var_os("PATH").as_deref()) {
+                env.push(("PATH".into(), path.to_string_lossy().into_owned()));
+            }
+        }
     }
     env.push((
         "CARGO_MANIFEST_DIR".into(),
@@ -136,27 +144,16 @@ fn nextest_like_env(
 
 /// The environment every test process gets on top of the caller's: the tree's
 /// target directory, then `extra` (the mutant switch or the site recorder).
-/// The PATH for test processes, when it differs from QS's own: without
-/// the directory of mbx's cargo wrapper, as tests under `mbx nextest run`
-/// see it, so a test that runs `cargo` from PATH reaches the toolchain.
-fn test_path() -> Option<String> {
-    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    PATH.get_or_init(|| {
-        let path = std::env::var_os("PATH")?;
-        path_without_mbx_wrapper(&path).map(|p| p.to_string_lossy().into_owned())
-    })
-    .clone()
-}
-
-/// `path` without the directories that hold mbx's cargo wrapper (a `cargo`
-/// next to mbx's `mbx-target` file), or `None` when it has none.
-fn path_without_mbx_wrapper(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
-    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
-    let wrapper = |d: &PathBuf| d.join("cargo").is_file() && d.join("mbx-target").is_file();
-    if !dirs.iter().any(wrapper) {
-        return None;
-    }
-    std::env::join_paths(dirs.iter().filter(|d| !wrapper(d))).ok()
+/// `path` with `bin` as its first directory, and nowhere else.
+fn path_with_first(bin: &Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let rest = path
+        .map(|p| {
+            std::env::split_paths(p)
+                .filter(|d| d != bin)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(rest)).ok()
 }
 
 /// A test process's variables: what nextest would give it, then QS's own
@@ -168,9 +165,8 @@ fn test_env(t: &ResolvedTest, extra: &[(String, String)]) -> Vec<(String, String
     let mut env: Vec<(String, String)> = t
         .env
         .iter()
-        .cloned()
-        .chain(test_path().map(|p| ("PATH".to_string(), p)))
         .filter(|(k, _)| !user_sets(k))
+        .cloned()
         .collect();
     env.extend(extra.iter().cloned());
     env
@@ -1299,26 +1295,12 @@ mod tests {
     }
 
     #[test]
-    fn the_mbx_cargo_wrapper_directory_is_left_off_a_test_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let wrapper = tmp.path().join("mbx-bin");
-        let tools = tmp.path().join("tools");
-        let other_cargo = tmp.path().join("other");
-        for d in [&wrapper, &tools, &other_cargo] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(wrapper.join("cargo"), "#!/bin/sh\n").unwrap();
-        std::fs::write(wrapper.join("mbx-target"), "/usr/bin/mbx\n").unwrap();
-        // A cargo without mbx's marker stays.
-        std::fs::write(other_cargo.join("cargo"), "#!/bin/sh\n").unwrap();
-        let path = std::env::join_paths([&wrapper, &tools, &other_cargo]).unwrap();
-        let stripped = path_without_mbx_wrapper(&path).unwrap();
-        assert_eq!(
-            std::env::split_paths(&stripped).collect::<Vec<_>>(),
-            vec![tools.clone(), other_cargo.clone()]
-        );
-        let clean = std::env::join_paths([&tools, &other_cargo]).unwrap();
-        assert_eq!(path_without_mbx_wrapper(&clean), None);
+    fn the_toolchain_bin_comes_first_on_a_test_path() {
+        let bin = Path::new("/toolchain/bin");
+        let path = std::ffi::OsString::from("/wrapper:/usr/bin:/toolchain/bin");
+        let first = path_with_first(bin, Some(&path)).unwrap();
+        assert_eq!(first, "/toolchain/bin:/wrapper:/usr/bin");
+        assert_eq!(path_with_first(bin, None).unwrap(), "/toolchain/bin");
     }
 
     fn fake_tests(names: &[&str]) -> Vec<ResolvedTest> {

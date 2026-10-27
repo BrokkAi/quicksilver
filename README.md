@@ -418,9 +418,10 @@ Quicksilver runs each test itself, one process per test, not through
 nextest or mbx. A test gets what nextest gives it: `CARGO` (the toolchain's
 own cargo, not a wrapper), `CARGO_MANIFEST_DIR`, the `CARGO_PKG_*`
 variables of its package, `NEXTEST=1`, `NEXTEST_EXECUTION_MODE` and
-`NEXTEST_RUN_ID`. It does not get `CARGO_TARGET_DIR`, and if mbx's cargo
-wrapper is on your `PATH`, its directory is left off the test's `PATH`, as
-under `mbx nextest run`. It does not run inside mbx's build session. Any of
+`NEXTEST_RUN_ID`. Its `PATH` starts with the toolchain's `bin` directory,
+so `cargo` and `rustc` on `PATH` are the toolchain's even when a wrapper,
+such as mbx's, comes first in yours. It does not get `CARGO_TARGET_DIR`,
+and it does not run inside mbx's build session. Any of
 these can be set in `[test-env]`, which wins.
 
 So a test can pass under `cargo nextest run` and fail here, for example one

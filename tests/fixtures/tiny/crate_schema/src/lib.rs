@@ -209,6 +209,12 @@ mod tests {
             std::env::current_dir().unwrap()
         );
         assert_eq!(std::env::var("NEXTEST").unwrap(), "1");
+        // `cargo` on PATH is the same toolchain cargo.
+        let path = std::env::var_os("PATH").unwrap();
+        assert_eq!(
+            std::env::split_paths(&path).next().as_deref(),
+            cargo.parent()
+        );
     }
 
     #[test]
