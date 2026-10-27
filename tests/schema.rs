@@ -76,7 +76,7 @@ fn site_id_collision_resalts() {
 #[test]
 fn schema_gates_and_differential_self_consistent() {
     if !tools_ok() {
-        eprintln!("skip: nextest or llvm-cov not available");
+        eprintln!("skip: cargo-nextest not available");
         return;
     }
     let repo = support::setup_tiny();
