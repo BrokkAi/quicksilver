@@ -5,25 +5,33 @@ use crate::types::{Outcome, PlannedMutant, TestObservation, TestVerdict};
 use crate::util::duration_from_secs;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BinariesManifest {
     pub mutant_id: String,
     pub tests: Vec<ManifestTest>,
+    /// `CARGO_PKG_*` for each package's tests, as cargo and nextest set them.
+    #[serde(default)]
+    pub package_env: BTreeMap<String, Vec<(String, String)>>,
+    /// The toolchain's cargo, given to tests as `CARGO`.
+    #[serde(default)]
+    pub cargo: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ManifestTest {
     pub name: String,
     pub binary: String,
     pub cwd_rel: String,
     #[serde(default)]
     pub id: String,
+    #[serde(default)]
+    pub package: String,
 }
 
 /// How to budget and confirm one mutant's test run.
@@ -79,21 +87,91 @@ struct ResolvedTest {
     /// The package directory under the tree root: the directory nextest
     /// would start the test in.
     cwd: PathBuf,
-    /// `<tree root>/target`. A test that runs `cargo` itself (trycmd
-    /// building clap's examples) then builds into the tree's own target
-    /// directory, even when the caller's environment names another one.
-    target_dir: PathBuf,
     duration_secs: f64,
     cpu_secs: f64,
+    /// What nextest gives the test process besides the caller's environment:
+    /// `CARGO`, `CARGO_MANIFEST_DIR`, `CARGO_PKG_*` and `NEXTEST*`.
+    env: Vec<(String, String)>,
+}
+
+/// One id for this QS process's test runs, as nextest gives each run.
+fn run_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        let hex = crate::sitemap::random_id() + &crate::sitemap::random_id();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
+    })
+}
+
+/// The environment nextest gives a test of `package` that starts in `cwd`.
+fn nextest_like_env(
+    manifest: &BinariesManifest,
+    package: &str,
+    cwd: &Path,
+) -> Vec<(String, String)> {
+    let mut env = manifest
+        .package_env
+        .get(package)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(cargo) = &manifest.cargo {
+        env.push(("CARGO".into(), cargo.clone()));
+    }
+    env.push((
+        "CARGO_MANIFEST_DIR".into(),
+        cwd.to_string_lossy().into_owned(),
+    ));
+    env.push(("NEXTEST".into(), "1".into()));
+    env.push(("NEXTEST_EXECUTION_MODE".into(), "process-per-test".into()));
+    env.push(("NEXTEST_RUN_ID".into(), run_id().into()));
+    env
 }
 
 /// The environment every test process gets on top of the caller's: the tree's
 /// target directory, then `extra` (the mutant switch or the site recorder).
+/// The PATH for test processes, when it differs from QS's own: without
+/// the directory of mbx's cargo wrapper, as tests under `mbx nextest run`
+/// see it, so a test that runs `cargo` from PATH reaches the toolchain.
+fn test_path() -> Option<String> {
+    static PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    PATH.get_or_init(|| {
+        let path = std::env::var_os("PATH")?;
+        path_without_mbx_wrapper(&path).map(|p| p.to_string_lossy().into_owned())
+    })
+    .clone()
+}
+
+/// `path` without the directories that hold mbx's cargo wrapper (a `cargo`
+/// next to mbx's `mbx-target` file), or `None` when it has none.
+fn path_without_mbx_wrapper(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let dirs: Vec<PathBuf> = std::env::split_paths(path).collect();
+    let wrapper = |d: &PathBuf| d.join("cargo").is_file() && d.join("mbx-target").is_file();
+    if !dirs.iter().any(wrapper) {
+        return None;
+    }
+    std::env::join_paths(dirs.iter().filter(|d| !wrapper(d))).ok()
+}
+
+/// A test process's variables: what nextest would give it, then QS's own
+/// (`extra`). A variable the user sets in `[test-env]` keeps the user's
+/// value, because the sandbox applies `[test-env]` before these.
 fn test_env(t: &ResolvedTest, extra: &[(String, String)]) -> Vec<(String, String)> {
-    let mut env = vec![(
-        "CARGO_TARGET_DIR".to_string(),
-        t.target_dir.to_string_lossy().into_owned(),
-    )];
+    let settings = crate::sandbox::current();
+    let user_sets = |name: &str| settings.as_ref().is_some_and(|s| s.sets(name));
+    let mut env: Vec<(String, String)> = t
+        .env
+        .iter()
+        .cloned()
+        .chain(test_path().map(|p| ("PATH".to_string(), p)))
+        .filter(|(k, _)| !user_sets(k))
+        .collect();
     env.extend(extra.iter().cloned());
     env
 }
@@ -578,6 +656,11 @@ fn resolve_tests(
                 .iter()
                 .find(|p| !p.id.is_empty() && p.id == t.id)
                 .or_else(|| planned.tests.iter().find(|p| p.name == t.name));
+            let cwd = if t.cwd_rel.is_empty() {
+                tree_root.to_path_buf()
+            } else {
+                tree_root.join(&t.cwd_rel)
+            };
             ResolvedTest {
                 cpu_secs: baseline
                     .map(|p| p.cpu_secs.unwrap_or(p.duration_secs))
@@ -585,12 +668,8 @@ fn resolve_tests(
                 id: t.id.clone(),
                 name: t.name.clone(),
                 binary: run_dir.join(&t.binary),
-                cwd: if t.cwd_rel.is_empty() {
-                    tree_root.to_path_buf()
-                } else {
-                    tree_root.join(&t.cwd_rel)
-                },
-                target_dir: tree_root.join("target"),
+                env: nextest_like_env(&manifest, &t.package, &cwd),
+                cwd,
                 duration_secs: planned
                     .tests
                     .iter()
@@ -1077,14 +1156,17 @@ mod tests {
                     binary: "test_identifier-aaaa".into(),
                     cwd_rel: "".into(),
                     id: "semver::test_identifier::test_parse".into(),
+                    ..Default::default()
                 },
                 ManifestTest {
                     name: "test_parse".into(),
                     binary: "test_version-bbbb".into(),
                     cwd_rel: "".into(),
                     id: "semver::test_version::test_parse".into(),
+                    ..Default::default()
                 },
             ],
+            ..Default::default()
         };
         fs::write(
             dir.path().join("manifest.json"),
@@ -1175,8 +1257,8 @@ mod tests {
                 name: name.into(),
                 binary: path,
                 cwd: dir.path().to_path_buf(),
-                target_dir: dir.path().join("target"),
                 duration_secs: 0.01,
+                env: Vec::new(),
                 cpu_secs: 0.01,
             }
         };
@@ -1210,13 +1292,33 @@ mod tests {
     }
 
     #[test]
-    fn every_run_builds_into_the_tree_target_dir() {
+    fn tests_get_no_cargo_target_dir_from_qs() {
         let t = &fake_tests(&["t1"])[0];
         let spec = spec_for(t, Duration::from_secs(1), &[], false);
+        assert!(!spec.env.iter().any(|(k, _)| k == "CARGO_TARGET_DIR"));
+    }
+
+    #[test]
+    fn the_mbx_cargo_wrapper_directory_is_left_off_a_test_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wrapper = tmp.path().join("mbx-bin");
+        let tools = tmp.path().join("tools");
+        let other_cargo = tmp.path().join("other");
+        for d in [&wrapper, &tools, &other_cargo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(wrapper.join("cargo"), "#!/bin/sh\n").unwrap();
+        std::fs::write(wrapper.join("mbx-target"), "/usr/bin/mbx\n").unwrap();
+        // A cargo without mbx's marker stays.
+        std::fs::write(other_cargo.join("cargo"), "#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([&wrapper, &tools, &other_cargo]).unwrap();
+        let stripped = path_without_mbx_wrapper(&path).unwrap();
         assert_eq!(
-            spec.env,
-            vec![("CARGO_TARGET_DIR".to_string(), "/target".to_string())]
+            std::env::split_paths(&stripped).collect::<Vec<_>>(),
+            vec![tools.clone(), other_cargo.clone()]
         );
+        let clean = std::env::join_paths([&tools, &other_cargo]).unwrap();
+        assert_eq!(path_without_mbx_wrapper(&clean), None);
     }
 
     fn fake_tests(names: &[&str]) -> Vec<ResolvedTest> {
@@ -1227,8 +1329,8 @@ mod tests {
                 name: (*n).into(),
                 binary: PathBuf::from("/bin/true"),
                 cwd: PathBuf::from("/"),
-                target_dir: PathBuf::from("/target"),
                 duration_secs: 0.41,
+                env: Vec::new(),
                 cpu_secs: 0.41,
             })
             .collect()

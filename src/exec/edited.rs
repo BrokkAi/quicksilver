@@ -2366,7 +2366,9 @@ mod tests {
                 binary: "test-bin".into(),
                 cwd_rel: String::new(),
                 id: "t".into(),
+                ..Default::default()
             }],
+            ..Default::default()
         };
         std::fs::write(
             dir.join("manifest.json"),

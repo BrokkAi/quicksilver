@@ -1067,11 +1067,28 @@ pub(crate) fn stage_tests(
             binary: dest_name,
             cwd_rel: t.cwd_rel.clone(),
             id: t.id.clone(),
+            package: t.package.clone(),
         });
+    }
+    // Tests read CARGO and CARGO_PKG_* at run time as they would under
+    // nextest; a test that falls back to `cargo` on PATH can reach a wrapper
+    // such as mbx's instead of the toolchain.
+    let tree = target.parent().unwrap_or(target);
+    let packages: std::collections::BTreeSet<String> =
+        tests.iter().map(|t| t.package.clone()).collect();
+    let package_env = crate::cargo_cmd::package_env(tree, &packages).unwrap_or_else(|err| {
+        tracing::warn!("cannot read package metadata for test variables: {err:#}");
+        Default::default()
+    });
+    let cargo = crate::target::toolchain_cargo(tree).map(|c| c.to_string_lossy().into_owned());
+    if cargo.is_none() {
+        tracing::warn!("cannot find the toolchain's cargo; tests get no CARGO variable");
     }
     let manifest = BinariesManifest {
         mutant_id: "schema".into(),
         tests: manifest_tests,
+        package_env,
+        cargo,
     };
     fs::write(
         run_dir.join("manifest.json"),

@@ -180,6 +180,19 @@ pub fn cfg_text(meta: &syn::Meta) -> String {
     format!("cfg({tidy})")
 }
 
+/// The cargo of the toolchain that builds `dir`: `<sysroot>/bin/cargo`, the
+/// one cargo or nextest would name in `CARGO`. Not a wrapper earlier on
+/// PATH, such as mbx's.
+pub fn toolchain_cargo(dir: &Path) -> Option<std::path::PathBuf> {
+    let out = rustc(dir).args(["--print", "sysroot"]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let sysroot = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let cargo = Path::new(&sysroot).join("bin").join("cargo");
+    cargo.is_file().then_some(cargo)
+}
+
 /// `rustc -vV`'s host triple for the toolchain that builds `dir`.
 pub fn host_triple(dir: &Path) -> Result<String> {
     let out = rustc(dir).arg("-vV").output().context("rustc -vV")?;

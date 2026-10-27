@@ -265,6 +265,11 @@ impl Settings {
         Ok(root)
     }
 
+    /// Whether `[test-env]` sets this variable.
+    pub fn sets(&self, name: &str) -> bool {
+        self.test_env.contains_key(name)
+    }
+
     /// This QS process's sandbox directory, once a test process used it.
     pub fn root(&self) -> Option<&Path> {
         self.root.get()?.as_ref().ok().map(PathBuf::as_path)

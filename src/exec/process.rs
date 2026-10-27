@@ -252,6 +252,10 @@ fn run_capturing(
     // "no mutant active", which is what the null runs depend on.
     cmd.env_remove("QS_MUTANT");
     cmd.env_remove("QS_RECORD_SITES");
+    // Neither nextest nor QS's own builds give tests CARGO_TARGET_DIR; a
+    // test that runs cargo builds into its tree's `target/`, as cargo finds
+    // it from the working directory. `[test-env]` can still set it.
+    cmd.env_remove("CARGO_TARGET_DIR");
     let _sandbox = sandbox(&mut cmd)?;
     for (k, v) in extra_env {
         cmd.env(k, v);

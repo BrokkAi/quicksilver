@@ -202,6 +202,54 @@ pub fn load_metadata(root: &Path) -> Result<Metadata> {
         .context("cargo metadata")
 }
 
+/// The `CARGO_PKG_*` variables cargo and nextest give a test process of
+/// each package in `packages`, from the workspace at `root`. Missing fields
+/// are empty strings, as cargo sets them.
+pub fn package_env(
+    root: &Path,
+    packages: &std::collections::BTreeSet<String>,
+) -> Result<BTreeMap<String, Vec<(String, String)>>> {
+    let meta = load_metadata(root)?;
+    let mut out = BTreeMap::new();
+    for p in meta.workspace_packages() {
+        if !packages.contains(p.name.as_str()) {
+            continue;
+        }
+        let text = |v: Option<String>| v.unwrap_or_default();
+        let v = &p.version;
+        let vars = vec![
+            ("CARGO_PKG_NAME", p.name.to_string()),
+            ("CARGO_PKG_VERSION", v.to_string()),
+            ("CARGO_PKG_VERSION_MAJOR", v.major.to_string()),
+            ("CARGO_PKG_VERSION_MINOR", v.minor.to_string()),
+            ("CARGO_PKG_VERSION_PATCH", v.patch.to_string()),
+            ("CARGO_PKG_VERSION_PRE", v.pre.to_string()),
+            ("CARGO_PKG_AUTHORS", p.authors.join(":")),
+            ("CARGO_PKG_DESCRIPTION", text(p.description.clone())),
+            ("CARGO_PKG_HOMEPAGE", text(p.homepage.clone())),
+            ("CARGO_PKG_REPOSITORY", text(p.repository.clone())),
+            ("CARGO_PKG_LICENSE", text(p.license.clone())),
+            (
+                "CARGO_PKG_LICENSE_FILE",
+                text(p.license_file.as_ref().map(|f| f.to_string())),
+            ),
+            (
+                "CARGO_PKG_README",
+                text(p.readme.as_ref().map(|f| f.to_string())),
+            ),
+            (
+                "CARGO_PKG_RUST_VERSION",
+                text(p.rust_version.as_ref().map(|r| r.to_string())),
+            ),
+        ];
+        out.insert(
+            p.name.to_string(),
+            vars.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+        );
+    }
+    Ok(out)
+}
+
 pub fn package_for_path(meta: &Metadata, rel: &str) -> Option<String> {
     let rel = rel.trim_start_matches("./");
     let ws = PathBuf::from(meta.workspace_root.as_str());
@@ -565,6 +613,19 @@ pub fn env_for_tests() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn package_env_has_cargo_pkg_variables() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny");
+        let packages = ["tiny_schema".to_string()].into_iter().collect();
+        let env = package_env(&root, &packages).unwrap();
+        let vars: BTreeMap<_, _> = env["tiny_schema"].iter().cloned().collect();
+        assert_eq!(vars["CARGO_PKG_NAME"], "tiny_schema");
+        assert_eq!(vars["CARGO_PKG_VERSION"], "0.1.0");
+        assert_eq!(vars["CARGO_PKG_VERSION_MINOR"], "1");
+        assert_eq!(vars["CARGO_PKG_DESCRIPTION"], "");
+        assert_eq!(env.len(), 1, "only the packages asked for");
+    }
 
     #[test]
     fn package_specs_name_members_by_package_id() {

@@ -414,9 +414,20 @@ process; `{sandbox}` stands for the process's sandbox directory:
 APP_CACHE_ROOT = "{sandbox}/cache"
 ```
 
-A test that fails or times out with no mutant active selects no mutants.
-`map` and `run` print why, with the last lines of its output, and the map
-keeps the end of its output under `not_green_output`.
+Quicksilver runs each test itself, one process per test, not through
+nextest or mbx. A test gets what nextest gives it: `CARGO` (the toolchain's
+own cargo, not a wrapper), `CARGO_MANIFEST_DIR`, the `CARGO_PKG_*`
+variables of its package, `NEXTEST=1`, `NEXTEST_EXECUTION_MODE` and
+`NEXTEST_RUN_ID`. It does not get `CARGO_TARGET_DIR`, and if mbx's cargo
+wrapper is on your `PATH`, its directory is left off the test's `PATH`, as
+under `mbx nextest run`. It does not run inside mbx's build session. Any of
+these can be set in `[test-env]`, which wins.
+
+So a test can pass under `cargo nextest run` and fail here, for example one
+that depends on something only a runner sets. Such a test, failing or timing
+out with no mutant active, selects no mutants. `map` and `run` print why,
+with the last lines of its output; `cargo quicksilver uncovered --not-green`
+lists every such test with the end of its output.
 
 `--no-sandbox`, or `enabled = false` under `[sandbox]`, runs tests in your
 own environment. The baseline `cargo nextest run`, which runs no mutants,

@@ -187,6 +187,30 @@ mod tests {
         assert!(std::env::var_os("FIXTURE_STATE").is_none(), "too slow");
     }
 
+    // Under quicksilver, a test gets what nextest would give it: the
+    // toolchain's cargo, its package's directory and CARGO_PKG_*.
+    #[test]
+    fn cargo_variables_are_set() {
+        if std::env::var_os("FIXTURE_STATE").is_none() {
+            return;
+        }
+        let cargo = std::path::PathBuf::from(std::env::var("CARGO").expect("CARGO"));
+        assert!(cargo.is_file(), "{}", cargo.display());
+        assert_eq!(cargo.file_name().unwrap(), "cargo");
+        assert!(
+            cargo.parent().unwrap().ends_with("bin"),
+            "the toolchain's cargo, not a wrapper: {}",
+            cargo.display()
+        );
+        assert_eq!(std::env::var("CARGO_PKG_NAME").unwrap(), "tiny_schema");
+        assert_eq!(std::env::var("CARGO_PKG_VERSION").unwrap(), "0.1.0");
+        assert_eq!(
+            std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()),
+            std::env::current_dir().unwrap()
+        );
+        assert_eq!(std::env::var("NEXTEST").unwrap(), "1");
+    }
+
     #[test]
     fn red_only_when_asked() {
         // Quicksilver's end-to-end test sets this through `[test-env]`, to
