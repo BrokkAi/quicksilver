@@ -5,7 +5,7 @@ use std::path::PathBuf;
 #[command(
     name = "cargo-quicksilver",
     version,
-    about = "Impact-selected mutation testing for Cargo workspaces"
+    about
 )]
 pub struct Cli {
     #[command(flatten)]
