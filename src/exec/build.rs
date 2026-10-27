@@ -44,7 +44,7 @@ pub(crate) fn resolve_binary(
         .or_else(|| fresh.iter().max_by_key(|e| mtime_or_epoch(&e.path)))
     {
         if fresh.len() > 1 {
-            tracing::info!(
+            tracing::debug!(
                 "resolve {}: {} fresh fingerprints of {}; using {}",
                 test.id,
                 fresh.len(),
