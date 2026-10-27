@@ -11,7 +11,7 @@ keywords = ["mutation-testing", "cargo", "testing"]
 categories = ["development-tools::testing", "command-line-utilities"]
 # Only what builds and documents the tool. Tests, fixtures, research notes
 # and benchmark scripts stay in the repository.
-include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "RUNNING.md", "LICENSE"]
 
 [lib]
 name = "cargo_quicksilver"
