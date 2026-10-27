@@ -242,9 +242,18 @@ pub fn prove(
     // Restore before propagating a spawn error; Drop also covers unwinding.
     guard.restore()?;
     let with_mutant = with_mutant?;
-    // An interrupt stopped the command; its exit status proves nothing.
+    // An interrupt stopped the command; its exit status proves nothing. A
+    // Ctrl-C reaches the command too, and QS's handler runs on another
+    // thread, so a command killed by SIGINT also counts.
+    #[cfg(unix)]
+    let killed_by_interrupt = {
+        use std::os::unix::process::ExitStatusExt;
+        with_mutant.signal() == Some(libc::SIGINT)
+    };
+    #[cfg(not(unix))]
+    let killed_by_interrupt = false;
     ensure!(
-        !stop.load(std::sync::atomic::Ordering::SeqCst),
+        !stop.load(std::sync::atomic::Ordering::SeqCst) && !killed_by_interrupt,
         "interrupted; the mutant is reverted"
     );
     let without_mutant = command(root, argv)?;

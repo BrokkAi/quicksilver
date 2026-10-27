@@ -825,7 +825,7 @@ fn edited_mutants_are_captured_built_and_judged() {
     // command's exit status proves nothing.
     #[cfg(unix)]
     {
-        let signal_command = r#"if sed -n "/pub fn always_ok()/,/^}/p" crate_a/src/lib.rs | grep -q "    false"; then kill -INT "$PPID"; exit 1; fi"#;
+        let signal_command = r#"if sed -n "/pub fn always_ok()/,/^}/p" crate_a/src/lib.rs | grep -q "    false"; then kill -INT "$PPID"; kill -INT $$; fi"#;
         let interrupted = qs(&["prove", &missed_m.id, "--", "sh", "-c", signal_command]);
         assert_eq!(interrupted.status.code(), Some(3));
         assert!(
