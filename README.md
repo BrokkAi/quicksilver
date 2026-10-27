@@ -406,6 +406,11 @@ example, when testing mbx itself:
 MBX_CACHE_DIR = "{sandbox}/mbx-cache"
 ```
 
+Your mbx config is still copied in, so with a fresh cache each test starts
+empty: a config that names a downloaded linker, for example, makes every
+test that builds download it again (and can hit the download site's rate
+limit). Add `MBX_LINKER = "system"` to `[test-env]` in that case.
+
 `[test-env]` in `quicksilver.toml` sets more variables for every test
 process; `{sandbox}` stands for the process's sandbox directory:
 
@@ -423,6 +428,13 @@ so `cargo` and `rustc` on `PATH` are the toolchain's even when a wrapper,
 such as mbx's, comes first in yours. It does not get `CARGO_TARGET_DIR`,
 and it does not run inside mbx's build session. Any of
 these can be set in `[test-env]`, which wins.
+
+The mutant's switch and the record of which functions a test enters
+travel in environment variables whose names start with `QS_`. A test
+helper that starts a subprocess with a cleared environment (Rust's
+`Command::env_clear`) must keep them, or the subprocess neither records
+what it enters nor sees the mutant: the tests behind it then never catch a
+mutant in code that only the subprocess runs.
 
 So a test can pass under `cargo nextest run` and fail here, for example one
 that depends on something only a runner sets. Such a test, failing or timing
