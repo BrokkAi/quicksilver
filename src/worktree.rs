@@ -220,7 +220,7 @@ pub fn require_mbx() -> Result<()> {
     match Command::new("mbx").arg("--version").output() {
         Ok(out) if out.status.success() => Ok(()),
         _ => bail!(
-            "cargo-quicksilver builds through mbx, which is not on PATH. Install it from https://mr-boxington.jdx.dev/installation"
+            "cargo-quicksilver builds through mbx, which is not on PATH. Install it from https://mr-boxington.jdx.dev/installation. If mbx is installed and you ran `cargo quicksilver` through a cargo wrapper that removes its own directory from PATH, add the directory that holds `mbx` to PATH, or run `cargo-quicksilver quicksilver ...` directly"
         ),
     }
 }

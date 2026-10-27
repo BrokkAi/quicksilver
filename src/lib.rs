@@ -10,6 +10,7 @@ pub mod exec;
 pub mod index;
 pub mod linediff;
 pub mod locate;
+pub mod mbx_env;
 pub mod outcome;
 pub mod pending;
 pub mod plan;
@@ -46,6 +47,8 @@ pub fn init_tracing() {
 
 pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     init_tracing();
+    // Before any thread starts: it changes this process's environment.
+    mbx_env::leave_enclosing_session();
     let result = match cli.command {
         cli::Command::List(_) => cmd_list(&cli.common),
         cli::Command::Run(args) => cmd_run(&cli.common, args),
