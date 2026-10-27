@@ -65,9 +65,12 @@ jobs:
         if: ${{ inputs.mbx_log != '' }}
         run: echo "MBX_LOG=${{ inputs.mbx_log }}" >> "$GITHUB_ENV"
       # Run each suite on its own, so one failure does not hide the others.
+      # One test at a time: with several at once on a fresh runner, mbx's
+      # first build sometimes fails its storage check (under investigation
+      # with the mbx maintainers).
       - name: End-to-end tests
         if: ${{ !cancelled() }}
-        run: cargo test --test edited
+        run: cargo test --test edited -- --test-threads=1
       - name: Engine tests
         if: ${{ !cancelled() }}
         run: cargo test --test engine
