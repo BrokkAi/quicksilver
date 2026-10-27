@@ -409,7 +409,10 @@ MBX_CACHE_DIR = "{sandbox}/mbx-cache"
 Your mbx config is still copied in, so with a fresh cache each test starts
 empty: a config that names a downloaded linker, for example, makes every
 test that builds download it again (and can hit the download site's rate
-limit). Add `MBX_LINKER = "system"` to `[test-env]` in that case.
+limit). Add `MBX_LINKER = "system"` to `[test-env]` in that case. That
+setting overrides mbx's choice of linker for every target, so tests that
+check that choice (mbx's own linker-selection tests, for example) then fail
+with no mutant active and select nothing.
 
 `[test-env]` in `quicksilver.toml` sets more variables for every test
 process; `{sandbox}` stands for the process's sandbox directory:
