@@ -4,7 +4,7 @@
 # $STATE_DIR/aws-resources.json for teardown.sh. A failed launch removes
 # whatever it created. The instance terminates itself after 12 hours.
 #
-# Usage: provision.sh STATE_DIR
+# Usage: QS_BENCH_AWS_ACCOUNT=<account id> provision.sh STATE_DIR
 set -euo pipefail
 
 STATE_DIR="${1:?usage: provision.sh STATE_DIR}"
@@ -22,8 +22,11 @@ SG_NAME="${NAME_TAG}-${SUFFIX}"
 KEY_FILE="$STATE_DIR/${KEY_NAME}.pem"
 aws() { command aws --profile "$PROFILE" --region "$REGION" "$@"; }
 
+# Launch only into the account named here, so a stray AWS profile cannot
+# start billed instances somewhere else.
+EXPECTED_ACCOUNT="${QS_BENCH_AWS_ACCOUNT:?set QS_BENCH_AWS_ACCOUNT to the AWS account id to launch in}"
 ACCOUNT="$(aws sts get-caller-identity --query Account --output text)"
-[[ "$ACCOUNT" == 842609633142 ]] || { echo "refusing: account $ACCOUNT is not 842609633142" >&2; exit 2; }
+[[ "$ACCOUNT" == "$EXPECTED_ACCOUNT" ]] || { echo "refusing: account $ACCOUNT is not $EXPECTED_ACCOUNT" >&2; exit 2; }
 HOST_CIDR="$(curl -fsS https://checkip.amazonaws.com | tr -d '[:space:]')/32"
 AMI_ID="$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id --query Parameter.Value --output text)"
 
