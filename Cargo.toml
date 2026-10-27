@@ -2,13 +2,16 @@
 name = "cargo-quicksilver"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.97"
+rust-version = "1.99"
 license = "Apache-2.0"
 description = "Impact-selected mutation testing for Cargo workspaces"
 readme = "README.md"
 repository = "https://github.com/BrokkAi/quicksilver"
 keywords = ["mutation-testing", "cargo", "testing"]
 categories = ["development-tools::testing", "command-line-utilities"]
+# Only what builds and documents the tool. Tests, fixtures, research notes
+# and benchmark scripts stay in the repository.
+include = ["src/**/*.rs", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
 
 [lib]
 name = "cargo_quicksilver"
