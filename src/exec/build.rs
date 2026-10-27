@@ -124,7 +124,7 @@ impl WantBase {
     }
 }
 
-/// `brokk_bifrost_core-c4d0bb3ad97e1f96` -> `brokk_bifrost_core`. The only
+/// `my_core-c4d0bb3ad97e1f96` -> `my_core`. The only
 /// `-` cargo leaves in an artifact file name is the fingerprint separator.
 pub(crate) fn strip_fingerprint(name: &str) -> &str {
     match name.rsplit_once('-') {
@@ -152,11 +152,8 @@ mod tests {
 
     #[test]
     fn fingerprint_suffix_is_stripped_only_when_it_is_a_hash() {
-        assert_eq!(
-            strip_fingerprint("brokk_bifrost_core-c4d0bb3ad97e1f96"),
-            "brokk_bifrost_core"
-        );
-        assert_eq!(strip_fingerprint("bifrost"), "bifrost");
+        assert_eq!(strip_fingerprint("my_core-c4d0bb3ad97e1f96"), "my_core");
+        assert_eq!(strip_fingerprint("myapp"), "myapp");
         // Too short to be a fingerprint.
         assert_eq!(strip_fingerprint("mcp-fuzz01"), "mcp-fuzz01");
         // Not hex.
@@ -173,19 +170,19 @@ mod tests {
     #[test]
     fn want_base_prefers_binary_rel_then_binary_name_then_package() {
         let from_rel = WantBase::new(
-            "quicksilver/deps/brokk_bifrost_core-c4d0bb3ad97e1f96",
+            "quicksilver/deps/my_core-c4d0bb3ad97e1f96",
             "ignored",
             "ignored",
         );
-        assert_eq!(from_rel.base, "brokk_bifrost_core");
+        assert_eq!(from_rel.base, "my_core");
         assert!(!from_rel.from_package);
 
-        let from_name = WantBase::new("", "brokk-bifrost-core", "other-pkg");
-        assert_eq!(from_name.base, "brokk_bifrost_core");
+        let from_name = WantBase::new("", "my-core", "other-pkg");
+        assert_eq!(from_name.base, "my_core");
         assert!(!from_name.from_package);
 
-        let from_pkg = WantBase::new("", "", "brokk-bifrost-core");
-        assert_eq!(from_pkg.base, "brokk_bifrost_core");
+        let from_pkg = WantBase::new("", "", "my-core");
+        assert_eq!(from_pkg.base, "my_core");
         assert!(from_pkg.from_package, "package fallback is flagged");
     }
 
@@ -268,17 +265,17 @@ mod tests {
 
     #[test]
     fn base_match_is_exact_and_never_a_substring() {
-        // The old substring scan matched the fuzzer for needle "bifrost".
+        // The old substring scan matched the fuzzer for needle "myapp".
         let w = Worker::new();
-        let fuzzer = w.exe("bifrost_mcp_property_fuzzer-abcdef1234567890", "");
-        let harness = w.exe("bifrost-1111111111111111", "");
+        let fuzzer = w.exe("myapp_property_fuzzer-abcdef1234567890", "");
+        let harness = w.exe("myapp-1111111111111111", "");
         let built = vec![fuzzer, harness.clone()];
-        let rel = "quicksilver/deps/bifrost-0000000000000000";
+        let rel = "quicksilver/deps/myapp-0000000000000000";
         assert_eq!(
             resolve_binary(&w.target(), &test(rel, ""), &built).unwrap(),
             harness.path
         );
-        let rel = "quicksilver/deps/mcp_property_fuzzer-0000000000000000";
+        let rel = "quicksilver/deps/property_fuzzer-0000000000000000";
         assert!(resolve_binary(&w.target(), &test(rel, ""), &built).is_err());
     }
 
