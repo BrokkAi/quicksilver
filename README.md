@@ -21,14 +21,20 @@ a language model.
 
 ## Install
 
-You need git, [cargo-nextest](https://nexte.st), and the
+Quicksilver runs on Linux and other Unix systems; it does not build on
+Windows. You need git, Rust 1.99 or newer,
+[cargo-nextest](https://nexte.st), and the
 [mbx](https://mr-boxington.jdx.dev/installation) build cache, which
-quicksilver builds through.
+quicksilver runs every build through.
 
 ```
 cargo install cargo-nextest
-cargo install --path .
+cargo install cargo-quicksilver
 ```
+
+Run it as `cargo quicksilver`. If your `cargo` is mbx's cargo wrapper,
+quicksilver leaves the wrapper's build session at start, so that its own
+builds get sessions of their own.
 
 
 ## Test a change
@@ -357,8 +363,9 @@ as nextest names it followed by the test's name (globs allowed):
 skip-tests = ["my_crate::suite::*::indexes_in_linear_time"]
 ```
 
-`map` and `run` then never run it, and count it as left out, not as not
-green.
+`map` and `run` then never run it themselves, and count it as left out,
+not as not green. The baseline `cargo nextest run` at the start still runs
+it, but its failure no longer stops `map` or `run`.
 
 
 ## Tests run in a sandbox
@@ -388,6 +395,16 @@ Tests that run cargo, rustup, git or mbx still work: `CARGO_HOME`,
 `RUSTUP_HOME` and `MBX_CACHE_DIR` point at your own, and your git and mbx
 config files are copied in. A test that needs other files from your home
 directory will fail in the sandbox and select no mutants.
+
+`[test-env]` (below) is applied after these, so it can change them too. Do
+that when the code under test writes to one of these places itself: a
+mutant could otherwise write bad entries into your real cache. For
+example, when testing mbx itself:
+
+```toml
+[test-env]
+MBX_CACHE_DIR = "{sandbox}/mbx-cache"
+```
 
 `[test-env]` in `quicksilver.toml` sets more variables for every test
 process; `{sandbox}` stands for the process's sandbox directory:

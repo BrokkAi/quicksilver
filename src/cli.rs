@@ -16,9 +16,11 @@ pub struct Cli {
 
 #[derive(Args, Debug, Clone)]
 pub struct CommonOpts {
+    /// Builds to run at once. Defaults to what the machine's memory allows.
     #[arg(long, global = true)]
     pub build_jobs: Option<usize>,
 
+    /// Test processes to run at once. Defaults to the number of CPUs.
     #[arg(long, global = true)]
     pub test_jobs: Option<usize>,
 
@@ -92,9 +94,10 @@ pub struct CommonOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Execute mutants with the schema engine.
+    /// Mutate functions with simple built-in replacements (`0`, `true`,
+    /// `None`, ...) and run the tests that reach each one.
     Run(RunArgs),
-    /// Print the mutant catalog and exit.
+    /// List the built-in mutants `run` would try, and exit.
     List(ListArgs),
     /// Check QS on this repository: run a sample of mutants with the tests
     /// QS selects and with every candidate test, and report any kill that
