@@ -1,5 +1,5 @@
-//! A crate whose test binary installs its own global allocator, as
-//! bifrost-store does to count heap use. The allocator's methods are ordinary
+//! A crate whose test binary installs a global allocator to count heap use.
+//! The allocator's methods are ordinary
 //! functions, so QS gives them prologues; the runtime itself allocates.
 
 pub struct CountingAllocator;

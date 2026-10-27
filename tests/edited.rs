@@ -947,7 +947,7 @@ fn status_of(results: &[(EditedMutant, Status)], m: &EditedMutant) -> Status {
         .unwrap_or_else(|| panic!("{} in results", m.id))
 }
 
-/// bifrost-store's test binary installs a counting `#[global_allocator]`. Its
+/// This fixture's test binary installs a counting `#[global_allocator]`. Its
 /// methods get prologues, and the runtime allocates while it initializes, so
 /// every test in such a binary deadlocked at startup on the runtime's own
 /// `LazyLock` and the map timed it out.

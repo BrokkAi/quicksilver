@@ -251,13 +251,13 @@ mod skip_tests {
     #[test]
     fn skip_tests_match_whole_ids_with_globs() {
         let globs = skip_globs(&[
-            "brokk-bifrost::suite_issues::*::c_wide_*_in_linear_time".to_string(),
+            "my-app::suite::*::c_wide_*_in_linear_time".to_string(),
             "p::exact::name".to_string(),
         ])
         .unwrap()
         .unwrap();
         assert!(globs.is_match(
-            "brokk-bifrost::suite_issues::issue_2145_wide_tree_traversal::c_wide_translation_unit_indexes_in_linear_time"
+            "my-app::suite::wide_tree_traversal::c_wide_translation_unit_indexes_in_linear_time"
         ));
         assert!(globs.is_match("p::exact::name"));
         assert!(!globs.is_match("p::exact::name_too"));

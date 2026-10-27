@@ -245,7 +245,7 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
     cmd.current_dir(&paths.baseline);
     apply_build_env(&mut cmd, cfg);
     // Workspace `cargo build --tests`, not `-p mutant.package`. A source-hashing
-    // build script (BIFROST_BUILD_IDENTITY) relinks a *different* crate; scoping
+    // build script can relink a *different* crate; scoping
     // to the mutant package misses the cascade this preflight exists to catch.
     cmd.args(["build", "--tests", "-v"]);
     cmd.stdout(Stdio::piped());
@@ -380,19 +380,16 @@ mod tests {
     fn junit_classname_is_binary_id_not_package() {
         let xml = r#"
 <testsuite>
-  <testcase name="row_identities_are_deterministic" classname="brokk-bifrost-core" time="0.20"/>
-  <testcase name="row_identities_are_deterministic_and_distinct" classname="brokk-bifrost-core" time="0.80"/>
+  <testcase name="identities_are_stable" classname="my-core" time="0.20"/>
+  <testcase name="identities_are_distinct" classname="my-core" time="0.80"/>
   <testcase name="it_works" classname="tiny_a::integration" time="1.5"/>
 </testsuite>
 "#;
         let meta = emptyish_metadata();
         let tests = parse_junit(xml, &meta).unwrap();
-        assert_eq!(tests[0].binary_id, "brokk-bifrost-core");
-        assert_eq!(tests[0].package, "brokk-bifrost-core");
-        assert_eq!(
-            tests[0].id,
-            "brokk-bifrost-core::row_identities_are_deterministic"
-        );
+        assert_eq!(tests[0].binary_id, "my-core");
+        assert_eq!(tests[0].package, "my-core");
+        assert_eq!(tests[0].id, "my-core::identities_are_stable");
         assert_eq!(tests[2].binary_id, "tiny_a::integration");
         assert_eq!(tests[2].package, "tiny_a");
         assert_eq!(tests[2].id, "tiny_a::integration::it_works");
@@ -403,20 +400,20 @@ mod tests {
     fn junit_failures_reads_nested_failure_and_package() {
         let xml = r#"
 <testsuite>
-  <testcase name="ok" classname="brokk-bifrost-core" time="0.1"/>
-  <testcase name="large_rust_file_definition_and_hover_stay_interactive" classname="brokk-bifrost::suite_issues" time="9.3">
+  <testcase name="ok" classname="my-core" time="0.1"/>
+  <testcase name="large_input_completes_in_time" classname="my-app::suite" time="9.3">
     <failure message="took 8s"/>
   </testcase>
 </testsuite>
 "#;
         let failed = junit_failures(xml);
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].package, "brokk-bifrost");
-        assert!(failed[0].name.contains("large_rust_file"));
-        assert!(failed[0].id.contains("suite_issues"));
+        assert_eq!(failed[0].package, "my-app");
+        assert!(failed[0].name.contains("large_input"));
+        assert!(failed[0].id.contains("suite"));
         let passed = junit_passed_ids(xml);
         assert!(passed.iter().any(|id| id.ends_with("::ok")));
-        assert!(!passed.iter().any(|id| id.contains("large_rust_file")));
+        assert!(!passed.iter().any(|id| id.contains("large_input")));
     }
 
     fn emptyish_metadata() -> cargo_metadata::Metadata {

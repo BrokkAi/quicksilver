@@ -10,9 +10,11 @@ QS's released help should show its supported workflows without research commands
 
 - [x] (2026-10-27) Inspect command, configuration, executor, report, and baseline dependencies.
 - [x] (2026-10-27) Remove estimate and higher-order features and hide developer options; all requested checks passed before commit.
-- [ ] Remove Bifrost-specific environment handling and examples; verify and commit.
+- [x] (2026-10-27) Remove Bifrost-specific environment handling and examples; all requested checks passed before commit.
 
 ## Surprises & Discoveries
+
+The second edited-suite run reached a pre-existing Ctrl-C assertion that returned success rather than interruption. The first run passed. Only comments in that test changed in milestone two. The full rerun passed (3 tests). Failure evidence: `/mnt/optane/tmp/qs-publish-logs/second-edited-signal-race.log`.
 
 Coupling rows also carry selected test IDs used to annotate survivors tested only by proptest properties. Preserve those IDs separately. Preflight is used by run and must stay. Package rebuild timings are consumed by planning; preserve the cached data fields and consumer, removing only estimate-only measurements. Excluded src/exec/build.rs contains Bifrost test examples that must remain for the parent.
 
@@ -55,8 +57,10 @@ Keep the `run`, `list`, `map`, `build`, `test`, `uncovered`, `pending`, `survivo
 
 ## Outcomes & Retrospective
 
-First milestone complete. Unit tests: 175 passed, 2 ignored. Edited and schema suites: 3 passed each. Engine suite passed. Clippy reports only the known excluded build.rs warning. The sandbox blocked a socket unit test; rerunning with normal permissions passed. Help and hidden parsing are verified.
+First milestone committed as d95d1d3. Unit tests: 175 passed, 2 ignored. Edited and schema suites: 3 passed each. Engine suite: 9 passed. Clippy reports only the known excluded build.rs warning. The sandbox blocked a socket unit test; rerunning with normal permissions passed. Help and hidden parsing are verified. Milestone two also passed formatting, clippy (only the excluded build.rs warning), 175 unit tests (2 ignored), 9 engine tests, 3 schema tests, and 3 edited tests on rerun. Both help captures preserve the visible flags. The final case-insensitive Bifrost scan finds only examples in excluded src/exec/build.rs. README Install and all excluded paths match the starting commit exactly.
 
 Plan created after inspecting dependencies to preserve first-order behavior during removal.
 
 Milestone one updated after compilation repairs and passing verification.
+
+Milestone two updated after the complete passing rerun and final scope and grep checks.

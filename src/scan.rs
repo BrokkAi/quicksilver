@@ -385,7 +385,7 @@ fn resolve_mod_file(name: &str, attrs: &[syn::Attribute], dirs: &Dirs) -> Option
             &dirs.child_dir
         };
         // Canonical, like the crate scope it is compared with: a `..` path
-        // into a directory shared by several crates (bifrost's
+        // into a directory shared by several crates (for example,
         // `#[path = "../../../test-support/git.rs"]`) otherwise still
         // `starts_with` the crate's source directory, so its functions
         // became sites in every crate that includes it, and `git cat-file`
@@ -872,7 +872,7 @@ mod tests {
         assert_eq!(fqns(&files), vec![("k.a.s".into(), false)]);
     }
 
-    /// bifrost's crates include `../../../test-support/git.rs`; the scope
+    /// Crates can include `../../../test-support/git.rs`; the scope
     /// check and `git cat-file` both need the path without `..`.
     #[test]
     fn a_path_attribute_leaving_the_crate_resolves_to_a_normalized_path() {

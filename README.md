@@ -56,11 +56,11 @@ dependency graph, that can be most of the workspace's tests.
 To add partner tests whenever a particular package is selected, configure:
 
 ```toml
-[package.brokk-bifrost-rust]
-extra-tests = ["brokk-bifrost-rust-analysis"]
+[package.my-language]
+extra-tests = ["my-language-analysis"]
 ```
 
-These entries apply only with `--package brokk-bifrost-rust`, after CLI and
+These entries apply only with `--package my-language`, after CLI and
 top-level `extra-tests`, without duplicates. Names are nextest binary ids:
 `pkg` for unit tests and `pkg::target` for integration tests.
 
@@ -394,7 +394,7 @@ process; `{sandbox}` stands for the process's sandbox directory:
 
 ```toml
 [test-env]
-BIFROST_CACHE_ROOT = "{sandbox}/cache"
+APP_CACHE_ROOT = "{sandbox}/cache"
 ```
 
 A test that fails or times out with no mutant active selects no mutants.

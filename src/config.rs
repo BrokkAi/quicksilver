@@ -153,12 +153,7 @@ pub fn merge_config(
         .or(file.build_jobs)
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
-    let mut build_env = file.build_env;
-    if let Ok(v) = std::env::var("BIFROST_BUILD_IDENTITY_OVERRIDE") {
-        build_env
-            .entry("BIFROST_BUILD_IDENTITY_OVERRIDE".into())
-            .or_insert(v);
-    }
+    let build_env = file.build_env;
 
     let mut extra_tests = Vec::new();
     for binary in cli.extra_tests.iter().chain(&file.extra_tests).chain(

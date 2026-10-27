@@ -718,7 +718,7 @@ pub(crate) fn union_selected_tests(planned: &[PlannedMutant]) -> Vec<TestInfo> {
 }
 
 /// Smoke the schema binary. The union of selected tests for a crate sample
-/// on bifrost-core is ~10k reverse-dep tests; running them all serially
+/// may include thousands of reverse-dependent tests; running them all serially
 /// with `--exact` is a full-suite gate, not a schema check.
 pub(crate) const NULL_GATE_TESTS: usize = 8;
 

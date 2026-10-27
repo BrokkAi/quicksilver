@@ -34,8 +34,8 @@ pub fn covering_seeds(cfg: &Config) -> Vec<String> {
 /// recorded tests and the staged binaries always agree.
 ///
 /// Reverse dependents are opt-in because a low crate is a dependency of the
-/// whole workspace: on bifrost, `-p brokk-bifrost-core` with dependents
-/// selects about 20,000 tests instead of core's ~470.
+/// whole workspace: selecting its reverse dependents can include thousands
+/// of tests from packages outside the requested scope.
 ///
 /// `--extra-tests` adds the package of each chosen test binary, and
 /// [`keeps_test`] keeps only those binaries' tests from it.
@@ -138,7 +138,7 @@ pub fn reverse_dependents(meta: &Metadata, seeds: &[String]) -> BTreeSet<String>
 }
 
 /// `--workspace` for no packages, else one `-p` per package. Bare cargo
-/// follows `default-members`, which on bifrost is only the facade crate.
+/// follows `default-members`, which may leave out workspace crates.
 pub fn apply_package_select(cmd: &mut Command, packages: &[String]) {
     if packages.is_empty() {
         cmd.arg("--workspace");
@@ -584,9 +584,9 @@ mod tests {
     #[test]
     fn parse_executables_keeps_only_test_harnesses() {
         let stdout = concat!(
-            r#"{"reason":"compiler-artifact","target":{"name":"brokk-bifrost-core"},"profile":{"test":true},"executable":"/t/quicksilver/deps/brokk_bifrost_core-c4d0bb3ad97e1f96"}"#,
+            r#"{"reason":"compiler-artifact","target":{"name":"my-core"},"profile":{"test":true},"executable":"/t/quicksilver/deps/my_core-c4d0bb3ad97e1f96"}"#,
             "\n",
-            r#"{"reason":"compiler-artifact","target":{"name":"bifrost_mcp_property_fuzzer"},"profile":{"test":false},"executable":"/t/quicksilver/deps/bifrost_mcp_property_fuzzer-abcdef1234567890"}"#,
+            r#"{"reason":"compiler-artifact","target":{"name":"my_property_fuzzer"},"profile":{"test":false},"executable":"/t/quicksilver/deps/my_property_fuzzer-abcdef1234567890"}"#,
             "\n",
             // No profile at all: not provably a harness, so it is dropped.
             r#"{"reason":"compiler-artifact","target":{"name":"odd"},"executable":"/t/quicksilver/deps/odd-1111111111111111"}"#,
@@ -601,7 +601,7 @@ mod tests {
         assert_eq!(
             exes,
             vec![PathBuf::from(
-                "/t/quicksilver/deps/brokk_bifrost_core-c4d0bb3ad97e1f96"
+                "/t/quicksilver/deps/my_core-c4d0bb3ad97e1f96"
             )],
             "plain bin artifacts must not be staged as test binaries"
         );

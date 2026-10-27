@@ -255,7 +255,7 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
             eprintln!("preflight recompile count after one mutant: {n} units");
             if n > 8 {
                 eprintln!(
-                    "warning: {n} crates rebuilt for one function-body edit. A source-hashing build script is likely at work. Pin identities with [build-env] in quicksilver.toml (bifrost: BIFROST_BUILD_IDENTITY_OVERRIDE)."
+                    "warning: {n} crates rebuilt for one function-body edit. A source-hashing build script is likely at work. Pin identities with [build-env] in quicksilver.toml."
                 );
             }
             Ok(Some(n))

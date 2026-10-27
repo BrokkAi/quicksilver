@@ -694,7 +694,7 @@ fn classify_path(p: &syn::TypePath) -> ReturnKind {
     }
 }
 
-/// Parse a standalone function snippet. Used by unit tests without standing up bifrost.
+/// Parse a standalone function snippet. Used by unit tests without loading a workspace.
 pub fn mutants_from_snippet(
     package: &str,
     path: &str,
