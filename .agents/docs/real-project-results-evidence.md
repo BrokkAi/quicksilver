@@ -56,9 +56,55 @@ the runs; ~79k is an approximate historical scope size.
 
 mbx's 7-crate mapped workspace has 153,723 tracked Rust lines at upstream
 53d2e4e54bd5bceb809cc9ed9eb3c3d30e76e59d (base of tested aa16be7,
-which added three test-only fixes). The README rounds this to ~150k.
+which added three test-only fixes). This supplied the earlier ~150k total row; the partition below supersedes it.
 The workspace was mapped and 169 targeted mutants checked; this does not
 assert that each of its seven crates contained a mutant.
+
+## Production/test line partition
+
+The README now separates production and test kloc (1 kloc = 1,000 physical
+Rust lines). Current counts are explicitly acceptable to the user, even
+though the mutation runs used earlier revisions. Comments, blank lines and
+multiline fixture strings follow the containing source span.
+
+Bifrost at 122167d27ac88e9e866a8ec8c46bd06429d632a4:
+
+| Analyzer | Production lines | Test lines | Shared test-support lines | Total |
+| --- | ---: | ---: | ---: | ---: |
+| C# | 22,511 | 3,310 | 0 | 25,821 |
+| PHP | 11,161 | 3,972 | 0 | 15,133 |
+| Ruby | 8,258 | 2,028 | 0 | 10,286 |
+| Go | 18,925 | 8,774 | 7 | 27,706 |
+| Total | 60,855 | 18,084 | 7 | 78,946 |
+
+Source: session 5b9275ef422b8eb3146a4a11fb9dd1aa, script
+`/home/jonathan/Projects/bifrost/.mj/qs-report/loc-partition.py`.
+Tree-sitter-rust parses all tracked Rust files in these four package
+directories from the git tree. Test items run from their first attribute
+through their closing brace: `#[test]`, `#[cfg(test)]`, and
+`#[cfg(all(test, ...))]`. These packages have only inline tests, with no
+out-of-line test modules or separate tests/benches/build.rs files.
+The seven Go lines gated by `any(test, feature = ...)` are shared test
+support; they join test lines in the README, giving 18,091 test lines.
+All remaining lines are production. Rounded to one decimal kloc:
+60.9 production, 18.1 test. The current total is 182 lines larger than
+the earlier 78,764-line snapshot above.
+
+mbx at 53d2e4e54bd5bceb809cc9ed9eb3c3d30e76e59d: 78,278 production
++ 75,445 test = 153,723 physical Rust lines in 167 tracked files across
+the same seven-crate workspace. Rounded: 78.3 production, 75.4 test kloc.
+Source: session c4726d0363d4a1daef5e51bd6bca3890. Tree-sitter Rust AST
+spans classify inline cfg(test)/cfg(all(test, ...)), test functions and
+helpers; classification propagates to external #[path] test modules and
+include!(scheduler_legacy_tests.rs). Integration tests and fixture files
+count entirely as test code. Comments/blanks are included; separator blanks
+outside inline spans remain production. Fixture source strings in test
+files count as test code. There is no root package build.rs in this
+snapshot; crates/mbx/tests/build.rs is an 8,730-line integration test and
+counts entirely as test. All module/include references resolve. Eight
+parser recovery errors around `raw.` expressions in production config.rs
+lines 1376–1527 were inspected and lie outside both test-only spans, so
+they do not affect the classification. No build or benchmark was run.
 
 ## Earlier three-analyzer source audit
 

@@ -79,7 +79,8 @@ Agents used quicksilver to find missing tests and bugs in two Rust projects:
 
 | | [mbx](https://github.com/jdx/mr-boxington) | [Bifrost](https://github.com/BrokkAi/bifrost) |
 | --- | --- | --- |
-| Rust in scope | **~150k lines** | **~79k lines** |
+| Production kloc | **78.3** | **60.9** |
+| Test kloc | **75.4** | **18.1** |
 | Scope tested | 7-crate workspace | C#, PHP, Ruby and Go analyzers |
 | Map time | **21 min** | **1 hr 5 min** |
 | Mutants checked | **169** | **1,724** |
