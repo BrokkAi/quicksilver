@@ -49,15 +49,37 @@ gets its own home and temporary directories, so a mutant cannot write into
 your real ones.
 
 
+## Dependencies
+
+Quicksilver builds on two existing Rust tools:
+
+- **[cargo-nextest](https://nexte.st)** discovers the workspace's test
+  binaries and individual tests, and runs the unmodified suite to check
+  that it passes and record per-test timings. Its machine-readable test
+  catalog lets quicksilver select exactly the tests that cover a mutant.
+  Quicksilver runs the mapped and mutant tests directly, in its own
+  sandboxes, to record coverage and activate each mutant.
+- **[mbx](https://mr-boxington.jdx.dev)** runs every Cargo build and manages
+  the build directories for quicksilver's worktrees. Its shared cache
+  reuses build outputs across worktrees and your normal development
+  builds. The map and mutant build also reuse the same worktree, so a
+  batch of mutants needs one rebuild of the changed crates and their
+  dependents. Quicksilver invokes mbx directly; no global Cargo wrapper
+  setup is needed.
+
+Both must be on `PATH`. They are executable dependencies:
+[`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
+does not install them automatically with quicksilver, but you can install
+all three in one command below. Existing installations can be reused.
+
+
 ## Quick tutorial
 
-You need Linux or another Unix system, Rust 1.99 or newer, git,
-[cargo-nextest](https://nexte.st) and the
-[mbx](https://mr-boxington.jdx.dev/installation) build cache. Then:
+You need Linux or another Unix system, Rust 1.99 or newer and git. Install
+quicksilver and its [dependencies](#dependencies) together:
 
 ```
-cargo install cargo-nextest
-cargo install cargo-quicksilver
+cargo install --locked cargo-quicksilver cargo-nextest mbx
 ```
 
 Take a crate, `voting`, with one function and two tests in `src/lib.rs`:

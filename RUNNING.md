@@ -25,12 +25,17 @@ Quicksilver runs on Linux and other Unix systems; it does not build on
 Windows. You need git, Rust 1.99 or newer,
 [cargo-nextest](https://nexte.st), and the
 [mbx](https://mr-boxington.jdx.dev/installation) build cache, which
-quicksilver runs every build through.
+quicksilver runs every build through. Both executables must be on `PATH`;
+Cargo does not install them automatically with quicksilver. Install all
+three together:
 
 ```
-cargo install cargo-nextest
-cargo install cargo-quicksilver
+cargo install --locked cargo-quicksilver cargo-nextest mbx
 ```
+
+Existing nextest and mbx installations can be reused. Quicksilver invokes
+mbx directly, so no global Cargo wrapper setup is needed. See
+[Dependencies](README.md#dependencies) for why these tools are required.
 
 Run it as `cargo quicksilver`. If your `cargo` is mbx's cargo wrapper,
 quicksilver leaves the wrapper's build session at start, so that its own
