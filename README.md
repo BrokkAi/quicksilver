@@ -75,8 +75,22 @@ all three in one command below. Existing installations can be reused.
 
 ## Results on real projects
 
-In both projects, coding agents wrote the mutants and reviewed the ones
-that survived.
+In both projects, agents wrote realistic mutants and reviewed the survivors.
+Most reviewed mutants exposed behavior the tests did not check.
+
+![Small project on the left, large project on the right: mbx had 31 test gaps among 40 reviewed mutants; Bifrost had 263 test gaps and 32 suspected bugs among 440 reviewed mutants.](https://raw.githubusercontent.com/BrokkAi/quicksilver/master/assets/results.svg)
+
+| Follow-up in mbx | Follow-up in Bifrost |
+| --- | --- |
+| **26 tests retained**, bringing the suite to **163 of 169 mutants caught** | **229 test gaps covered** by proven tests; **31 bugs fixed** |
+
+Bars show the share of reviewed mutants. The mbx review includes 37
+survivors and 3 corrected false kills. Bifrost's review covers the C#, PHP
+and Ruby analyzers. “Other findings” groups the remaining review categories,
+broken down below.
+
+<details>
+<summary>Run details and survivor breakdowns</summary>
 
 ### A small project: mbx
 
@@ -130,6 +144,8 @@ added later catches it.
 The agents added tests for 229 of the 263 gaps, each one checked to fail
 with its mutant and pass without it. Follow-up fixed 31 of the 32 suspected
 bugs in Bifrost; the last one needs a design decision first.
+
+</details>
 
 
 ## Quick tutorial
