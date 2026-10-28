@@ -75,7 +75,7 @@ all three in one command below. Existing installations can be reused.
 
 ## Results on real projects
 
-Agents used quicksilver to find missing tests and bugs in two Rust projects:
+Runtimes will vary by project size and mutation count, but you can generally expect "hours on a single machine" rather than "days across a fleet".
 
 | | [mbx](https://github.com/jdx/mr-boxington) | [Bifrost](https://github.com/BrokkAi/bifrost) |
 | --- | --- | --- |
