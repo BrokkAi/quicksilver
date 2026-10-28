@@ -85,100 +85,13 @@ Agents used quicksilver to find missing tests and bugs in two Rust projects:
 | Mutants checked | **169** | **1,449** |
 | Build + test after map | **6 min 26 sec** for 169 mutants | **70 min** for a 521-mutant C# batch |
 | Test gaps found | **31** | **263** |
-| Bugs found | **5 confirmed**, fixes submitted | **65+ fixed**, each with a regression test |
-| Follow-up tests | **26 added or strengthened and merged** | **229 gaps covered** by proven tests |
+| Bugs confirmed | **5** | **65+** |
 
 Mapping prepares the test-to-function map; subsequent mutant batches reuse
 the build work. Times exclude writing mutants and reviewing findings. mbx
 ran on a shared 96-CPU host; Bifrost ran on a 64-vCPU EC2 host, one analyzer
 at a time. The Bifrost checking time is for the C# batch shown, while its
 finding counts combine all three analyzers.
-
-<details>
-<summary>Run details and survivor breakdowns</summary>
-
-### A small project: mbx
-
-[mbx](https://github.com/jdx/mr-boxington) is a build cache for Rust: 7
-crates, about 150,000 lines of Rust and 2,100 tests.
-
-- Five agents each took one area of the code. Between them they wrote 169
-  mutants, most of which bring back a bug that mbx fixed in the past.
-- `map` put a switch in 2,657 functions and found that tests enter 2,439
-  of them, in 21 minutes. After `map`, `build` recompiled the changed crates
-  once for all 169 mutants, in one Cargo invocation, in 39 seconds. `test`
-  took 6 minutes: 132 caught, 37 missed.
-- Review covered the 37 survivors and 3 more mutants that an unrelated,
-  randomly failing test had counted as caught. Of these 40, 31 were
-  behavior no test checked. 5 were races that need a hook in mbx before a
-  test can catch them, and 4 were caught by a test that quicksilver could
-  not use at the time. None was an equivalent mutant.
-- The agents wrote 29 tests, and `prove` confirmed that each one catches
-  its mutant. A run with all 29 caught 163 of 169 mutants. Review retained
-  23 new tests and 3 extended tests, guarding 27 mutants; these were merged
-  in [#854](https://github.com/jdx/mr-boxington/pull/854). The reduced suite
-  was not remeasured.
-- Investigations during the campaign also uncovered five mbx defects:
-  a flight-wait lock after a mismatched result, a same-tick input change
-  escaping verification, restored outputs triggering unnecessary rebuilds
-  on ZFS, a swallowed Cargo metadata error, and a lost build session under
-  the Cargo shim. All five have tested fixes submitted upstream:
-  [#859](https://github.com/jdx/mr-boxington/pull/859),
-  [#860](https://github.com/jdx/mr-boxington/pull/860),
-  [#861](https://github.com/jdx/mr-boxington/pull/861),
-  [#862](https://github.com/jdx/mr-boxington/pull/862), and
-  [#863](https://github.com/jdx/mr-boxington/pull/863).
-
-Times are from a 96-CPU machine shared with other work.
-
-### A large project: Bifrost
-
-[Bifrost](https://github.com/BrokkAi/bifrost) is a multi-language static
-analyzer: about 30 crates, 3.3 million lines of Rust and more than 12,000
-tests.
-
-- Agents worked through the workspace one crate at a time, in 12 rounds,
-  and wrote about 7,000 mutants.
-- In the round for the C# analyzer, on a 64-CPU machine, `map` took 16
-  minutes (948.9 seconds). After `map`, `build` incrementally rebuilt the
-  changed crates for 521 mutants in 642.5 seconds, and `test` ran them in
-  3,547.7 seconds: about 70 minutes for build and test together.
-- In three rounds, every survivor was reviewed and followed up:
-
-| Crate | Mutants | Caught | Missed | Test gap | Suspected bug | Equivalent | Unreachable | Other |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| C# analyzer | 664 | 459 | 205 | 128 | 9 | 33 | 22 | 13 |
-| PHP analyzer | 442 | 295 | 147 | 86 | 12 | 30 | 14 | 5 |
-| Ruby analyzer | 343 | 255 | 88 | 49 | 11 | 18 | 8 | 2 |
-| **Total** | **1,449** | **1,009** | **440** | **263** | **32** | **81** | **44** | **20** |
-
-*Test gap*: the mutant changes behavior that no test checks. *Suspected
-bug*: reviewing the survivor flagged a possible defect in the original code.
-*Equivalent*: the mutant cannot change what the program does.
-*Unreachable*: the mutant is in code that cannot run, or in a defensive
-check. *Other*: 18 mutants change only log or diagnostic output; 2 are
-caught by tests added later.
-
-The agents added tests for 229 of the 263 gaps, each one checked to fail
-with its mutant and pass without it. The 32 suspected-defect labels above
-are initial review categories, not a count of distinct production bugs.
-Follow-up tests and investigation found and fixed **at least 65 distinct
-production bugs**: 21 in C#, 27 in PHP and 17 in Ruby. Each has a regression
-test recorded failing before the fix. The fixes include a C# stack overflow
-on deeply nested expressions, PHP interpreting an octal directory-depth
-argument as decimal, and a Ruby factory-cache panic. They landed in the
-C# [coverage](https://github.com/BrokkAi/bifrost-dev/pull/7157) and
-[follow-up](https://github.com/BrokkAi/bifrost-dev/pull/7320) PRs, the PHP
-[coverage](https://github.com/BrokkAi/bifrost-dev/pull/7188) and
-[follow-up](https://github.com/BrokkAi/bifrost-dev/pull/7228) PRs, and the Ruby
-[follow-up](https://github.com/BrokkAi/bifrost-dev/pull/7290) PR.
-
-The campaign also removed 19 dead functions. A further confirmed Ruby bug,
-[lost absolute-versus-lexical name context](https://github.com/BrokkAi/bifrost-dev/issues/7287),
-remains open pending a producer contract change; it is excluded from the
-fixed-bug count.
-
-</details>
 
 
 ## Quick tutorial
