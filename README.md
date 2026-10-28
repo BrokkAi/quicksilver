@@ -31,8 +31,8 @@ rebuilds your project once for each mutant. Quicksilver does not:
 body with `0`, `true` or `None`. Real bugs are an off-by-one, a swapped
 condition, a forgotten case. With quicksilver you, or a coding agent, write
 those as ordinary edits to function bodies, and quicksilver turns each
-edited function into a mutant. In the two projects below, most surviving
-mutants pointed at behavior no test checked, and some at real bugs.
+edited function into a mutant. In the projects below, reviewing survivors
+exposed missing assertions and real bugs.
 
 **Built for agents.** Agents can map a workspace, split the work
 (`pending --split`), write mutants in parallel and submit them as patches
@@ -77,21 +77,19 @@ all three in one command below. Existing installations can be reused.
 
 Agents used quicksilver to find missing tests and bugs in two Rust projects:
 
-| | Small project: [mbx](https://github.com/jdx/mr-boxington) | Large project: [Bifrost](https://github.com/BrokkAi/bifrost) |
+| | [mbx](https://github.com/jdx/mr-boxington) | [Bifrost](https://github.com/BrokkAi/bifrost) |
 | --- | --- | --- |
-| Codebase | **150k Rust lines**, 7 crates | **3.3M Rust lines**, about 30 crates |
-| Scope tested | Whole workspace | C#, PHP and Ruby analyzers |
-| Map time | **21 min** | **16 min** for the C# analyzer |
-| Mutants checked | **169** | **1,449** |
-| Build + test after map | **6 min 26 sec** for 169 mutants | **70 min** for a 521-mutant C# batch |
-| Test gaps found | **31** | **263** |
-| Bugs confirmed | **5** | **65+** |
+| Rust in scope | **~150k lines** | **~79k lines** |
+| Scope tested | 7-crate workspace | C#, PHP, Ruby and Go analyzers |
+| Map time | **21 min** | **1 hr 5 min** |
+| Mutants checked | **169** | **1,724** |
+| Build + test after map | **6 min 26 sec** | **3 hr 49 min** |
+| Test gaps found | **31** | **311** |
+| Bugs confirmed | **5** | **79** |
 
-Mapping prepares the test-to-function map; subsequent mutant batches reuse
-the build work. Times exclude writing mutants and reviewing findings. mbx
-ran on a shared 96-CPU host; Bifrost ran on a 64-vCPU EC2 host, one analyzer
-at a time. The Bifrost checking time is for the C# batch shown, while its
-finding counts combine all three analyzers.
+Times sum each map and every tested mutant generation in the scopes shown,
+excluding agent work. Builds are incremental after mapping. mbx ran on a
+shared 96-CPU host; Bifrost ran on a 64-vCPU EC2 host.
 
 
 ## Quick tutorial

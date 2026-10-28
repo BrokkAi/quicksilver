@@ -15,21 +15,64 @@ from c31788f646a8565e51cecb86f9049f9a, and jdx/mr-boxington PRs #854, #859–#86
 - Review of 40 (37 survivors + those three corrected kills):
   31 gaps, 5 races needing hooks, 4 tool limitations.
 - Five product defects were found during QS investigations, rather than
-  directly by survivors. Tested fixes #859–#863 were all OPEN when checked,
-  not merged upstream. The older four-bug count omitted #859.
+  directly by survivors. At the 2026-10-28 15:55 UTC session update,
+  #860 and #861 had merged; #859, #862 and #863 remained open.
+  The older four-bug count omitted #859.
 - #854 merged 23 new + 3 extended tests guarding 27 mutants. The measured
   163/169 result used all 29 proposed tests BEFORE review. The retained
   26-test suite was not remeasured; 160/169 is inferred, not observed.
 
-## Bifrost source audit
+## Current headline scope
+
+The README uses the broadest Bifrost cohort with complete tested-mutant
+counts and map/build/test timings: C#, PHP, Ruby and Go (rounds 8–11).
+The [full campaign audit](bifrost-campaign-audit.md) records 12 completed
+mutation targets, but their complete tested-mutant and timing totals could
+not be recovered. Do not use the whole repository's LOC for this subset.
+
+| Analyzer | Rust lines | Mutants | Gaps | Confirmed bugs | Map seconds | Build seconds | Test seconds |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| C# | 25,840 | 664 | 128 | 21 | 948.9 | 802.8 | 4977.0 |
+| PHP | 15,133 | 442 | 86 | 27 | 964.2 | 527.9 | 1709.6 |
+| Ruby | 10,252 | 343 | 49 | 17 | 957.1 | 482.6 | 1264.6 |
+| Go | 27,539 | 275 | 48 | 14 | 1017.6 | 925.1 | 3057.2 |
+| Total | 78,764 | 1,724 | 311 | 79 | 3887.8 | 2738.4 | 11008.4 |
+
+Timing sums include one map per analyzer and every tested generation:
+A/B for C#, PHP and Ruby, A/B/C for Go. Build + test is 13,746.8 seconds
+(3 hr 49 min rounded); mapping is 1 hr 5 min rounded. These are sums of
+recorded process wall times, excluding agent work; builds reuse map output.
+The 79 bug groups are explicitly enumerated confirmed production defects,
+with fixes merged and recorded failing-before regressions. This inventory
+is conservative, not a claim that no further bugs were found.
+
+LOC counts newline bytes in all tracked Rust files under the stated package
+scope, including tests/fixtures/build.rs where present. The Bifrost session
+confirmed that all tracked Rust under these four package directories is
+inside src, so the audit's source count and all-tracked count are identical.
+Extra-test-only packages are excluded from this mutation scope's LOC.
+Bifrost was counted at 54f6c8dba9c575c3d8e0a21d152c8b2bad006787, after
+the runs; ~79k is an approximate historical scope size.
+
+mbx's 7-crate mapped workspace has 153,723 tracked Rust lines at upstream
+53d2e4e54bd5bceb809cc9ed9eb3c3d30e76e59d (base of tested aa16be7,
+which added three test-only fixes). The README rounds this to ~150k.
+The workspace was mapped and 169 targeted mutants checked; this does not
+assert that each of its seven crates contained a mutant.
+
+## Earlier three-analyzer source audit
+
+The preserved audit below covers C#, PHP and Ruby. Its references to the
+README describe the earlier draft; current headline scope and timing are
+specified above and supersede those comparisons.
 
 Copied from session 5b9275ef422b8eb3146a4a11fb9dd1aa at
 /home/jonathan/Projects/bifrost/.mj/qs-report/showcase-facts.md.
 Relative supporting-artifact links below refer to that original directory;
 the commit and PR links are durable primary sources. The numbered defect
 inventories reconcile to 21 + 27 + 17 = 65, a conservative lower bound.
-Findings cover C#, PHP and Ruby; the headline timing is the C# generation-A
-batch, not all 1,449 mutants.
+Findings below cover C#, PHP and Ruby; the earlier draft used C# generation-A
+timing. The current README instead sums all generations of four analyzers.
 
 | Round | Mutants tested | Caught | Missed | Other outcomes | Gaps / suspected defects | Gap mutants newly killed | Strict confirmed bug groups (minimum) |
 |---|---:|---:|---:|---:|---:|---:|---:|
