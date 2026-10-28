@@ -60,13 +60,17 @@ Quicksilver builds on two existing Rust tools:
   which functions each test enters and selects the tests for each mutant.
   Quicksilver runs the mapped and mutant tests directly, in its own
   sandboxes, to record coverage and activate each mutant.
-- **[mbx](https://mr-boxington.jdx.dev)** runs every Cargo build and manages
-  the build directories for quicksilver's worktrees. Its shared cache
-  reuses build outputs across worktrees and your normal development
-  builds. The map and mutant build also reuse the same worktree, so a
-  batch of mutants needs one rebuild of the changed crates and their
-  dependents. Quicksilver invokes mbx directly; no global Cargo wrapper
-  setup is needed.
+- **[mbx](https://mr-boxington.jdx.dev)** manages build state for
+  quicksilver's isolated git worktrees. It gives each worktree its own
+  [target directory](https://mr-boxington.jdx.dev/managed-targets), reuses
+  matching build outputs, and can seed
+  [private incremental compiler state](https://mr-boxington.jdx.dev/incremental)
+  from another checkout when quicksilver edits a crate. Before removing a
+  worktree, quicksilver calls `mbx clean` to release its target and
+  incremental state. Requiring mbx lets quicksilver delegate build reuse
+  and cleanup to one backend; it replaces quicksilver's former build-output
+  cloning layer. Quicksilver invokes mbx directly, so no global Cargo
+  wrapper setup is needed.
 
 Both must be on `PATH`. They are executable dependencies:
 [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
