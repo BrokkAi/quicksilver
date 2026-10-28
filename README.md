@@ -55,8 +55,9 @@ Quicksilver builds on two existing Rust tools:
 
 - **[cargo-nextest](https://nexte.st)** discovers the workspace's test
   binaries and individual tests, and runs the unmodified suite to check
-  that it passes and record per-test timings. Its machine-readable test
-  catalog lets quicksilver select exactly the tests that cover a mutant.
+  that it passes and record per-test timings. Its machine-readable catalog
+  supplies test names and executable paths. Quicksilver's own map records
+  which functions each test enters and selects the tests for each mutant.
   Quicksilver runs the mapped and mutant tests directly, in its own
   sandboxes, to record coverage and activate each mutant.
 - **[mbx](https://mr-boxington.jdx.dev)** runs every Cargo build and manages
