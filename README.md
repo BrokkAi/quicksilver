@@ -20,9 +20,9 @@ rebuilds your project once for each mutant. Quicksilver does not:
 
 - **One build for many mutants.** It puts a small switch at the start of
   every function and compiles the workspace once. Each mutant is turned on
-  at run time, so a thousand mutants cost one build, not a thousand. On a
-  real workspace of 7 crates and 2,100 tests, 169 hand-written mutants
-  compiled in one cargo invocation, in 38 seconds.
+  at run time, so a thousand mutants cost one build, not a thousand. On
+  mbx, a workspace of 7 crates and 2,100 tests, 169 hand-written mutants
+  compiled in one incremental rebuild after `map`, in 39 seconds.
 - **Only the tests that matter.** The same switch records which tests enter
   which functions. A mutant runs only the tests that reach it, cheapest
   first, so a kill is usually found early.
@@ -31,8 +31,8 @@ rebuilds your project once for each mutant. Quicksilver does not:
 body with `0`, `true` or `None`. Real bugs are an off-by-one, a swapped
 condition, a forgotten case. With quicksilver you, or a coding agent, write
 those as ordinary edits to function bodies, and quicksilver turns each
-edited function into a mutant. In that same workspace, of the first 20
-surviving mutants reviewed, 13 pointed at behavior its tests did not check.
+edited function into a mutant. In the two projects below, most surviving
+mutants pointed at behavior no test checked, and some at real bugs.
 
 **Built for agents.** Agents can map a workspace, split the work
 (`pending --split`), write mutants in parallel and submit them as patches
@@ -71,6 +71,65 @@ Both must be on `PATH`. They are executable dependencies:
 [`cargo install`](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
 does not install them automatically with quicksilver, but you can install
 all three in one command below. Existing installations can be reused.
+
+
+## Results on real projects
+
+In both projects, coding agents wrote the mutants and reviewed the ones
+that survived.
+
+### A small project: mbx
+
+[mbx](https://github.com/jdx/mr-boxington) is a build cache for Rust: 7
+crates, about 150,000 lines of Rust and 2,100 tests.
+
+- Five agents each took one area of the code. Between them they wrote 169
+  mutants, most of which bring back a bug that mbx fixed in the past.
+- `map` put a switch in 2,657 functions and found that tests enter 2,439
+  of them, in 21 minutes. After `map`, `build` recompiled the changed crates
+  once for all 169 mutants, in one Cargo invocation, in 39 seconds. `test`
+  took 6 minutes: 132 caught, 37 missed.
+- Review covered the 37 survivors and 3 more mutants that an unrelated,
+  randomly failing test had counted as caught. Of these 40, 31 were
+  behavior no test checked. 5 were races that need a hook in mbx before a
+  test can catch them, and 4 were caught by a test that quicksilver could
+  not use at the time. None was an equivalent mutant.
+- The agents wrote 29 tests, and `prove` confirmed that each one catches
+  its mutant. Review kept 26 of them. With those tests, 163 of the 169
+  mutants are caught.
+
+Times are from a 96-CPU machine shared with other work.
+
+### A large project: Bifrost
+
+[Bifrost](https://github.com/BrokkAi/bifrost) is a multi-language static
+analyzer: about 30 crates, 3.3 million lines of Rust and more than 12,000
+tests.
+
+- Agents worked through the workspace one crate at a time, in 12 rounds,
+  and wrote about 7,000 mutants.
+- In the round for the C# analyzer, on a 64-CPU machine, `map` took 16
+  minutes. After `map`, `build` incrementally rebuilt the changed crates
+  for 521 mutants in 11 minutes, and `test` ran them in an hour.
+- In three rounds, every survivor was reviewed and followed up:
+
+| Crate | Mutants | Caught | Missed | Test gap | Suspected bug | Equivalent | Unreachable | Other |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| C# analyzer | 664 | 459 | 205 | 128 | 9 | 33 | 22 | 13 |
+| PHP analyzer | 442 | 295 | 147 | 86 | 12 | 30 | 14 | 5 |
+| Ruby analyzer | 343 | 255 | 88 | 49 | 11 | 18 | 8 | 2 |
+| **Total** | **1,449** | **1,009** | **440** | **263** | **32** | **81** | **44** | **20** |
+
+*Test gap*: the mutant changes behavior that no test checks. *Suspected
+bug*: reviewing the survivor flagged a possible defect in the original code.
+*Equivalent*: the mutant cannot change what the program does.
+*Unreachable*: the mutant is in code that cannot run, or in a defensive
+check. *Other*: the mutant changes only log or diagnostic output, or a test
+added later catches it.
+
+The agents added tests for 229 of the 263 gaps, each one checked to fail
+with its mutant and pass without it. Follow-up fixed 31 of the 32 suspected
+bugs in Bifrost; the last one needs a design decision first.
 
 
 ## Quick tutorial
