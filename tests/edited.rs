@@ -225,6 +225,8 @@ fn edited_mutants_are_captured_built_and_judged() {
         let sources = CaptureSources {
             checkout: Some(repo.path().to_path_buf()),
             patches: patches.into_iter().map(Into::into).collect(),
+            from: Vec::new(),
+            verbose_intents: false,
             options: CaptureOptions {
                 skip_outside_bodies: skip,
             },

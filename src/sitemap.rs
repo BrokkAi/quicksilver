@@ -85,6 +85,9 @@ pub struct SiteMap {
     pub cpu_secs_by_test: BTreeMap<String, f64>,
     /// Tests that did not pass under the schema binary, with why.
     pub not_green: Vec<(String, String)>,
+    /// Tolerated failures of the original suite, excluded before recording.
+    #[serde(default)]
+    pub baseline_failures: Vec<crate::types::BaselineFailure>,
     /// Tests `[map] skip-tests` left out: never run, so neither green nor
     /// not green.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -710,6 +713,7 @@ mod tests {
             hits: [("p::t1".to_string(), vec![7])].into_iter().collect(),
             cpu_secs_by_test: Default::default(),
             not_green: Vec::new(),
+            baseline_failures: Vec::new(),
             skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),
@@ -778,6 +782,7 @@ mod tests {
             .into_iter()
             .collect(),
             not_green: Vec::new(),
+            baseline_failures: Vec::new(),
             skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),

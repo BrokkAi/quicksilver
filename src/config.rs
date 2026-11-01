@@ -41,6 +41,12 @@ pub struct MapFile {
     /// never run, such as timing guards that fail under the switch.
     #[serde(rename = "skip-tests", default)]
     pub skip_tests: Vec<String>,
+    /// Project nextest profile for the baseline (default: default).
+    #[serde(rename = "nextest-profile")]
+    pub nextest_profile: Option<String>,
+    /// Make failures outside the mutated packages block mapping too.
+    #[serde(rename = "fail-on-extra-baseline", default)]
+    pub fail_on_extra_baseline: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -86,6 +92,8 @@ pub struct Config {
     pub sandbox: bool,
     /// `[map] skip-tests`: test id globs never run or recorded.
     pub skip_tests: Vec<String>,
+    pub nextest_profile: String,
+    pub fail_on_extra_baseline: bool,
     /// `[sandbox] dir`: where sandboxes go instead of the system temporary
     /// directory.
     pub sandbox_dir: Option<PathBuf>,
@@ -185,6 +193,12 @@ pub fn merge_config(
             crate::index::skip_globs(&file.map.skip_tests)?;
             file.map.skip_tests.clone()
         },
+        nextest_profile: file
+            .map
+            .nextest_profile
+            .clone()
+            .unwrap_or_else(|| "default".into()),
+        fail_on_extra_baseline: file.map.fail_on_extra_baseline,
         sandbox_dir: match &file.sandbox.dir {
             Some(dir) if !dir.is_absolute() => anyhow::bail!(
                 "[sandbox] dir must be an absolute path, not {}",

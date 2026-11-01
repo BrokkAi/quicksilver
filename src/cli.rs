@@ -2,11 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(
-    name = "cargo-quicksilver",
-    version,
-    about
-)]
+#[command(name = "cargo-quicksilver", version, about)]
 pub struct Cli {
     #[command(flatten)]
     pub common: CommonOpts,
@@ -184,6 +180,14 @@ pub struct BuildArgs {
     /// to that patch (split at the last equals sign).
     #[arg(long = "patch", value_name = "PATCH[=INTENTS]")]
     pub patches: Vec<crate::exec::edited::PatchSource>,
+    /// Carry mutants from saved edited state or test --json onto this map.
+    /// Exact function names, paths and original bodies must still match.
+    /// Invalid mutants are reported and omitted (exit 2); valid ones build.
+    #[arg(long = "from", value_name = "FILE", conflicts_with_all = ["patches", "no_capture"])]
+    pub from: Vec<PathBuf>,
+    /// Name each intent key that matches a function but no captured edit.
+    #[arg(long)]
+    pub verbose_intents: bool,
     /// Drop edits outside function bodies with a warning instead of
     /// rejecting the whole capture.
     #[arg(long)]

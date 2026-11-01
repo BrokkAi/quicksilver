@@ -4,7 +4,7 @@ use crate::cargo_cmd::{
 };
 use crate::config::Config;
 use crate::discover::{apply_mutant, restore_file};
-use crate::types::{BaselineReport, Mutant, Paths, TestInfo};
+use crate::types::{BaselineFailure, BaselineFailureKind, BaselineReport, Mutant, Paths, TestInfo};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
@@ -44,14 +44,17 @@ pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &packages, false)
 }
 
-pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo>, Vec<String>)> {
+pub fn run_green_suite(
+    cfg: &Config,
+    paths: &Paths,
+) -> Result<(f64, Vec<TestInfo>, Vec<BaselineFailure>)> {
     if !nextest_available() {
         bail!("cargo nextest is required. Install it with: cargo install cargo-nextest");
     }
-    let config_path = write_nextest_config(&paths.index)?;
+    let config_path = write_nextest_config(&paths.index, &paths.baseline, &cfg.nextest_profile)?;
     let meta = load_metadata(&paths.baseline)?;
     let mut last_tests = Vec::new();
-    let mut last_failed_ids = Vec::new();
+    let mut failures = std::collections::BTreeMap::new();
     let mut last_secs = 0.0;
     for run in 0..cfg.baseline_runs.max(1) {
         info!(
@@ -63,7 +66,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         cmd.current_dir(&paths.baseline);
         apply_build_env(&mut cmd, cfg);
         cmd.args(["nextest", "run"]);
-        cmd.args(crate::cargo_cmd::nextest_profile_args());
+        cmd.args(["--profile", &cfg.nextest_profile]);
         cmd.arg("--config-file").arg(&config_path);
         crate::cargo_cmd::apply_package_select(
             &mut cmd,
@@ -74,27 +77,26 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
         }
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
+        // Never mistake a previous invocation's JUnit report for this run's.
+        let junit = paths.index.join("baseline-junit.xml");
+        if junit.is_file() {
+            fs::remove_file(&junit)?;
+        }
         let start = Instant::now();
         let status = cmd.status().context("cargo nextest run")?;
         last_secs = start.elapsed().as_secs_f64();
-        let junit = paths
-            .baseline
-            .join("target")
-            .join("nextest")
-            .join("quicksilver")
-            .join("junit.xml");
-        let junit = if junit.is_file() {
-            junit
-        } else {
-            paths.index.join("junit.xml")
-        };
         if junit.is_file() {
             let xml = fs::read_to_string(&junit)?;
             last_tests = parse_junit(&xml, &meta)?;
             let seeds = crate::cargo_cmd::covering_seeds(cfg);
             let failed = junit_failures(&xml);
             let skip = crate::index::skip_globs(&cfg.skip_tests)?;
-            let (seed_fails, skipped) = blocking_failures(&failed, &seeds, skip.as_ref());
+            let blocking_seeds = if cfg.fail_on_extra_baseline {
+                &[][..]
+            } else {
+                &seeds
+            };
+            let (seed_fails, skipped) = blocking_failures(&failed, blocking_seeds, skip.as_ref());
             if !seed_fails.is_empty() {
                 bail!(
                     "red baseline: {} failing test(s) in {}: {} … Mutation results are meaningless against a failing suite. A test that cannot pass here can be left out with [map] skip-tests in quicksilver.toml.",
@@ -103,7 +105,7 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
                     seed_fails
                         .iter()
                         .take(5)
-                        .map(|f| f.id.as_str())
+                        .map(|f| format!("{:?} {} (nextest profile {})", f.kind, f.id, cfg.nextest_profile))
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -121,14 +123,39 @@ pub fn run_green_suite(cfg: &Config, paths: &Paths) -> Result<(f64, Vec<TestInfo
                     failed[0].id
                 );
             }
-            last_failed_ids = failed.into_iter().map(|f| f.id).collect();
-        } else if !status.success() {
-            bail!("red baseline: cargo nextest run failed and produced no junit.xml");
+            if !status.success() && failed.is_empty() {
+                bail!("red baseline: nextest failed but JUnit identified no failing tests (profile {})", cfg.nextest_profile);
+            }
+            for failure in failed {
+                if skip.as_ref().is_some_and(|g| g.is_match(&failure.id)) {
+                    continue;
+                }
+                failures
+                    .entry(failure.id)
+                    .and_modify(|kind| {
+                        if failure.kind == BaselineFailureKind::Timeout {
+                            *kind = failure.kind;
+                        }
+                    })
+                    .or_insert(failure.kind);
+            }
+        } else {
+            bail!(
+                "baseline cargo nextest run produced no JUnit report: {} (status {status})",
+                junit.display()
+            );
         }
     }
     let json = serde_json::to_vec_pretty(&last_tests)?;
     crate::util::write_atomic(&paths.index.join("tests.json"), json)?;
-    Ok((last_secs, last_tests, last_failed_ids))
+    Ok((
+        last_secs,
+        last_tests,
+        failures
+            .into_iter()
+            .map(|(id, kind)| BaselineFailure { id, kind })
+            .collect(),
+    ))
 }
 
 pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<TestInfo>> {
@@ -163,6 +190,7 @@ pub struct JunitFailure {
     pub id: String,
     pub package: String,
     pub name: String,
+    pub kind: BaselineFailureKind,
 }
 
 /// The baseline failures that stop QS: those in the mutated packages
@@ -218,11 +246,24 @@ pub fn junit_failures(xml: &str) -> Vec<JunitFailure> {
                 id: format!("{classname}::{name}"),
                 package,
                 name,
+                kind: failure_kind(body),
             });
         }
         rest = &rest[tag_end.min(rest.len()) + 1..];
     }
     out
+}
+
+fn failure_kind(body: &str) -> BaselineFailureKind {
+    for marker in ["<failure", "<error"] {
+        if let Some(start) = body.find(marker) {
+            let tag = &body[start..body[start..].find('>').map_or(body.len(), |n| start + n)];
+            if attr(tag, "type").is_some_and(|t| t.to_ascii_lowercase().contains("timeout")) {
+                return BaselineFailureKind::Timeout;
+            }
+        }
+    }
+    BaselineFailureKind::Fail
 }
 
 pub fn junit_passed_ids(xml: &str) -> std::collections::HashSet<String> {
@@ -366,6 +407,7 @@ pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<B
                 earlier.tests.len()
             );
             earlier.failed_test_ids.clear();
+            earlier.failures.clear();
             earlier.preflight_recompiled = None;
             return Ok(earlier);
         }
@@ -385,16 +427,18 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
             package_costs: Vec::new(),
             preflight_recompiled: None,
             failed_test_ids: Vec::new(),
+            failures: Vec::new(),
         });
     }
     build_baseline(cfg, paths)?;
-    let (suite_secs, tests, failed_test_ids) = run_green_suite(cfg, paths)?;
+    let (suite_secs, tests, failures) = run_green_suite(cfg, paths)?;
     let report = BaselineReport {
         suite_secs,
         tests,
         package_costs: Vec::new(),
         preflight_recompiled: None,
-        failed_test_ids,
+        failed_test_ids: failures.iter().map(|f| f.id.clone()).collect(),
+        failures,
     };
     write_baseline_report(paths, &report)?;
     Ok(report)
@@ -403,6 +447,37 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn junit_preserves_failure_and_timeout_kinds_without_reading_output_text() {
+        let xml = r#"<testsuite>
+<testcase name="assertion" classname="pkg::extra"><failure type="test failure">timeout in assertion text</failure></testcase>
+<testcase name="slow" classname="pkg::extra"><failure type="test timeout"/></testcase>
+<testcase name="killed" classname="pkg::extra"><error type="test timeout"/></testcase>
+</testsuite>"#;
+        let failures = junit_failures(xml);
+        assert_eq!(
+            failures.iter().map(|f| f.kind).collect::<Vec<_>>(),
+            vec![
+                BaselineFailureKind::Fail,
+                BaselineFailureKind::Timeout,
+                BaselineFailureKind::Timeout
+            ]
+        );
+        let typed: Vec<_> = failures
+            .iter()
+            .map(|f| BaselineFailure {
+                id: f.id.clone(),
+                kind: f.kind,
+            })
+            .collect();
+        let json = serde_json::to_value(&typed).unwrap();
+        assert_eq!(json[0]["kind"], "FAIL");
+        assert_eq!(json[1]["kind"], "TIMEOUT");
+        let warning = crate::types::baseline_failure_summary(&typed);
+        assert!(warning.contains("FAIL pkg::extra::assertion"));
+        assert!(warning.contains("TIMEOUT pkg::extra::slow"));
+    }
 
     #[test]
     fn junit_classname_is_binary_id_not_package() {
@@ -430,6 +505,7 @@ mod tests {
             id: id.into(),
             package: package.into(),
             name: id.rsplit("::").next().unwrap().into(),
+            kind: BaselineFailureKind::Fail,
         };
         let failed = vec![
             fail("my-core::flaky_ctime_order", "my-core"),

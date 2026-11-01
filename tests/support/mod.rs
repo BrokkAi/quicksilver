@@ -97,6 +97,8 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
         sandbox: false,
         sandbox_dir: None,
         skip_tests: Vec::new(),
+        nextest_profile: "default".into(),
+        fail_on_extra_baseline: false,
         build_jobs: 2,
         test_jobs: 4,
         max_build_memory_frac: 0.7,

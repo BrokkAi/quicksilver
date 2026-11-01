@@ -21,6 +21,8 @@ pub struct EditView {
 #[derive(Debug, Clone, Serialize)]
 pub struct Survivor {
     pub id: String,
+    pub stable_id: String,
+    pub baseline_failures: Vec<crate::types::BaselineFailure>,
     pub fqns: String,
     pub path: String,
     pub line: usize,
@@ -232,6 +234,8 @@ pub fn collect(
         };
         out.push(Survivor {
             id: record.mutant.id.clone(),
+            stable_id: record.mutant.stable_id(),
+            baseline_failures: map.baseline_failures.clone(),
             fqns: record.mutant.fqns(),
             path: site.path.clone(),
             line: site.start_line,
@@ -303,6 +307,10 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
     let map = SiteMap::load(&paths)?.ok_or_else(|| {
         anyhow::anyhow!("no map for this repository; run `cargo quicksilver map` first")
     })?;
+    eprint!(
+        "{}",
+        crate::types::baseline_failure_summary(&map.baseline_failures)
+    );
     let state = State::load(&paths)?;
     let files = crate::discover::file_globset(&cfg.files)?;
     let records = collect(
@@ -338,7 +346,11 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
         std::fs::create_dir_all(dir)?;
         for (i, bucket) in split(&records, n).iter().enumerate() {
             let path = dir.join(format!("survivors-{}.txt", i + 1));
-            let content: String = bucket.iter().map(|&i| text_block(&records[i])).collect();
+            let content = crate::types::baseline_failure_summary(&map.baseline_failures)
+                + &bucket
+                    .iter()
+                    .map(|&i| text_block(&records[i]))
+                    .collect::<String>();
             crate::util::write_atomic(&path, content)?;
             let files: BTreeSet<_> = bucket.iter().map(|&i| records[i].path.as_str()).collect();
             eprintln!(
@@ -464,6 +476,8 @@ mod tests {
     fn split_keeps_source_files_whole() {
         let make = |id: &str, path: &str| Survivor {
             id: id.into(),
+            stable_id: id.into(),
+            baseline_failures: Vec::new(),
             fqns: String::new(),
             path: path.into(),
             line: 1,

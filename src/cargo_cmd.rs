@@ -7,19 +7,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::Instant;
 
-/// The nextest profile QS writes into its own nextest config file. Builds
-/// use Cargo's ordinary dev and test profiles, so they share mbx cache
-/// entries with the user's own builds.
-pub const NEXTEST_PROFILE: &str = "quicksilver";
-
 /// Cargo, run through mbx: `mbx <subcommand> ...`. mbx rejects options
 /// before the subcommand, so callers add everything after it.
 pub fn cargo_command() -> Command {
     Command::new("mbx")
-}
-
-pub fn nextest_profile_args() -> Vec<String> {
-    vec!["--profile".into(), NEXTEST_PROFILE.into()]
 }
 
 /// The packages whose code is mutated: `--package`, or none for all.
@@ -560,20 +551,50 @@ pub fn nextest_available() -> bool {
     crate::util::which("cargo-nextest").is_some()
 }
 
-pub fn write_nextest_config(index: &Path) -> Result<PathBuf> {
-    write_nextest_config_junit(index, None)
-}
-
-pub fn write_nextest_config_junit(index: &Path, junit: Option<&Path>) -> Result<PathBuf> {
-    let path = index.join("nextest.toml");
-    let junit_path = match junit {
-        Some(p) => p.display().to_string(),
-        None => "junit.xml".into(),
+/// Preserve project execution policy, changing only collection/reporting.
+/// The selected profile still inherits and applies its own per-test overrides.
+pub fn write_nextest_config(index: &Path, root: &Path, profile: &str) -> Result<PathBuf> {
+    let project = root.join(".config/nextest.toml");
+    let mut config: toml::Value = if project.is_file() {
+        toml::from_str(&std::fs::read_to_string(&project)?)
+            .with_context(|| format!("parse {}", project.display()))?
+    } else {
+        toml::Value::Table(Default::default())
     };
-    let body = format!(
-        "\n[profile.quicksilver]\nslow-timeout = {{ period = \"120s\", terminate-after = 2 }}\nfail-fast = false\n\n[profile.quicksilver.junit]\npath = \"{junit_path}\"\n"
+    let profiles = config
+        .as_table_mut()
+        .context("nextest config must be a table")?
+        .entry("profile")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("nextest profile must be a table")?;
+    // Do not invent a misspelled project profile by adding JUnit settings to it.
+    anyhow::ensure!(
+        profile == "default" || profiles.contains_key(profile),
+        "[map] nextest-profile {profile:?} is not defined in {}",
+        project.display()
     );
-    crate::util::write_atomic(&path, body.trim_start())?;
+    let selected = profiles
+        .entry(profile)
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("selected nextest profile must be a table")?;
+    selected.insert("fail-fast".into(), toml::Value::Boolean(false));
+    let junit = selected
+        .entry("junit")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .context("nextest junit must be a table")?;
+    junit.insert(
+        "path".into(),
+        toml::Value::String(
+            std::path::absolute(index.join("baseline-junit.xml"))?
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    );
+    let path = index.join("nextest.toml");
+    crate::util::write_atomic(&path, toml::to_string_pretty(&config)?)?;
     Ok(path)
 }
 
@@ -613,6 +634,58 @@ pub fn env_for_tests() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nextest_preserves_project_timeouts_profiles_and_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".config")).unwrap();
+        let source = r#"
+[store]
+dir = "custom-nextest"
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
+[[profile.default.overrides]]
+filter = 'test(heavy)'
+slow-timeout = { period = "90s", terminate-after = 20 }
+[profile.scheduled]
+inherits = "default"
+slow-timeout = "300s"
+fail-fast = true
+"#;
+        std::fs::write(dir.path().join(".config/nextest.toml"), source).unwrap();
+        let index = dir.path().join("index");
+        for name in ["default", "scheduled"] {
+            let path = write_nextest_config(&index, dir.path(), name).unwrap();
+            let merged: toml::Value =
+                toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            let original: toml::Value = toml::from_str(source).unwrap();
+            assert_eq!(
+                merged["profile"]["default"]["slow-timeout"],
+                original["profile"]["default"]["slow-timeout"]
+            );
+            assert_eq!(
+                merged["profile"]["default"]["overrides"],
+                original["profile"]["default"]["overrides"]
+            );
+            assert_eq!(
+                merged["profile"]["scheduled"]["slow-timeout"],
+                original["profile"]["scheduled"]["slow-timeout"]
+            );
+            assert_eq!(merged["store"], original["store"]);
+            assert_eq!(merged["profile"][name]["fail-fast"].as_bool(), Some(false));
+            assert!(
+                Path::new(merged["profile"][name]["junit"]["path"].as_str().unwrap()).is_absolute()
+            );
+        }
+        assert!(write_nextest_config(&index, dir.path(), "typo")
+            .unwrap_err()
+            .to_string()
+            .contains("not defined"));
+        let plain = tempfile::tempdir().unwrap();
+        let path = write_nextest_config(&index, plain.path(), "default").unwrap();
+        let merged: toml::Value = toml::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(merged["profile"]["default"].get("slow-timeout").is_none());
+    }
 
     #[test]
     fn package_env_has_cargo_pkg_variables() {

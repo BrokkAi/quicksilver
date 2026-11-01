@@ -396,7 +396,7 @@ pub struct BodyEdit {
 
 /// A mutant captured from the checkout: every changed body, switched on
 /// together.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct EditedMutant {
     pub id: String,
     pub edits: Vec<BodyEdit>,
@@ -406,12 +406,45 @@ pub struct EditedMutant {
 }
 
 impl EditedMutant {
+    /// Cross-map comparison key: full function names and exact bodies.
+    /// Intent, map site ids, file paths and source line numbers are excluded.
+    pub fn stable_id(&self) -> String {
+        let mut pairs: Vec<_> = self.edits.iter().map(|e| (&e.fqn, &e.body)).collect();
+        pairs.sort();
+        let mut h = Sha256::new();
+        h.update(b"quicksilver-stable-mutant-v1");
+        h.update((pairs.len() as u64).to_le_bytes());
+        for (name, body) in pairs {
+            for value in [name, body] {
+                h.update((value.len() as u64).to_le_bytes());
+                h.update(value.as_bytes());
+            }
+        }
+        crate::util::hex(&h.finalize())
+    }
+
     pub fn fqns(&self) -> String {
         self.edits
             .iter()
             .map(|e| e.fqn.as_str())
             .collect::<Vec<_>>()
             .join(" + ")
+    }
+}
+
+// Derive the comparison key on output; legacy states need no migration.
+impl Serialize for EditedMutant {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut out = serializer
+            .serialize_struct("EditedMutant", if self.intent.is_some() { 4 } else { 3 })?;
+        out.serialize_field("id", &self.id)?;
+        out.serialize_field("stable_id", &self.stable_id())?;
+        out.serialize_field("edits", &self.edits)?;
+        if let Some(intent) = &self.intent {
+            out.serialize_field("intent", intent)?;
+        }
+        out.end()
     }
 }
 
@@ -778,6 +811,17 @@ pub fn attach_intents(
     prefix: &str,
     functions: &[(&str, &str, (usize, usize))],
 ) -> Vec<String> {
+    attach_intents_detailed(mutants, spans, intents, prefix, functions, false)
+}
+
+pub fn attach_intents_detailed(
+    mutants: &mut [EditedMutant],
+    spans: &[(usize, usize)],
+    intents: &BTreeMap<String, String>,
+    prefix: &str,
+    functions: &[(&str, &str, (usize, usize))],
+    detailed: bool,
+) -> Vec<String> {
     let mut warnings = Vec::new();
     let mut elsewhere = 0usize;
     for (key, text) in intents {
@@ -800,7 +844,8 @@ pub fn attach_intents(
                 .iter()
                 .any(|(fqn, path, span)| names(fqn, path, *span)) =>
             {
-                elsewhere += 1
+                elsewhere += 1;
+                if detailed { warnings.push(format!("intent for `{key}` names a function that this build did not capture")); }
             }
             [] => warnings.push(format!(
                 "intent for `{key}` names no function in the map (a typo, or a name from another commit?)"

@@ -332,6 +332,36 @@ pub struct PackageCost {
     pub rebuild_secs: f64,
 }
 
+/// Why a test could not contribute coverage in the unmodified baseline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BaselineFailureKind {
+    Fail,
+    Timeout,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BaselineFailure {
+    pub id: String,
+    pub kind: BaselineFailureKind,
+}
+
+/// A complete, reusable coverage-loss warning (also used in split exports).
+pub fn baseline_failure_summary(failures: &[BaselineFailure]) -> String {
+    if failures.is_empty() {
+        return String::new();
+    }
+    let mut out = format!("coverage loss: {} test(s) failed at baseline and were excluded from recording and mutant selection:\n", failures.len());
+    for failure in failures {
+        let kind = match failure.kind {
+            BaselineFailureKind::Fail => "FAIL",
+            BaselineFailureKind::Timeout => "TIMEOUT",
+        };
+        out.push_str(&format!("  {kind} {}\n", failure.id));
+    }
+    out
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineReport {
     pub suite_secs: f64,
@@ -341,4 +371,6 @@ pub struct BaselineReport {
     /// Test ids that failed in the uninstrumented suite (non-seed SLO flakes, etc.).
     #[serde(default)]
     pub failed_test_ids: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<BaselineFailure>,
 }

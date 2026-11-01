@@ -129,6 +129,7 @@ pub fn prepare(cfg: Config, skip_baseline: bool) -> Result<Prepared> {
             skipped.len()
         );
     }
+    tests.retain(|t| !baseline.failed_test_ids.contains(&t.id));
     let timing = index::attach_timings(&mut tests, &baseline.tests);
     if !baseline.tests.is_empty() && !tests.is_empty() {
         if timing.matched == 0 {

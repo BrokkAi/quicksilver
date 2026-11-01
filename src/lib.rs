@@ -2,6 +2,7 @@ pub mod apply;
 pub mod baseline;
 pub mod capture;
 pub mod cargo_cmd;
+pub mod carry;
 pub mod cli;
 pub mod config;
 pub mod discover;
@@ -95,6 +96,10 @@ fn cmd_map(common: &cli::CommonOpts, args: cli::MapArgs) -> Result<i32> {
             map.skipped_tests.len()
         );
     }
+    eprint!(
+        "{}",
+        types::baseline_failure_summary(&map.baseline_failures)
+    );
     eprintln!(
         "map written to {}",
         sitemap::SiteMap::path(&paths).display()
@@ -118,8 +123,11 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     let paths = cfg.paths();
     paths.ensure()?;
     let sources = exec::edited::CaptureSources {
-        checkout: (!args.no_capture && args.patches.is_empty()).then(|| cfg.repo_root.clone()),
+        checkout: (!args.no_capture && args.patches.is_empty() && args.from.is_empty())
+            .then(|| cfg.repo_root.clone()),
         patches: args.patches.clone(),
+        from: args.from.clone(),
+        verbose_intents: args.verbose_intents,
         options: capture::CaptureOptions {
             skip_outside_bodies: args.skip_outside_bodies,
         },
@@ -136,7 +144,11 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     }
     if report.results.is_empty() {
         eprintln!("nothing to build");
-        return Ok(0);
+        return Ok(if report.import_rejected.is_empty() {
+            0
+        } else {
+            2
+        });
     }
     let mut unviable = 0usize;
     let mut new = 0usize;
@@ -174,9 +186,17 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     eprintln!("next: run `cargo quicksilver test`");
     if let Some(path) = &cfg.json {
         let state = exec::edited::State::load(&paths)?;
-        crate::util::write_atomic(path, serde_json::to_vec_pretty(&state)?)?;
+        let mut json = serde_json::to_value(&state)?;
+        json["import_rejected"] = serde_json::to_value(&report.import_rejected)?;
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&json)?)?;
     }
-    Ok(if unviable > 0 { 1 } else { 0 })
+    Ok(if !report.import_rejected.is_empty() {
+        2
+    } else if unviable > 0 {
+        1
+    } else {
+        0
+    })
 }
 
 /// Every test the map found not green: its id and why, then the end of its
@@ -307,6 +327,12 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let paths = cfg.paths();
     paths.ensure()?;
+    if let Some(map) = sitemap::SiteMap::load(&paths)? {
+        eprint!(
+            "{}",
+            types::baseline_failure_summary(&map.baseline_failures)
+        );
+    }
     let results = exec::edited::test(
         &cfg,
         &paths,
@@ -343,6 +369,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
             .map(|(m, v)| {
                 serde_json::json!({
                     "id": m.id,
+                    "stable_id": m.stable_id(),
                     "intent": m.intent,
                     "edits": m.edits.iter().map(|e| serde_json::json!({
                         "fqn": e.fqn, "path": e.path, "line": e.line,
@@ -355,6 +382,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
         let report = serde_json::json!({
             "commit": map.as_ref().map(|m| m.commit.clone()),
             "target": map.as_ref().map(|m| m.target.clone()),
+            "baseline_failures": map.as_ref().map(|m| &m.baseline_failures),
             "mutants": rows,
         });
         crate::util::write_atomic(path, serde_json::to_vec_pretty(&report)?)?;

@@ -686,7 +686,7 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
         tests.len(),
         timing.matched
     );
-    build_map_from(cfg, paths, tests)
+    build_map_with_failures(cfg, paths, tests, baseline.failures)
 }
 
 /// The saved map, when it was built at `commit`. Commands that need a map
@@ -706,6 +706,15 @@ pub fn map_at(paths: &Paths, commit: &str) -> Result<SiteMap> {
 /// [`build_map`] for a baseline that is already checked out and built, with
 /// its tests listed and timed.
 pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Result<SiteMap> {
+    build_map_with_failures(cfg, paths, tests, Vec::new())
+}
+
+fn build_map_with_failures(
+    cfg: &Config,
+    paths: &Paths,
+    tests: Vec<TestInfo>,
+    baseline_failures: Vec<crate::types::BaselineFailure>,
+) -> Result<SiteMap> {
     let started = Instant::now();
     let mut listed = tests;
     let skipped_tests = crate::index::drop_skipped(cfg, &mut listed)?;
@@ -715,6 +724,12 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
             skipped_tests.len()
         );
     }
+    let excluded: BTreeSet<_> = baseline_failures.iter().map(|f| f.id.as_str()).collect();
+    listed.retain(|t| !excluded.contains(t.id.as_str()));
+    eprint!(
+        "{}",
+        crate::types::baseline_failure_summary(&baseline_failures)
+    );
     let files = tracked_file_hashes(&cfg.repo_root)?;
 
     let (fns, test_lines) = crate::discover::scan_workspace_with_tests(
@@ -855,6 +870,7 @@ pub fn build_map_from(cfg: &Config, paths: &Paths, tests: Vec<TestInfo>) -> Resu
         hits,
         cpu_secs_by_test: recording.cpu_secs_by_test.clone().into_iter().collect(),
         not_green: recording.not_green.clone(),
+        baseline_failures,
         skipped_tests,
         not_green_output: recording.not_green_output.clone(),
         property_tests,
@@ -938,6 +954,7 @@ pub struct BuildReport {
     pub builds: u64,
     pub secs: f64,
     pub discarded_records: usize,
+    pub import_rejected: Vec<String>,
 }
 
 /// The map, the mutant state reconciled with it, and an empty report.
@@ -958,6 +975,7 @@ fn load_for_build(paths: &Paths) -> Result<(SiteMap, State, BuildReport)> {
         builds: 0,
         secs: 0.0,
         discarded_records,
+        import_rejected: Vec::new(),
     };
     Ok((map, state, report))
 }
@@ -998,6 +1016,8 @@ impl std::str::FromStr for PatchSource {
 pub struct CaptureSources {
     pub checkout: Option<PathBuf>,
     pub patches: Vec<PatchSource>,
+    pub from: Vec<PathBuf>,
+    pub verbose_intents: bool,
     pub options: CaptureOptions,
     /// Author's notes by full function name or `path:line`, applied to the
     /// mutants this build captures (see `capture::attach_intents`).
@@ -1163,6 +1183,14 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         );
     }
     let mut captures: Vec<(String, CaptureOutcome)> = Vec::new();
+    // Read imports before saving/reconciling state: --from may name edited.json.
+    for source in &sources.from {
+        let outcome = crate::carry::capture_from(&map, &cfg.repo_root, source)?;
+        report
+            .import_rejected
+            .extend(outcome.dropped.iter().cloned());
+        captures.push((source.display().to_string(), outcome));
+    }
     if let Some(checkout) = &sources.checkout {
         let outcome = capture_checkout(&map, checkout, sources.options)?;
         captures.push((checkout.display().to_string(), outcome));
@@ -1200,12 +1228,13 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
             .iter()
             .map(|s| (s.fqn.as_str(), s.path.as_str(), (s.start_line, s.end_line)))
             .collect();
-        for w in crate::capture::attach_intents(
+        for w in crate::capture::attach_intents_detailed(
             &mut all,
             &spans,
             &sources.intents,
             &map.prefix,
             &functions,
+            sources.verbose_intents,
         ) {
             eprintln!("  {w}");
         }
@@ -1217,7 +1246,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         }
     }
     let mut overrides = 0usize;
-    let offset = usize::from(sources.checkout.is_some());
+    let offset = sources.from.len() + usize::from(sources.checkout.is_some());
     let functions: Vec<_> = map
         .sites
         .iter()
@@ -1239,9 +1268,14 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
                     .map_or((0, 0), |s| (s.start_line, s.end_line))
             })
             .collect();
-        for warning in
-            crate::capture::attach_intents(&mut scoped, &spans, &intents, &map.prefix, &functions)
-        {
+        for warning in crate::capture::attach_intents_detailed(
+            &mut scoped,
+            &spans,
+            &intents,
+            &map.prefix,
+            &functions,
+            sources.verbose_intents,
+        ) {
             eprintln!("  {source}: {warning}");
         }
         for (kept, local) in outcome.mutants.iter_mut().zip(scoped) {
@@ -2130,6 +2164,7 @@ mod tests {
             builds: 0,
             secs: 0.0,
             discarded_records: 0,
+            import_rejected: Vec::new(),
         };
         for note in [None, Some("first note"), Some("different note")] {
             record_capture(
@@ -2214,6 +2249,7 @@ mod tests {
             hits: BTreeMap::new(),
             cpu_secs_by_test: Default::default(),
             not_green: Vec::new(),
+            baseline_failures: Vec::new(),
             skipped_tests: Vec::new(),
             not_green_output: Default::default(),
             property_tests: Default::default(),
