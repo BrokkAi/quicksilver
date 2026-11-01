@@ -142,6 +142,12 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     if !report.rejected.is_empty() {
         return Ok(2);
     }
+    if let Some(path) = &cfg.json {
+        let state = exec::edited::State::load(&paths)?;
+        let mut json = serde_json::to_value(&state)?;
+        json["import_rejected"] = serde_json::to_value(&report.import_rejected)?;
+        crate::util::write_atomic(path, serde_json::to_vec_pretty(&json)?)?;
+    }
     if report.results.is_empty() {
         eprintln!("nothing to build");
         return Ok(if report.import_rejected.is_empty() {
@@ -184,12 +190,6 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
         report.secs
     );
     eprintln!("next: run `cargo quicksilver test`");
-    if let Some(path) = &cfg.json {
-        let state = exec::edited::State::load(&paths)?;
-        let mut json = serde_json::to_value(&state)?;
-        json["import_rejected"] = serde_json::to_value(&report.import_rejected)?;
-        crate::util::write_atomic(path, serde_json::to_vec_pretty(&json)?)?;
-    }
     Ok(if !report.import_rejected.is_empty() {
         2
     } else if unviable > 0 {

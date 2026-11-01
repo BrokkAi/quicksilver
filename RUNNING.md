@@ -208,6 +208,35 @@ cargo quicksilver build --patch lane1.patch --patch lane2.patch
 Each patch is captured on its own. Concurrent `build` and `test` commands
 wait for each other.
 
+### Rechecking mutants after adding tests
+
+Save the old mutants before mapping a different commit. A `test --json`
+report contains the bodies and originals needed to carry them forward;
+`build --json` also saves the complete captured state, including untested
+mutants. Keep these files outside the edited checkout (or gitignored), so
+capture does not treat them as added source files.
+
+```
+cargo quicksilver test --json /tmp/qs-before.json
+# Commit the new tests, then:
+cargo quicksilver map
+cargo quicksilver build --from /tmp/qs-before.json --json /tmp/qs-rebuilt.json
+cargo quicksilver test --json /tmp/qs-after.json
+```
+
+`--from FILE` accepts either export and can be repeated. It finds the full
+function name in the new map and requires the same path and exact original
+body. Missing, moved, ambiguous or changed functions are reported individually;
+there is no fuzzy fallback. Each mutant is accepted or omitted as a whole.
+Valid imports are compiled against the new map; old verdicts are not imported.
+If any mutant is omitted, `build` exits 2 and its JSON names the omissions
+in `import_rejected`. You can still test the mutants that compiled.
+
+Exports include a separate `stable_id`, derived from full function names
+and exact replacement bodies. Join the before/after results on this key;
+`id` remains the identifier used by commands and can change across maps.
+Intent notes and source line numbers do not affect `stable_id`.
+
 ### Notes on what a mutant models
 
 A note says what fault a mutant models, such as "off-by-one at the upper
@@ -218,7 +247,8 @@ bound". Survivors are shown with their note.
   `{"crate_a/src/lib.rs:2": "subtracts instead of adding"}`. It applies to
   the mutants this build captures. One file can serve several builds:
   `build` warns only about keys that name no function in the map, and
-  counts the keys meant for other builds in one line.
+  counts the keys meant for other builds in one line. Add
+  `--verbose-intents` to name each valid key with no captured edit.
 - `--patch lane.patch=notes.json`: notes for that patch's mutants only, so
   different mutants of one function can each have their own. These win
   over `--intents`. No notes file is picked up without this form.
@@ -388,6 +418,8 @@ workspace root.
 | `extra-tests = [...]` | Test binaries of other packages to add, as `--extra-tests`. |
 | `[package.<name>] extra-tests` | The same, only when `--package <name>` is given. |
 | `[build-env]` | Variables for every build and baseline test run. |
+| `[map] nextest-profile` | Project nextest profile for the baseline and test catalog; defaults to `default`. |
+| `[map] fail-on-extra-baseline` | When true, baseline failures in extra suites also block mapping. |
 | `[map] skip-tests` | Test ids (globs allowed) that quicksilver never runs. |
 | `[test-budget]` | Minimum seconds per test id, for tests with long deadlines of their own. |
 | `[test-env]` | Variables for every test process; `{sandbox}` is that process's sandbox. |
@@ -409,6 +441,32 @@ RUSTFLAGS = "--cfg scheduled_tests"
 As with cargo, `RUSTFLAGS` replaces the rustflags from `.cargo/config.toml`
 and from your environment, so repeat any you need. The map records these
 settings; `build` warns when they changed since `map`.
+
+### Baseline policy and excluded tests
+
+The baseline merges `.config/nextest.toml` from the mapped commit, preserving
+its timeouts, per-test overrides and profile inheritance. Quicksilver changes
+only fail-fast (to collect the whole suite) and the JUnit report path. To
+select a project profile:
+
+```toml
+[map]
+nextest-profile = "scheduled"
+fail-on-extra-baseline = true
+```
+
+Schema recording derives per-test budgets from the baseline's measured
+durations, with a longer retry for a recording timeout. `[test-budget]`
+can extend a recording or mutant test's minimum budget.
+
+A failure in a package being mutated blocks the map. By default, failures
+in extra test suites are tolerated: each affected test is excluded from
+recording and mutant selection. Map, test and survivors print a coverage-loss
+summary naming every excluded test as `FAIL` or `TIMEOUT`; map and test JSON
+contain `baseline_failures`. Survivor JSON records and split review files
+carry the same exclusions. `fail-on-extra-baseline = true` makes these
+extra failures blocking too. A baseline-failing test cannot catch a mutant;
+fix the original test and map again to restore its coverage.
 
 ### Tests to leave out
 

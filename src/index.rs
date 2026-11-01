@@ -49,7 +49,14 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
     apply_build_env(&mut cmd, cfg);
-    cmd.args(["nextest", "list", "--message-format", "json"]);
+    cmd.args([
+        "nextest",
+        "list",
+        "--message-format",
+        "json",
+        "--profile",
+        &cfg.nextest_profile,
+    ]);
     apply_package_select(&mut cmd, &test_packages(cfg, &meta));
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
@@ -122,7 +129,12 @@ pub fn parse_nextest_list(
                     .get("ignored")
                     .and_then(|x| x.as_bool())
                     .unwrap_or(false);
-                if ignored {
+                let excluded = spec
+                    .get("filter-match")
+                    .and_then(|m| m.get("status"))
+                    .and_then(|v| v.as_str())
+                    == Some("mismatch");
+                if ignored || excluded {
                     continue;
                 }
                 tests.push(TestInfo {

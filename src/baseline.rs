@@ -38,7 +38,7 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
 
 pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     let target = paths.baseline.join("target");
-    info!("baseline cargo build --tests (profile quicksilver)");
+    info!("baseline cargo build --tests");
     let meta = load_metadata(&paths.baseline)?;
     let packages = crate::cargo_cmd::test_packages(cfg, &meta);
     crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &packages, false)
@@ -58,9 +58,10 @@ pub fn run_green_suite(
     let mut last_secs = 0.0;
     for run in 0..cfg.baseline_runs.max(1) {
         info!(
-            "baseline cargo nextest run ({}/{})",
+            "baseline cargo nextest run ({}/{}, project profile {})",
             run + 1,
-            cfg.baseline_runs.max(1)
+            cfg.baseline_runs.max(1),
+            cfg.nextest_profile
         );
         let mut cmd = crate::cargo_cmd::cargo_command();
         cmd.current_dir(&paths.baseline);

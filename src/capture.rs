@@ -1184,6 +1184,19 @@ mod tests {
     }
 
     #[test]
+    fn detailed_intent_warning_names_each_valid_but_uncaptured_key() {
+        let intents = [("p.f".into(), "fault".into())].into_iter().collect();
+        let functions = [("p.f", "lib.rs", (1, 3))];
+        let concise = attach_intents(&mut [], &[], &intents, "", &functions);
+        assert_eq!(concise.len(), 1);
+        assert!(!concise[0].contains("p.f"));
+        let detailed = attach_intents_detailed(&mut [], &[], &intents, "", &functions, true);
+        assert!(detailed
+            .iter()
+            .any(|line| line.contains("intent for `p.f`")));
+    }
+
+    #[test]
     fn intents_attach_by_full_name_or_line_and_skip_ambiguous_keys() {
         let (a, a_lines) = mutant_at("k.Scope.new", "src/scope.rs", 10, 5);
         let (b, b_lines) = mutant_at("k.SchemaVersionRegistry.new", "src/registry.rs", 40, 3);

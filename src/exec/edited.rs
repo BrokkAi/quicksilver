@@ -1177,6 +1177,13 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     let started = Instant::now();
     let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(paths)?;
+    if !sources.from.is_empty() {
+        let head = crate::worktree::head(&cfg.repo_root)?;
+        anyhow::ensure!(
+            head == map.commit,
+            "the map is not for HEAD; run `cargo quicksilver map` before `build --from`"
+        );
+    }
     if cfg.build_env != map.build_env {
         warn!(
             "[build-env] in quicksilver.toml differs from the one `map` used, so these binaries may not behave as the map recorded; run `cargo quicksilver map` again"

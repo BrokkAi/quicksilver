@@ -68,6 +68,9 @@ jobs:
       - name: End-to-end tests
         if: ${{ !cancelled() }}
         run: cargo test --test edited
+      - name: Campaign carry-forward and baseline policy
+        if: ${{ !cancelled() }}
+        run: cargo test --test campaign
       - name: Engine tests
         if: ${{ !cancelled() }}
         run: cargo test --test engine

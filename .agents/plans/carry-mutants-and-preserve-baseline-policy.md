@@ -9,14 +9,15 @@ A campaign must be able to map a new commit containing regression tests, rebuild
 ## Progress
 
 - [x] (2026-11-01) Read issues and current code; verified origin/master is be52427 and working tree is clean.
-- [ ] Preserve nextest configuration/profile policy (implemented and unit-tested); verify with a small real nextest run.
-- [ ] Persist typed baseline exclusions, remove them before recording, and report coverage loss in map/test/survivors (implemented; end-to-end checks pending).
-- [ ] Add function-anchored `build --from`, exact original validation, and cross-map stable IDs (implemented and unit-tested; end-to-end checks pending).
-- [ ] Complete unit/integration/lint checks, document usage, commit/push, and hand off the tested head.
+- [x] (2026-11-01) Preserve nextest configuration/profile policy, including selected profile default filters; verified real nextest timeout overrides and custom store path.
+- [x] (2026-11-01) Persist typed baseline exclusions, remove them before recording, and report coverage loss in map/test/survivors; strict extra-baseline mode tested.
+- [x] (2026-11-01) Add function-anchored `build --from`, exact original validation, and cross-map stable IDs; both saved-state and test-report imports verified end to end.
+- [x] (2026-11-01) Full test suites, Clippy and formatting pass; RUNNING.md and CI regression added.
+- [ ] Push tested commits and send the exact installable head to the campaign session.
 
 ## Surprises & Discoveries
 
-The generated nextest profile explicitly replaces repository configuration and terminates tests after 120 seconds twice. The baseline report already stores failure IDs, but the map discards that information and does not exclude those IDs from its recording list. Existing BodyEdit records already store full names and original bodies, so no fuzzy patch application is necessary for carry-forward. Existing runtime mutant IDs must remain compatible with saved state and verdict journals.
+The generated nextest profile explicitly replaces repository configuration and terminates tests after 120 seconds twice. The baseline report already stores failure IDs, but the map discards that information and does not exclude those IDs from its recording list. Existing BodyEdit records already store full names and original bodies, so no fuzzy patch application is necessary for carry-forward. Existing runtime mutant IDs must remain compatible with saved state and verdict journals. Real end-to-end testing also exposed that profile filtering must be applied to `nextest list`, not only `run`, or deliberately omitted tests reappear in recording. The test catalog now passes the selected profile and respects nextest filter mismatches. JUnit uses an absolute path under the QS index so a project's custom store directory remains supported. Unignored JSON exports inside the edited checkout are intentionally rejected as added files; the tutorial now recommends external or ignored export paths.
 
 ## Decision Log
 
@@ -32,7 +33,9 @@ The generated nextest profile explicitly replaces repository configuration and t
 
 ## Outcomes & Retrospective
 
-Implementation and validation pending.
+Implemented all three issues. Full `mbx test --tests` passed: 187 library tests, one new campaign integration, three edited-workflow integrations, nine engine integrations and three schema integrations (203 passed, two pre-existing ignored). `mbx clippy --all-targets -- -D warnings`, `cargo fmt --check` and `git diff --check` passed. The tiny campaign proves a 50ms project timeout override is preserved, a separate slower test passes its longer override, a selected profile's default filter also controls recording, and a nonstandard nextest store directory still produces QS's isolated JUnit report. Both a failing and timed-out extra test are recorded as exclusions and never enter the map's tests/hits/not-green set. Strict mode rejects them.
+
+The same integration captures a missed boundary mutant, saves its report, commits a new assertion with a source-line shift, remaps, imports, builds and kills the mutant while retaining stable_id. It also exercises saved-state deduplication, partial rejection with exit 2 and JSON diagnostics, survivor JSON and split review warnings. Unit tests cover missing/moved/drifted/ambiguous functions, invalid or overlapping edits, legacy serialization and detailed intent warnings. No benchmark host, engine change or large campaign was used. Push and handoff are the only remaining steps.
 
 ## Context and Orientation
 
@@ -69,3 +72,7 @@ Use existing serde/serde_json, toml, sha2, syn and map/worktree helpers; do not 
 Revision note: Initial plan created for the explicitly requested implementation/tested-head handoff.
 
 Checkpoint note: All 186 active library tests pass (two ignored). The initial sandboxed run hit the existing socket-binding sandbox restriction; the unrestricted run passed. Integration and lint validation remain.
+
+Validation artifacts: `/mnt/optane/tmp/qs-batch36-38-tests.log` and `/mnt/optane/tmp/qs-batch36-38-clippy.log`. The baseline FAIL/TIMEOUT output inside the successful campaign test is intentional test input. The first isolated campaign attempt placed a JSON export in the edited checkout and was correctly rejected; the fixture now ignores its output files.
+
+Revision note: Completed implementation and tests, added selected-profile catalog filtering, documented import exit behavior and recorded complete validation before push.
