@@ -13,7 +13,7 @@ A baseline currently gets only build-env, while schema and mutant tests get test
 - [x] (2026-11-03) Implement environment-only helper, private specification and nextest overlays for listing/baseline; retain original project wrappers, all four runner policies and inherited profile rules.
 - [x] (2026-11-03) Validate real nextest runner policies, special-character values, explicit env precedence, preserved HOME, inherited TIMEOUT and scratch cleanup including timeout. Plain test-env also passes with --no-sandbox.
 - [x] (2026-11-03) Format and Clippy clean; 226 tests passed across all suites, two existing unit ignores. Adapt the old schema fixture to distinguish recording from baseline explicitly, then rerun its failure and finish the previously unrun suites.
-- [ ] Commit, obtain clean review, push, verify CI and send exact install handoff.
+- [x] (2026-11-03) Commit e20d852, obtain clean required review (tree 2199c69), push origin/master, verify exact-head CI success and send install/map clearance to Bifrost session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
 ## Surprises & Discoveries
 
@@ -37,7 +37,7 @@ Evidence logs: /tmp/qs-test-env-control.log (red baseline before fix); /tmp/qs-t
 
 ## Outcomes & Retrospective
 
-The implementation and local acceptance checks are complete. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Committed review, push, CI and install handoff remain.
+The implementation and local acceptance checks are complete. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Commit e20d85255c7805e3f19e278d0f11ead80f9699de passed required review and is on origin/master. Exact-head CI succeeded in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/41740977340 . The peer received the verified install/map handoff. This completion record changes no executable source; e20d852 remains the tested install head.
 
 ## Context and Orientation
 
