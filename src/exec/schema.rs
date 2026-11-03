@@ -1,6 +1,6 @@
 //! Schema pool + test pool. Test binaries do not change between mutants.
 
-use crate::cargo_cmd::{build_tests_captured, crate_root_source, CapturedBuild};
+use crate::cargo_cmd::{build_tests_captured, CapturedBuild};
 use crate::config::Config;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
@@ -10,9 +10,9 @@ use crate::exec::test::{
 use crate::exec::{append_outcome, load_resume, ExecResult};
 use crate::plan::Plan;
 use crate::schema::{
-    apply_schema_to_tree, attribute_spans, build_sites, chunk_sites, disable_attributed,
-    disable_sites, inject_runtime, lookup_variant, parse_compiler_error_spans, qs_mutant_env,
-    restore_files, snapshot_sources, Site,
+    attribute_spans, build_sites, chunk_sites, disable_attributed, disable_sites, inject_runtime,
+    lookup_variant, parse_compiler_error_spans, qs_mutant_env, restore_files, snapshot_sources,
+    Site,
 };
 use crate::scratch::{ensure_worker, remove_extra_workers};
 use crate::types::{Mutant, Outcome, Paths, PlannedMutant, TestInfo};
@@ -271,6 +271,7 @@ fn run_crate(
     cancel: &AtomicBool,
     dispatch: &dyn Fn(SchemaReady) -> bool,
 ) -> Result<CrateDone> {
+    let _target_lease = crate::artifacts::TargetLease::if_needed(cfg, worker)?;
     let mutants: Vec<Mutant> = planned.iter().map(|p| p.mutant.clone()).collect();
     let (sites, prefiltered) = build_sites(&mutants)?;
     let mut unviable = Vec::new();
@@ -303,8 +304,10 @@ fn run_crate(
 
     let target = worker.join("target");
     let meta = crate::cargo_cmd::load_metadata_with_features(worker, &cfg.cargo_features)?;
-    let crate_root_abs =
-        crate_root_source(&meta, package).with_context(|| format!("crate root for {package}"))?;
+    let crate_root_abs = cfg
+        .mutation_target
+        .root(&meta, package)?
+        .with_context(|| format!("crate root for {package}"))?;
     let crate_root = rebase_to_worker(&crate_root_abs, &paths.baseline, worker);
     let crate_root_rel = crate::util::rel_slash(
         crate_root
@@ -343,7 +346,8 @@ fn run_crate(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let snap = snapshot_sources(worker, &batch, &crate_root_rel)?;
+        let mut snap = snapshot_sources(worker, &batch, &crate_root_rel)?;
+        crate::production::extend_snapshot(cfg, worker, &crate_root, &batch, &mut snap)?;
         let mut isolated = isolate(
             cfg,
             worker,
@@ -527,7 +531,7 @@ fn isolate(
                 executables: Vec::new(),
             });
         }
-        let applied = apply_schema_to_tree(worker, &sites, crate_root)?;
+        let applied = crate::production::apply_schema(worker, &sites, crate_root, cfg)?;
         let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if built.success {
             let executables = finalize_test_binaries(
@@ -588,7 +592,7 @@ fn isolate(
 
     restore_files(worker, originals)?;
     if !sites.is_empty() {
-        let applied = apply_schema_to_tree(worker, &sites, crate_root)?;
+        let applied = crate::production::apply_schema(worker, &sites, crate_root, cfg)?;
         let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if !built.success {
             warn!("schema still failing after {max_rounds} diagnostic rounds; bisecting");
@@ -608,7 +612,7 @@ fn isolate(
             }
             restore_files(worker, originals)?;
             if !sites.is_empty() {
-                let _ = apply_schema_to_tree(worker, &sites, crate_root)?;
+                let _ = crate::production::apply_schema(worker, &sites, crate_root, cfg)?;
                 let last = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
                 if !last.success {
                     bail!(
@@ -682,7 +686,7 @@ fn bisect_offenders(
     let mut offenders = BTreeSet::new();
     while !remaining.is_empty() {
         restore_files(worker, originals)?;
-        apply_schema_to_tree(worker, &remaining, crate_root)?;
+        crate::production::apply_schema(worker, &remaining, crate_root, cfg)?;
         let built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if built.success {
             break;
@@ -695,7 +699,7 @@ fn bisect_offenders(
         let mid = remaining.len() / 2;
         let left = remaining[..mid].to_vec();
         restore_files(worker, originals)?;
-        apply_schema_to_tree(worker, &left, crate_root)?;
+        crate::production::apply_schema(worker, &left, crate_root, cfg)?;
         let left_built = cargo_build(cfg, worker, target, &mutated_pkgs, cargo_invocations)?;
         if !left_built.success {
             remaining = left;
@@ -1104,7 +1108,23 @@ fn stage_tests_inner(
     if cargo.is_none() {
         tracing::warn!("cannot find the toolchain's cargo; tests get no CARGO variable");
     }
+    let children = executables
+        .iter()
+        .filter(|e| !e.test_harness)
+        .map(|e| {
+            Ok(crate::exec::test::ChildExecutable {
+                path: e
+                    .original_path
+                    .clone()
+                    .context("child artifact original path")?,
+                sha256: crate::util::sha256_file(&e.path)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    crate::production::require_selected_binary(cfg, tree, executables)?;
     let manifest = BinariesManifest {
+        artifact_schema: 1,
+        children,
         mutant_id: "schema".into(),
         tests: manifest_tests,
         package_env,

@@ -12,6 +12,14 @@ pub struct Cli {
 
 #[derive(Args, Debug, Clone)]
 pub struct CommonOpts {
+    /// Instrument the library source target; requires exactly one --package.
+    #[arg(long, global = true, conflicts_with = "bin")]
+    pub lib: bool,
+    /// Instrument this production binary, retaining package integration tests.
+    /// Requires exactly one --package.
+    #[arg(long, global = true, conflicts_with = "lib")]
+    pub bin: Option<String>,
+
     /// Cargo features (comma or space separated; repeatable). Explicit feature
     /// flags replace the complete [cargo] selection in quicksilver.toml.
     #[arg(long, global = true)]
@@ -101,6 +109,8 @@ pub struct CommonOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(name = "__hold-target", hide = true)]
+    HoldTarget,
     #[command(name = "__cargo-build", hide = true)]
     ProtectedCargo(ProtectedCargoArgs),
     /// Mutate functions with simple built-in replacements (`0`, `true`,

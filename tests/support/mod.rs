@@ -88,6 +88,7 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
     use std::collections::BTreeMap;
     let git = cargo_quicksilver::worktree::repo_of(repo).expect("fixture is a git repository");
     Config {
+        mutation_target: Default::default(),
         cargo_features: Default::default(),
         repo_root: repo.to_path_buf(),
         worktree_root: cargo_quicksilver::worktree::root(&git),

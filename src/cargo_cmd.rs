@@ -309,16 +309,31 @@ impl MutableScope {
 }
 
 pub fn mutable_scope(meta: &Metadata, package: &str) -> Option<MutableScope> {
+    mutable_scope_for(meta, package, &Default::default())
+        .ok()
+        .flatten()
+}
+
+pub fn mutable_scope_for(
+    meta: &Metadata,
+    package: &str,
+    selection: &crate::production::Selection,
+) -> Result<Option<MutableScope>> {
     let pkg = meta
         .workspace_packages()
         .into_iter()
-        .find(|p| p.name.as_str() == package)?;
-    let root_file = crate_root_source(meta, package)?;
-    let root_dir = root_file.parent()?.to_path_buf();
-    let proc_macro = pkg
-        .targets
-        .iter()
-        .any(|t| t.kind.iter().any(|k| k.to_string() == "proc-macro"));
+        .find(|p| p.name.as_str() == package)
+        .context("workspace package")?;
+    let Some(root_file) = selection.root(meta, package)? else {
+        return Ok(None);
+    };
+    let root_dir = root_file
+        .parent()
+        .context("crate root directory")?
+        .to_path_buf();
+    let proc_macro = selection
+        .target(meta, package)?
+        .is_some_and(|t| t.kind.iter().any(|k| k.to_string() == "proc-macro"));
     let mut other_targets = Vec::new();
     for t in &pkg.targets {
         let src = t.src_path.as_std_path().to_path_buf();
@@ -334,12 +349,12 @@ pub fn mutable_scope(meta: &Metadata, package: &str) -> Option<MutableScope> {
             _ => other_targets.push(src),
         }
     }
-    Some(MutableScope {
+    Ok(Some(MutableScope {
         root_dir,
         root_file,
         other_targets,
         proc_macro,
-    })
+    }))
 }
 
 pub fn crate_root_source(meta: &Metadata, package: &str) -> Option<PathBuf> {
@@ -402,8 +417,10 @@ pub fn build_tests(
     let output = cmd.output().context("cargo build --tests")?;
     let secs = start.elapsed().as_secs_f64();
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("cargo build --tests failed:\n{stderr}");
+        bail!(
+            "cargo build --tests failed:\n{}",
+            crate::exec::schema::compiler_errors(&output.stdout, &output.stderr)
+        );
     }
     let executables = if json {
         parse_executables(&output.stdout, target_dir)
@@ -458,12 +475,21 @@ pub fn build_tests_captured(
 /// the manifest directory tells them apart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuiltExe {
+    pub test_harness: bool,
+    pub original_path: Option<PathBuf>,
     pub path: PathBuf,
     pub manifest_dir: Option<PathBuf>,
     pub(crate) artifacts: Option<std::sync::Arc<crate::artifacts::ArtifactCopies>>,
 }
 
 pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
+    parse_all_executables(stdout, target_dir)
+        .into_iter()
+        .filter(|e| e.test_harness)
+        .collect()
+}
+
+pub(crate) fn parse_all_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
     let mut out = Vec::new();
     for line in stdout.split(|b| *b == b'\n') {
         if line.is_empty() {
@@ -480,7 +506,12 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
             .and_then(|p| p.get("test"))
             .and_then(|t| t.as_bool())
             .unwrap_or(false);
-        if !is_test {
+        let plain_bin = v
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(|k| k.as_array())
+            .is_some_and(|ks| ks.iter().any(|k| k.as_str() == Some("bin")));
+        if !is_test && !plain_bin {
             continue;
         }
         if let Some(exe) = v.get("executable").and_then(|e| e.as_str()) {
@@ -489,6 +520,8 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
                 .and_then(|m| m.as_str())
                 .and_then(|m| Path::new(m).parent().map(Path::to_path_buf));
             out.push(BuiltExe {
+                test_harness: is_test,
+                original_path: Some(PathBuf::from(exe)),
                 path: PathBuf::from(exe),
                 manifest_dir,
                 artifacts: None,

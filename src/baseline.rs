@@ -41,7 +41,18 @@ pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     info!("baseline cargo build --tests");
     let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     let packages = crate::cargo_cmd::test_packages(cfg, &meta);
-    crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &packages, false)
+    let build = crate::cargo_cmd::build_tests(
+        &paths.baseline,
+        &target,
+        cfg,
+        &packages,
+        cfg.mutation_target.bin.is_some(),
+    )?;
+    if cfg.mutation_target.bin.is_some() {
+        let outputs = crate::cargo_cmd::parse_all_executables(&build.stdout, &target);
+        crate::production::require_selected_binary(cfg, &paths.baseline, &outputs)?;
+    }
+    Ok(build)
 }
 
 pub fn run_green_suite(
@@ -489,7 +500,10 @@ pub fn load_baseline_report(paths: &Paths) -> Result<Option<BaselineReport>> {
 /// The earlier failures are dropped, because they describe another commit.
 pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<BaselineReport> {
     if let Some(mut earlier) = load_baseline_report(paths)? {
-        if !earlier.tests.is_empty() && earlier.cargo_features == cfg.cargo_features {
+        if !earlier.tests.is_empty()
+            && earlier.cargo_features == cfg.cargo_features
+            && earlier.mutation_target == cfg.mutation_target
+        {
             let _meta = materialize_and_metadata(cfg, paths)?;
             info!(
                 "sites selection: reusing {} test durations from an earlier run; no baseline build or suite run",
@@ -507,12 +521,13 @@ pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<B
 pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<BaselineReport> {
     let _meta = materialize_and_metadata(cfg, paths)?;
     if skip {
-        if let Some(existing) =
-            load_baseline_report(paths)?.filter(|r| r.cargo_features == cfg.cargo_features)
-        {
+        if let Some(existing) = load_baseline_report(paths)?.filter(|r| {
+            r.cargo_features == cfg.cargo_features && r.mutation_target == cfg.mutation_target
+        }) {
             return Ok(existing);
         }
         return Ok(BaselineReport {
+            mutation_target: cfg.mutation_target.clone(),
             cargo_features: cfg.cargo_features.clone(),
             suite_secs: 0.0,
             tests: Vec::new(),
@@ -525,6 +540,7 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     build_baseline(cfg, paths)?;
     let (suite_secs, tests, failures) = run_green_suite(cfg, paths)?;
     let report = BaselineReport {
+        mutation_target: cfg.mutation_target.clone(),
         cargo_features: cfg.cargo_features.clone(),
         suite_secs,
         tests,

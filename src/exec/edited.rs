@@ -9,7 +9,7 @@
 use crate::capture::{
     capture_checkout, capture_patch, CaptureOptions, CaptureOutcome, EditedMutant,
 };
-use crate::cargo_cmd::{build_tests_captured, crate_root_source, BuiltExe};
+use crate::cargo_cmd::{build_tests_captured, BuiltExe};
 use crate::config::Config;
 use crate::exec::schema::{
     cheapest_tests, compiler_errors, null_schema_gate, stage_tests, tail_utf8, NULL_GATE_TESTS,
@@ -20,8 +20,8 @@ use crate::exec::test::{
     run_mutant_tests_with_env, TestRunPolicy, DIRECT_MUTANT_ENV,
 };
 use crate::schema::{
-    apply_schema_to_tree, attribute_spans, disable_attributed, disable_sites, inject_runtime,
-    parse_compiler_error_spans, qs_mutant_env, qs_mutants_env, restore_files, Site, SiteVariant,
+    attribute_spans, disable_attributed, disable_sites, parse_compiler_error_spans, qs_mutant_env,
+    qs_mutants_env, restore_files, Site, SiteVariant,
 };
 use crate::sitemap::{sites_from_functions, tracked_file_hashes, MapSite, SiteMap};
 use crate::types::{Mutant, Paths, PlannedMutant, TestInfo, VerdictKind};
@@ -118,6 +118,8 @@ pub struct Record {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct State {
+    #[serde(default)]
+    pub mutation_target: crate::production::Selection,
     #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
     /// The map these records were built against.
@@ -239,15 +241,22 @@ impl State {
     /// tested against the new map's tests. A feature selection change resets
     /// every retained status, including kills and compile failures.
     pub(crate) fn reconcile(&mut self, map: &SiteMap) -> Reconciled {
-        if self.map_id == map.map_id && self.cargo_features == map.cargo_features {
+        if self.map_id == map.map_id
+            && self.cargo_features == map.cargo_features
+            && self.mutation_target == map.mutation_target
+        {
             return Reconciled::default();
         }
-        if self.commit.is_empty() || self.commit != map.commit {
+        if self.commit.is_empty()
+            || self.commit != map.commit
+            || self.mutation_target != map.mutation_target
+        {
             let dropped = self.records.len();
             *self = State {
                 map_id: map.map_id.clone(),
                 commit: map.commit.clone(),
                 test_packages: map.test_packages.clone(),
+                mutation_target: map.mutation_target.clone(),
                 cargo_features: map.cargo_features.clone(),
                 build_env: map.build_env.clone(),
                 generation: 0,
@@ -404,7 +413,7 @@ fn build_direct(
         })
         .collect();
     restore_files(&map.worker, &files)?;
-    apply_all(&map.worker, &sites, &map.crate_roots)?;
+    apply_all(cfg, &map.worker, &sites, &map.crate_roots)?;
     let built = build_schema(cfg, &map.worker, &map.test_packages, &AtomicU64::new(0))?;
     if built.success {
         Ok(Ok(built.executables))
@@ -434,6 +443,7 @@ fn now_rfc3339() -> String {
 /// workspace-relative path. The worktree itself may hold schema source, so
 /// the originals come from git.
 fn read_originals(
+    cfg: &Config,
     tree: &Path,
     commit: &str,
     prefix: &str,
@@ -446,6 +456,10 @@ fn read_originals(
     for rel in files {
         let bytes = crate::worktree::show(tree, commit, &format!("{prefix}{rel}"))?;
         out.insert(rel.to_string(), bytes);
+    }
+    let sources: Vec<Site> = map_sites.iter().map(identity_site).collect();
+    for rel in crate_roots.values() {
+        crate::production::extend_snapshot(cfg, tree, &tree.join(rel), &sources, &mut out)?;
     }
     Ok(out)
 }
@@ -479,6 +493,7 @@ struct IsolatedAll {
 
 /// Apply every crate's sites to its crate root in the worker.
 fn apply_all(
+    cfg: &Config,
     worker: &Path,
     sites: &[Site],
     crate_roots: &BTreeMap<String, String>,
@@ -495,7 +510,12 @@ fn apply_all(
         let rel = crate_roots
             .get(pkg)
             .with_context(|| format!("no crate root recorded for package {pkg}"))?;
-        applied.extend(apply_schema_to_tree(worker, &sites, &worker.join(rel))?);
+        applied.extend(crate::production::apply_schema(
+            worker,
+            &sites,
+            &worker.join(rel),
+            cfg,
+        )?);
     }
     Ok(applied)
 }
@@ -547,10 +567,10 @@ fn isolate_all(
         restore_files(worker, originals)?;
         if sites.is_empty() {
             for rel in crate_roots.values() {
-                inject_runtime(&worker.join(rel))?;
+                crate::production::inject_selected_runtime(cfg, worker, &worker.join(rel))?;
             }
         }
-        let applied = apply_all(worker, &sites, crate_roots)?;
+        let applied = apply_all(cfg, worker, &sites, crate_roots)?;
         let built = build_schema(cfg, worker, test_packages, &builds)?;
         if built.success {
             return Ok(IsolatedAll {
@@ -614,7 +634,7 @@ fn bisect_all(
     let mut offenders = BTreeSet::new();
     while !remaining.is_empty() {
         restore_files(worker, originals)?;
-        apply_all(worker, &remaining, crate_roots)?;
+        apply_all(cfg, worker, &remaining, crate_roots)?;
         if build_schema(cfg, worker, test_packages, builds)?.success {
             break;
         }
@@ -626,7 +646,7 @@ fn bisect_all(
         let mid = remaining.len() / 2;
         let left = remaining[..mid].to_vec();
         restore_files(worker, originals)?;
-        apply_all(worker, &left, crate_roots)?;
+        apply_all(cfg, worker, &left, crate_roots)?;
         if !build_schema(cfg, worker, test_packages, builds)?.success {
             remaining = left;
         } else {
@@ -694,6 +714,8 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
         "Cargo feature selection: {}",
         serde_json::to_string(&cfg.cargo_features)?
     );
+    crate::baseline::checkout_main(cfg, paths)?;
+    let _target_lease = crate::artifacts::TargetLease::if_needed(cfg, &paths.baseline)?;
     let baseline = crate::baseline::prepare_baseline(cfg, paths, false)?;
     let mut tests = crate::index::list_tests_plain(cfg, paths)?;
     let timing = crate::index::attach_timings(&mut tests, &baseline.tests);
@@ -772,7 +794,10 @@ fn build_map_with_failures(
         .map(|s| s.package.as_str())
         .collect::<BTreeSet<_>>()
     {
-        let abs = crate_root_source(&meta, pkg).with_context(|| format!("crate root for {pkg}"))?;
+        let abs = cfg
+            .mutation_target
+            .root(&meta, pkg)?
+            .with_context(|| format!("crate root for {pkg}"))?;
         let repo = crate::worktree::repo_of(&paths.baseline)?;
         let top = abs.strip_prefix(&repo.toplevel).with_context(|| {
             format!("crate root {} is outside the Git repository", abs.display())
@@ -788,7 +813,7 @@ fn build_map_with_failures(
             warn!("cannot look for proptest properties: {err:#}");
             Default::default()
         });
-    let originals = read_originals(&worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
+    let originals = read_originals(cfg, &worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
     let sites: Vec<Site> = map_sites.iter().map(identity_site).collect();
     let test_packages = crate::cargo_cmd::test_packages(cfg, &meta);
     let mut isolated = isolate_all(
@@ -877,6 +902,7 @@ fn build_map_with_failures(
     }
 
     let map = SiteMap {
+        mutation_target: cfg.mutation_target.clone(),
         cargo_features: cfg.cargo_features.clone(),
         version: crate::sitemap::MAP_VERSION,
         map_id: crate::sitemap::random_id(),
@@ -987,6 +1013,7 @@ fn load_for_build(cfg: &Config, paths: &Paths) -> Result<(SiteMap, State, BuildR
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(paths)?;
     let reconciled = state.reconcile(&map);
     reconciled.report();
@@ -1204,6 +1231,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     let started = Instant::now();
     let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(cfg, paths)?;
+    let _target_lease = crate::artifacts::TargetLease::if_needed(cfg, &map.worker)?;
     if !sources.from.is_empty() || sources.rebuild {
         let head = crate::worktree::head(&cfg.repo_root)?;
         anyhow::ensure!(
@@ -1232,6 +1260,19 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     for patch in &sources.patches {
         let outcome = capture_patch(&map, &cfg.repo_root, &patch.patch, sources.options)?;
         captures.push((patch.patch.display().to_string(), outcome));
+    }
+    if !cfg.mutation_target.is_default() {
+        for (_, outcome) in &mut captures {
+            if outcome
+                .mutants
+                .iter()
+                .flat_map(|m| &m.edits)
+                .any(|e| map.site(e.site_id).is_some_and(|s| s.opaque_return))
+            {
+                outcome.problems.push("opaque-return direct variants are not supported in explicit production target passes; physical prove is available only for source unique to the selected target".into());
+                outcome.mutants.clear();
+            }
+        }
     }
     let mut ok = true;
     for (source, outcome) in &captures {
@@ -1404,6 +1445,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         .collect();
 
     let originals = read_originals(
+        cfg,
         &map.worker,
         &map.commit,
         &map.prefix,
@@ -1500,7 +1542,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
             }
         }
         restore_files(&map.worker, &originals)?;
-        apply_all(&map.worker, &isolated.sites, &map.crate_roots)?;
+        apply_all(cfg, &map.worker, &isolated.sites, &map.crate_roots)?;
         report.builds += 1;
         let back = build_schema(cfg, &map.worker, &map.test_packages, &AtomicU64::new(0))?;
         if !back.success {
@@ -1849,13 +1891,35 @@ pub fn test(
     let map = SiteMap::load(paths)?
         .context("no map in this scratch session; run `cargo quicksilver map` first")?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(paths)?;
     let reconciled = state.reconcile(&map);
-    if reconciled != Reconciled::default() {
-        reconciled.report();
-        state.save(paths)?;
+    let _target_lease = crate::artifacts::TargetLease::if_needed(cfg, &map.worker)?;
+    let again_changed = prepare_again(&mut state, paths, only, again);
+    if state
+        .records
+        .iter()
+        .any(|r| matches!(r.status, Status::Built { .. }))
+    {
+        crate::exec::test::validate_children(
+            &generation_dir(paths, state.generation),
+            &map.worker.join("target"),
+            _target_lease.is_some(),
+        )?;
+        for r in &state.records {
+            if matches!(r.status, Status::Built { direct: true, .. })
+                && (only.is_empty() || only.iter().any(|id| r.mutant.id.starts_with(id)))
+            {
+                crate::exec::test::validate_children(
+                    &direct_dir(paths, state.generation, &r.mutant.id),
+                    &map.worker.join("target"),
+                    _target_lease.is_some(),
+                )?;
+            }
+        }
     }
-    if prepare_again(&mut state, paths, only, again) > 0 {
+    if reconciled != Reconciled::default() || again_changed > 0 {
+        reconciled.report();
         state.save(paths)?;
     }
     let pending = state
@@ -2279,6 +2343,7 @@ mod tests {
 
     fn map_of(map_id: &str, commit: &str, test_packages: &[&str]) -> SiteMap {
         SiteMap {
+            mutation_target: Default::default(),
             cargo_features: Default::default(),
             version: crate::sitemap::MAP_VERSION,
             map_id: map_id.into(),
@@ -2353,6 +2418,7 @@ mod tests {
             map_id: map.map_id.clone(),
             commit: map.commit.clone(),
             test_packages: map.test_packages.clone(),
+            mutation_target: map.mutation_target.clone(),
             cargo_features: map.cargo_features.clone(),
             build_env: map.build_env.clone(),
             generation: 3,
@@ -2525,6 +2591,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("test-bin"), b"staged binary").unwrap();
         let manifest = crate::exec::test::BinariesManifest {
+            artifact_schema: 1,
+            children: Vec::new(),
             mutant_id: "schema".into(),
             tests: vec![crate::exec::test::ManifestTest {
                 name: "t".into(),

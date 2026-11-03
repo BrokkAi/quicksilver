@@ -33,6 +33,13 @@ pub fn capture_from(map: &SiteMap, repo: &Path, source: &Path) -> Result<Capture
         &std::fs::read(source).with_context(|| format!("read {}", source.display()))?,
     )
     .with_context(|| format!("parse {}", source.display()))?;
+    let prior_target: crate::production::Selection = serde_json::from_value(
+        json.get("mutation_target")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .context("read source production target")?;
+    map.mutation_target.require_match(&prior_target)?;
     let prior_features: crate::features::CargoFeatures = serde_json::from_value(
         json.get("cargo_features")
             .cloned()
@@ -191,6 +198,7 @@ mod tests {
             scaffolding: None,
         };
         let map = SiteMap {
+            mutation_target: Default::default(),
             cargo_features: Default::default(),
             version: crate::sitemap::MAP_VERSION,
             map_id: "new".into(),

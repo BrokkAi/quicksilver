@@ -10,10 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+// Version 10 pins explicit production target selection.
 // Version 9 supports tracked shared production sources outside the workspace.
 // Version 8 pins Cargo features; version 7 predates feature selection and
 // remains usable under Cargo defaults. Older binaries refuse newer maps.
-pub const MAP_VERSION: u32 = 9;
+pub const MAP_VERSION: u32 = 10;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -46,6 +47,8 @@ pub struct MapSite {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteMap {
+    #[serde(default)]
+    pub mutation_target: crate::production::Selection,
     #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
     pub version: u32,
@@ -128,8 +131,10 @@ impl SiteMap {
         let map: SiteMap =
             serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
         anyhow::ensure!(
-            (map.version == MAP_VERSION || map.version == 8)
-                || (map.version == 7 && map.cargo_features == Default::default()),
+            map.version == MAP_VERSION
+                || (map.mutation_target.is_default()
+                    && (matches!(map.version, 8 | 9)
+                        || (map.version == 7 && map.cargo_features == Default::default()))),
             "{} is map version {}, this build reads {}; run `cargo quicksilver map` again",
             p.display(),
             map.version,
@@ -711,6 +716,7 @@ mod tests {
             cpu_secs: None,
         };
         let map = SiteMap {
+            mutation_target: Default::default(),
             cargo_features: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),
@@ -775,6 +781,7 @@ mod tests {
             cpu_secs: None,
         };
         let mut map = SiteMap {
+            mutation_target: Default::default(),
             cargo_features: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),

@@ -365,6 +365,8 @@ pub fn baseline_failure_summary(failures: &[BaselineFailure]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BaselineReport {
     #[serde(default)]
+    pub mutation_target: crate::production::Selection,
+    #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
     pub suite_secs: f64,
     pub tests: Vec<TestInfo>,

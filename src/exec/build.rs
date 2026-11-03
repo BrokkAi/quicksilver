@@ -28,6 +28,7 @@ pub(crate) fn resolve_binary(
         .map(|n| n.to_string_lossy().into_owned());
     let mut fresh: Vec<&crate::cargo_cmd::BuiltExe> = built
         .iter()
+        .filter(|e| e.test_harness)
         .filter(|e| {
             e.path
                 .file_name()
@@ -212,6 +213,8 @@ mod tests {
             let path = self.target().join("quicksilver/deps").join(name);
             fs::write(&path, name).unwrap();
             BuiltExe {
+                test_harness: true,
+                original_path: None,
                 path,
                 manifest_dir: Some(self.root.join(pkg_dir)),
                 artifacts: None,

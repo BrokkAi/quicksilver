@@ -10,6 +10,8 @@ use std::time::Duration;
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
     #[serde(default)]
+    pub mutation: crate::production::Selection,
+    #[serde(default)]
     pub cargo: crate::features::CargoFeatures,
     #[serde(rename = "build-jobs")]
     pub build_jobs: Option<usize>,
@@ -70,6 +72,7 @@ pub struct SandboxFile {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub mutation_target: crate::production::Selection,
     pub cargo_features: crate::features::CargoFeatures,
     pub repo_root: PathBuf,
     /// `<git common dir>/quicksilver`: where QS's worktrees live.
@@ -176,6 +179,15 @@ pub fn merge_config(
             file.cargo.clone()
         };
     cargo_features.normalize();
+    let mutation_target = if cli.lib || cli.bin.is_some() {
+        crate::production::Selection {
+            lib: cli.lib,
+            bin: cli.bin.clone(),
+        }
+    } else {
+        file.mutation.clone()
+    };
+    mutation_target.validate(&extras.packages)?;
 
     let mut extra_tests = Vec::new();
     for binary in cli.extra_tests.iter().chain(&file.extra_tests).chain(
@@ -191,6 +203,7 @@ pub fn merge_config(
     }
 
     Ok(Config {
+        mutation_target,
         cargo_features,
         repo_root,
         worktree_root: crate::worktree::root(&repo),

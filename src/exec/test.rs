@@ -11,6 +11,11 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BinariesManifest {
+    /// Version 1 records ordinary child outputs as well as test harnesses.
+    #[serde(default)]
+    pub artifact_schema: u32,
+    #[serde(default)]
+    pub children: Vec<ChildExecutable>,
     pub mutant_id: String,
     pub tests: Vec<ManifestTest>,
     /// `CARGO_PKG_*` for each package's tests, as cargo and nextest set them.
@@ -19,6 +24,37 @@ pub struct BinariesManifest {
     /// The toolchain's cargo, given to tests as `CARGO`.
     #[serde(default)]
     pub cargo: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChildExecutable {
+    pub path: PathBuf,
+    pub sha256: String,
+}
+
+/// Validate once before a phase, while its ordinary mbx view lease is live.
+/// Never turn stale/missing child artifacts into mutation verdicts.
+pub(crate) fn validate_children(run_dir: &Path, target: &Path, required: bool) -> Result<()> {
+    let path = run_dir.join("manifest.json");
+    if !path.is_file() {
+        return Ok(());
+    }
+    let manifest: BinariesManifest = serde_json::from_slice(&fs::read(path)?)?;
+    anyhow::ensure!(!required || manifest.artifact_schema >= 1,
+        "this generation predates child executable identity tracking; run `cargo quicksilver build --rebuild` before testing");
+    for child in &manifest.children {
+        let in_view = target
+            .canonicalize()
+            .ok()
+            .zip(child.path.canonicalize().ok())
+            .is_some_and(|(view, path)| path.starts_with(view));
+        let actual = in_view
+            .then(|| crate::util::sha256_file(&child.path).ok())
+            .flatten();
+        anyhow::ensure!(actual.as_deref() == Some(child.sha256.as_str()),
+            "child executable from this generation is missing or changed: {}; run `cargo quicksilver build --rebuild` before testing (direct CLI variants require `prove` when their child differs from the shared generation)", child.path.display());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1153,6 +1189,8 @@ mod tests {
     fn same_name_in_two_binaries_resolves_by_id() {
         let dir = tempfile::tempdir().unwrap();
         let manifest = BinariesManifest {
+            artifact_schema: 1,
+            children: Vec::new(),
             mutant_id: "schema".into(),
             tests: vec![
                 ManifestTest {
@@ -1849,5 +1887,48 @@ mod tests {
         let (outcome, seen) = drive(false, &fake_tests(&["t1"]), &[(RunStatus::Failed, 0.5, "")]);
         assert_eq!(outcome.kind, VerdictKind::Caught);
         assert_eq!(seen.len(), 1, "no retry and no null run without confirm");
+    }
+}
+
+#[cfg(test)]
+mod child_identity_tests {
+    use super::*;
+    #[test]
+    fn child_identity_refuses_replacements_and_legacy_unknown_outputs() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let run = temp.path().join("run");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(&run).unwrap();
+        let child = target.join("tool");
+        fs::write(&child, "original executable").unwrap();
+        let mut manifest = BinariesManifest {
+            artifact_schema: 1,
+            children: vec![ChildExecutable {
+                path: child.clone(),
+                sha256: crate::util::sha256_file(&child).unwrap(),
+            }],
+            ..Default::default()
+        };
+        let save = |m: &BinariesManifest| {
+            fs::write(run.join("manifest.json"), serde_json::to_vec(m).unwrap()).unwrap()
+        };
+        save(&manifest);
+        validate_children(&run, &target, true).unwrap();
+        fs::write(&child, "replacement").unwrap();
+        assert!(validate_children(&run, &target, true)
+            .unwrap_err()
+            .to_string()
+            .contains("missing or changed"));
+        fs::remove_file(&child).unwrap();
+        assert!(validate_children(&run, &target, true).is_err());
+        manifest.children.clear();
+        manifest.artifact_schema = 0;
+        save(&manifest);
+        assert!(validate_children(&run, &target, true)
+            .unwrap_err()
+            .to_string()
+            .contains("predates child executable"));
+        validate_children(&run, &target, false).unwrap();
     }
 }

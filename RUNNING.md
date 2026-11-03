@@ -470,6 +470,7 @@ workspace root.
 | `build-jobs`, `test-jobs` | Builds and test processes at once, as `--build-jobs` and `--test-jobs`. |
 | `extra-tests = [...]` | Test binaries of other packages to add, as `--extra-tests`. |
 | `[package.<name>] extra-tests` | The same, only when `--package <name>` is given. |
+| `[mutation]` | One production source target: `bin = "name"` or `lib = true`, with exactly one package. |
 | `[cargo]` | Cargo `features`, `all-features` and `no-default-features`, pinned for the campaign. |
 | `[build-env]` | Variables for every build and baseline test run. |
 | `[map] nextest-profile` | Project nextest profile for the baseline and test catalog; defaults to `default`. |
@@ -478,6 +479,57 @@ workspace root.
 | `[test-budget]` | Minimum seconds per test id, for tests with long deadlines of their own. |
 | `[test-env]` | Variables for every test process; `{sandbox}` is that process's sandbox. |
 | `[sandbox]` | `enabled = false` turns the sandbox off; `dir` moves it. |
+
+### Production library and binary passes
+
+Without a source selector, quicksilver instruments each package's library,
+or its first binary when it has no library. That pass does not cover the
+package's other production targets. Select one explicitly with exactly one
+package:
+
+```
+cargo quicksilver -p my_package --bin authoring_cli --features release-tooling map
+cargo quicksilver -p my_package --bin authoring_cli --features release-tooling build
+cargo quicksilver -p my_package --bin authoring_cli --features release-tooling test
+```
+
+`--lib` selects the library explicitly. These flags choose the source root
+to instrument; package integration tests and CLI drivers remain available.
+For a whole campaign, persist the choice alongside Cargo features:
+
+```toml
+[mutation]
+bin = "authoring_cli"
+# Use lib = true instead for a library pass.
+```
+
+An explicit `--lib` or `--bin` replaces `[mutation]`. Map, baseline,
+build/state and test JSON record `mutation_target`; the existing `target`
+field still means the Rust host triple. Explicit passes qualify function
+identities with package, target kind and target name. Build, rebuild, test,
+apply, prove and saved-body imports reject a different source selection.
+Changing targets needs a new map; previous target records and verdicts are
+not reused. Export a catalog before replacing its map and use `--from`
+only with the same source-target selection.
+
+Shared files compiled by the package's library and binaries retain their
+original bodies in unselected contexts: runtime dispatch is inactive there.
+Mutant bodies must still compile in every Cargo context using that physical
+source. No source in your checkout is changed by map/build/test.
+
+CLI tests using `env!("CARGO_BIN_EXE_name")` embed Cargo's original executable
+path. Quicksilver holds an ordinary mbx session while recording/testing and
+checks saved child executable hashes before testing a generation. If mbx
+collected that output, or another build replaced it between commands, test
+refuses before recording verdicts: run `build --rebuild` explicitly. It
+neither redirects targets nor restores files into Cargo outputs. Older
+staged generations without child identity metadata also need a rebuild.
+Explicit production passes currently refuse edited mutants of `impl Trait`
+functions: their direct builds cannot provide the same target isolation as
+schema arms. `apply` and `prove` also refuse a target-isolated mutant whose
+physical source is shared with another target, since a physical edit would
+change those other contexts too. Use schema build/test for shared source;
+physical `prove` is available for source unique to the selected target.
 
 ### Shared source in nested workspaces
 
@@ -523,8 +575,9 @@ a dependency can re-enable a feature even with `--no-default-features`.
 The selection reaches metadata, baseline tests, the nextest catalog and all
 schema builds, including `build --rebuild` and the built-in `run` command.
 Map, baseline, build and test JSON record it as `cargo_features`. New maps
-use format version 9, which older binaries refuse; version 8 maps and
-version 7 maps with their original Cargo defaults remain readable. Build,
+use format version 10, which older binaries refuse; versions 8–9 maps and
+version 7 maps with their original Cargo defaults remain readable under
+their original implicit production-target selection. Build,
 rebuild and test reject settings different from the map. To change the
 selection, map again; captured mutants at the same commit are retained but
 all compiled statuses and verdicts, including kills and compile failures,

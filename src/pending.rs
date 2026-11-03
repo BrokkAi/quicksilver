@@ -96,7 +96,9 @@ pub fn run(common: &CommonOpts, args: PendingArgs) -> Result<i32> {
     let head = crate::worktree::head(&cfg.repo_root)?;
     let map = crate::exec::edited::map_at(&paths, &head)?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.mutation_target.require_match(&cfg.mutation_target)?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(&paths)?;
     state.reconcile(&map);
     let files = crate::discover::file_globset(&cfg.files)?;

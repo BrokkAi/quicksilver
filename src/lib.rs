@@ -17,6 +17,7 @@ pub mod mbx_env;
 pub mod outcome;
 pub mod pending;
 pub mod plan;
+pub mod production;
 pub mod progress;
 pub mod proptest;
 pub mod report;
@@ -54,6 +55,9 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     if let cli::Command::ProtectedCargo(args) = cli.command {
         return artifacts::helper(&args.args, &args.helper_bin);
     }
+    if matches!(cli.command, cli::Command::HoldTarget) {
+        return artifacts::hold_target_helper();
+    }
     artifacts::remember_executable()?;
     // Before any thread starts: it changes this process's environment.
     mbx_env::leave_enclosing_session();
@@ -70,6 +74,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Apply(args) => apply::run_apply(&cli.common, args),
         cli::Command::Prove(args) => apply::run_prove(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
+        cli::Command::HoldTarget => unreachable!("handled before session restore"),
         cli::Command::ProtectedCargo(_) => unreachable!("handled before session restore"),
     };
     if let Some(line) = sandbox::summary() {
@@ -231,6 +236,7 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
     let head = worktree::head(&cfg.repo_root)?;
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.mutation_target.require_match(&cfg.mutation_target)?;
     if args.not_green {
         print!("{}", not_green_report(&map));
         eprintln!(
@@ -396,6 +402,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
             "commit": map.as_ref().map(|m| m.commit.clone()),
             "target": map.as_ref().map(|m| m.target.clone()),
             "cargo_features": state.cargo_features,
+            "mutation_target": state.mutation_target,
             "baseline_failures": map.as_ref().map(|m| &m.baseline_failures),
             "mutants": rows,
         });

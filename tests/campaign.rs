@@ -1233,3 +1233,336 @@ fn main() { let _ = shared::answer(20); let _ = other::flag(); }
     assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
     assert_eq!(fs::read_to_string(&shared).unwrap(), original);
 }
+
+#[test]
+fn explicit_production_binary_pass_keeps_cli_drivers_and_target_identity() {
+    use cargo_quicksilver::exec::test::BinariesManifest;
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(root.join("optional-helper/src")).unwrap();
+    fs::write(root.join(".gitignore"), "*.json\n").unwrap();
+    fs::write(
+        root.join("Cargo.toml"),
+        r#"
+[package]
+name = "mixed"
+version = "0.1.0"
+edition = "2021"
+[workspace]
+members = ["optional-helper"]
+[features]
+default = []
+tooling = ["dep:optional_helper"]
+[dependencies]
+optional_helper = { path = "optional-helper", optional = true }
+[lib]
+path = "src/lib.rs"
+[[bin]]
+name = "author-cli"
+path = "src/author.rs"
+required-features = ["tooling"]
+[[bin]]
+name = "viewer"
+path = "src/viewer.rs"
+[[test]]
+name = "cli"
+required-features = ["tooling"]
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("optional-helper/Cargo.toml"),
+        "[package]\nname='optional_helper'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("optional-helper/src/lib.rs"),
+        "pub fn offset() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    let library = "mod common; pub fn library_answer() -> u32 { common::answer() }\n";
+    let viewer = "mod common; fn main() { println!(\"{}\", common::answer()); }\n";
+    let author = "mod common; fn author_only() -> u32 { optional_helper::offset() } fn opaque() -> impl std::fmt::Debug { 42u32 } fn main() { println!(\"{}\", common::answer() + author_only()); }\n";
+    let common = "pub fn answer() -> u32 { 42 }\n";
+    fs::write(root.join("src/lib.rs"), library).unwrap();
+    fs::write(root.join("src/viewer.rs"), viewer).unwrap();
+    fs::write(root.join("src/author.rs"), author).unwrap();
+    fs::write(root.join("src/common.rs"), common).unwrap();
+    fs::write(root.join("tests/cli.rs"), r#"
+use std::process::Command;
+#[test]
+fn authoring_cli() {
+    let author = env!("CARGO_BIN_EXE_author-cli");
+    let viewer = env!("CARGO_BIN_EXE_viewer");
+    if std::env::var_os("QS_RECORD_SITES").is_some() || std::env::var_os("QS_MUTANT").is_some() {
+        let root = std::env::var_os("CARGO_MANIFEST_DIR").unwrap();
+        let cleaned = Command::new("mbx").arg("clean").arg(root).output().unwrap();
+        assert!(cleaned.status.success(), "{}", String::from_utf8_lossy(&cleaned.stderr));
+        assert!(std::path::Path::new(author).is_file(), "active mbx lease must protect the CLI child");
+        assert!(std::path::Path::new(viewer).is_file());
+    }
+    assert_eq!(mixed::library_answer(), 42, "library context");
+    let other = Command::new(viewer).output().unwrap();
+    assert!(other.status.success());
+    assert_eq!(String::from_utf8_lossy(&other.stdout).trim(), "42", "other binary context");
+    let selected = Command::new(author).output().unwrap();
+    assert!(selected.status.success());
+    assert_eq!(String::from_utf8_lossy(&selected.stdout).trim(), "42", "selected binary context");
+}
+"#).unwrap();
+    git(
+        root,
+        &[
+            "add",
+            "Cargo.toml",
+            ".gitignore",
+            "src",
+            "tests/cli.rs",
+            "optional-helper",
+        ],
+    );
+    git(
+        root,
+        &[
+            "commit",
+            "-m",
+            "mixed production library and required-feature binaries",
+        ],
+    );
+    let tool = |args: &[&str], code: i32| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(root)
+            .args([
+                "quicksilver",
+                "--manifest-path",
+                "Cargo.toml",
+                "-p",
+                "mixed",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    tool(&["list", "--json", "default-target.json"], 0);
+    assert!(json(root, "default-target.json")
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["fqn"] == "mixed.library_answer"));
+    let missing = tool(&["--bin", "absent", "list"], 2);
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("no selected production target"));
+    let disabled = tool(&["--bin", "author-cli", "map"], 2);
+    assert!(
+        String::from_utf8_lossy(&disabled.stderr).contains("required Cargo features"),
+        "{}",
+        String::from_utf8_lossy(&disabled.stderr)
+    );
+    fs::write(
+        root.join("quicksilver.toml"),
+        "[cargo]\nfeatures=['tooling']\n[mutation]\nbin='author-cli'\n",
+    )
+    .unwrap();
+    tool(&["map", "--json", "author-map.json"], 0);
+    let map: SiteMap = serde_json::from_value(json(root, "author-map.json")).unwrap();
+    assert_eq!(map.mutation_target.bin.as_deref(), Some("author-cli"));
+    assert_eq!(map.crate_roots["mixed"], "src/author.rs");
+    assert!(map.tests.iter().any(|t| t.binary_id == "mixed::cli"));
+    assert!(!map
+        .sites
+        .iter()
+        .any(|s| s.fqn.contains("library_answer") || s.path == "src/viewer.rs"));
+    let selected = map
+        .sites
+        .iter()
+        .find(|s| s.fqn == "mixed::bin::author-cli.common.answer")
+        .unwrap();
+    let selected_id = selected.site_id;
+    assert!(map
+        .tests_entering(&[selected_id])
+        .iter()
+        .any(|t| t.binary_id == "mixed::cli"));
+    let paths = support::cfg_for(root).paths();
+    let map_bytes = fs::read(SiteMap::path(&paths)).unwrap();
+    fs::write(root.join("src/common.rs"), common.replace("42", "0")).unwrap();
+    tool(&["build", "--json", "author-built.json"], 0);
+    fs::write(root.join("src/common.rs"), common).unwrap();
+    let built: State = serde_json::from_value(json(root, "author-built.json")).unwrap();
+    let before = fs::read(State::path(&paths)).unwrap();
+    fs::write(
+        root.join("src/author.rs"),
+        author.replace("{ 42u32 }", "{ 43u32 }"),
+    )
+    .unwrap();
+    let unsupported = tool(&["build"], 2);
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("opaque-return direct variants"));
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    fs::write(root.join("src/author.rs"), author).unwrap();
+
+    for args in [
+        vec!["--lib", "build", "--rebuild"],
+        vec!["--bin", "viewer", "test"],
+        vec!["--lib", "apply", &built.records[0].mutant.id],
+    ] {
+        let rejected = tool(&args, 2);
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("production target differs"));
+        assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+        assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), map_bytes);
+    }
+    let shared_apply = tool(&["apply", &built.records[0].mutant.id], 2);
+    assert!(String::from_utf8_lossy(&shared_apply.stderr).contains("other compilation contexts"));
+    let shared_prove = tool(
+        &["prove", &built.records[0].mutant.id, "--", "/bin/true"],
+        3,
+    );
+    assert!(String::from_utf8_lossy(&shared_prove.stderr).contains("other compilation contexts"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/common.rs")).unwrap(),
+        common
+    );
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    // A missing compile-time child is an infrastructure error, never a kill.
+    let run = paths
+        .runs
+        .join("edited")
+        .join(format!("gen-{}", built.generation));
+    let manifest: BinariesManifest =
+        serde_json::from_slice(&fs::read(run.join("manifest.json")).unwrap()).unwrap();
+    let child = manifest
+        .children
+        .iter()
+        .find(|c| c.path.file_name().unwrap() == "author-cli")
+        .unwrap();
+    let held = child.path.with_extension("qs-test-held");
+    fs::rename(&child.path, &held).unwrap();
+    let rejected = tool(&["test"], 2);
+    assert!(String::from_utf8_lossy(&rejected.stderr)
+        .contains("child executable from this generation is missing or changed"));
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    fs::rename(held, &child.path).unwrap();
+    tool(&["test", "--json", "author-tested.json"], 0);
+    let tested = json(root, "author-tested.json");
+    assert_eq!(tested["mutation_target"]["bin"], "author-cli");
+    assert_eq!(tested["mutants"][0]["verdict"]["kind"], "caught");
+    assert!(tested["mutants"][0]["verdict"]["test"]
+        .as_str()
+        .unwrap()
+        .contains("authoring_cli"));
+    let id = built.records[0].mutant.id.clone();
+    tool(&["build", "--rebuild", "--json", "author-rebuilt.json"], 0);
+    let rebuilt: State = serde_json::from_value(json(root, "author-rebuilt.json")).unwrap();
+    assert_eq!(rebuilt.records[0].mutant.id, id);
+    assert_eq!(
+        rebuilt.records[0].mutant.edits,
+        built.records[0].mutant.edits
+    );
+    assert_eq!(rebuilt.mutation_target, map.mutation_target);
+    tool(&["test", "--json", "author-retested.json"], 0);
+    assert_eq!(
+        json(root, "author-retested.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    tool(&["map"], 0);
+    State::default().save(&paths).unwrap();
+    tool(
+        &[
+            "build",
+            "--from",
+            "author-tested.json",
+            "--json",
+            "author-replayed.json",
+        ],
+        0,
+    );
+    let replayed: State = serde_json::from_value(json(root, "author-replayed.json")).unwrap();
+    assert_eq!(replayed.records[0].mutant.id, id);
+    assert_eq!(
+        replayed.records[0].mutant.edits,
+        built.records[0].mutant.edits
+    );
+    tool(&["test", "--json", "author-replay-test.json"], 0);
+    assert_eq!(
+        json(root, "author-replay-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    tool(&["--bin", "viewer", "map", "--json", "viewer-map.json"], 0);
+    let other: SiteMap = serde_json::from_value(json(root, "viewer-map.json")).unwrap();
+    assert_ne!(
+        other
+            .sites
+            .iter()
+            .find(|s| s.fqn == "mixed::bin::viewer.common.answer")
+            .unwrap()
+            .site_id,
+        selected_id
+    );
+    tool(
+        &["--bin", "viewer", "test", "--json", "viewer-empty.json"],
+        0,
+    );
+    assert!(State::load(&paths).unwrap().records.is_empty());
+    assert!(json(root, "viewer-empty.json")["mutants"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let before = fs::read(State::path(&paths)).unwrap();
+    tool(
+        &["--bin", "viewer", "build", "--from", "author-tested.json"],
+        2,
+    );
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    tool(&["--lib", "map", "--json", "library-map.json"], 0);
+    let library_map: SiteMap = serde_json::from_value(json(root, "library-map.json")).unwrap();
+    assert!(library_map.mutation_target.lib);
+    assert_eq!(library_map.crate_roots["mixed"], "src/lib.rs");
+    assert!(library_map
+        .sites
+        .iter()
+        .any(|s| s.fqn == "mixed::lib::mixed.common.answer"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+        library
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/viewer.rs")).unwrap(),
+        viewer
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/author.rs")).unwrap(),
+        author
+    );
+    tool(
+        &[
+            "--bin",
+            "author-cli",
+            "--file",
+            "src/common.rs",
+            "run",
+            "--limit",
+            "1",
+            "--identity-sample",
+            "1",
+            "--json",
+            "author-builtin.json",
+        ],
+        0,
+    );
+    assert!(json(root, "author-builtin.json")["outcomes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|o| o["kind"] == "caught"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/common.rs")).unwrap(),
+        common
+    );
+}

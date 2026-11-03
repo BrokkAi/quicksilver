@@ -247,7 +247,7 @@ pub(crate) fn build(
     crate::scratch::check_free_space(&copies.dir, cfg.max_scratch)?;
     let start = std::time::Instant::now();
     let result = exchange(&mut cmd, progress, |success, stdout| {
-        let mut executables = crate::cargo_cmd::parse_executables(stdout, target);
+        let mut executables = crate::cargo_cmd::parse_all_executables(stdout, target);
         // Failed attribution rounds don't publish or stage binaries.
         if success {
             copies.copy(&mut executables)?;
@@ -327,6 +327,8 @@ test "$acknowledgment" = staged || exit 3
                 "collector must not enter between Cargo exit and snapshot"
             );
             let mut exes = vec![crate::cargo_cmd::BuiltExe {
+                test_harness: true,
+                original_path: None,
                 path: target.join("tool-0123456789abcdef"),
                 manifest_dir: None,
                 artifacts: None,
@@ -368,11 +370,15 @@ test "$acknowledgment" = staged || exit 3
         let copies = ArtifactCopies::new(tmp.path()).unwrap();
         let mut exes = vec![
             crate::cargo_cmd::BuiltExe {
+                test_harness: true,
+                original_path: None,
                 path: newer,
                 manifest_dir: None,
                 artifacts: None,
             },
             crate::cargo_cmd::BuiltExe {
+                test_harness: true,
+                original_path: None,
                 path: older,
                 manifest_dir: None,
                 artifacts: None,
@@ -413,6 +419,8 @@ test "$acknowledgment" = staged || exit 3
         let directory = copies.dir.clone();
         let error = exchange(&mut wrapped(&lease, &target), None, |_, _| {
             let mut exes = vec![crate::cargo_cmd::BuiltExe {
+                test_harness: true,
+                original_path: None,
                 path: target.join("missing"),
                 manifest_dir: None,
                 artifacts: None,
@@ -433,5 +441,87 @@ test "$acknowledgment" = staged || exit 3
         cmd.args(["-c", "printf 'cargo exited early\\n'"]);
         let error = exchange(&mut cmd, None, |_, _| Ok(())).unwrap_err();
         assert!(format!("{error:#}").contains("before reporting Cargo completion"));
+    }
+}
+
+/// An ordinary mbx command keeps the workspace view leased while direct tests
+/// and their compile-time CARGO_BIN_EXE children use its existing outputs.
+pub(crate) struct TargetLease {
+    running: RunningBuild,
+    _directory: Arc<ArtifactCopies>,
+}
+impl Drop for TargetLease {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.running.0.take() {
+            if let Some(mut input) = child.stdin.take() {
+                let _ = input.write_all(b"released\n");
+            }
+            let _ = child.wait();
+        }
+    }
+}
+
+pub(crate) fn hold_target_helper() -> Result<i32> {
+    println!("quicksilver-target-lease-v1");
+    std::io::stdout().flush()?;
+    let mut release = String::new();
+    std::io::stdin().read_line(&mut release)?;
+    Ok(0)
+}
+
+impl TargetLease {
+    pub(crate) fn if_needed(cfg: &crate::config::Config, root: &Path) -> Result<Option<Self>> {
+        let meta = crate::cargo_cmd::load_metadata_with_features(root, &cfg.cargo_features)?;
+        let packages = crate::cargo_cmd::test_packages(cfg, &meta);
+        let needed = meta.workspace_packages().iter().any(|p| {
+            (packages.is_empty() || packages.iter().any(|n| n == p.name.as_str()))
+                && p.targets
+                    .iter()
+                    .any(|t| t.kind.iter().any(|k| k.to_string() == "bin"))
+        });
+        if !needed {
+            return Ok(None);
+        }
+        let directory = ArtifactCopies::new(&cfg.paths().runs.join("target-leases"))?;
+        let bin = directory.dir.join("helper-bin");
+        fs::create_dir(&bin)?;
+        std::os::unix::fs::symlink(executable()?, bin.join("cargo-quicksilver"))?;
+        let mut path = vec![bin];
+        let original = cfg
+            .build_env
+            .get("PATH")
+            .map(std::ffi::OsString::from)
+            .or_else(|| std::env::var_os("PATH"))
+            .unwrap_or_default();
+        path.extend(std::env::split_paths(&original));
+        let mut cmd = crate::cargo_cmd::cargo_command();
+        cmd.current_dir(root);
+        crate::cargo_cmd::apply_build_env(&mut cmd, cfg);
+        cmd.env("PATH", std::env::join_paths(path)?);
+        cmd.args(["quicksilver", "__hold-target"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut running = RunningBuild(Some(cmd.spawn().context("start mbx target lease")?));
+        let output = running
+            .0
+            .as_mut()
+            .unwrap()
+            .stdout
+            .take()
+            .context("target lease stdout")?;
+        let mut reader = std::io::BufReader::new(output);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .context("wait for mbx target lease")?;
+        ensure!(
+            line.trim() == "quicksilver-target-lease-v1",
+            "mbx target lease did not start: {line}"
+        );
+        Ok(Some(Self {
+            running,
+            _directory: directory,
+        }))
     }
 }

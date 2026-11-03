@@ -1,4 +1,4 @@
-use crate::cargo_cmd::{mutable_scope, MutableScope};
+use crate::cargo_cmd::{mutable_scope_for, MutableScope};
 use crate::scan::scan_crate_for;
 use crate::types::Mutant;
 use crate::util::{hex, line_col_to_offset, rel_slash};
@@ -77,6 +77,7 @@ pub fn kind_is_schema_prefiltered(label: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct DiscoverFilter {
+    pub mutation_target: crate::production::Selection,
     pub cargo_features: crate::features::CargoFeatures,
     pub packages: Vec<String>,
     pub files: Vec<String>,
@@ -252,6 +253,7 @@ fn scan_functions(
     diff: Option<&DiffSelection>,
     mut test_lines: Option<&mut TestLines>,
 ) -> Result<Vec<FnDecl>> {
+    filter.mutation_target.validate(&filter.packages)?;
     let meta = crate::cargo_cmd::load_metadata_with_features(root, &filter.cargo_features)?;
     let globset = file_globset(&filter.files)?;
     let scan_started = std::time::Instant::now();
@@ -269,18 +271,17 @@ fn scan_functions(
         if !filter.packages.is_empty() && !filter.packages.iter().any(|p| p == &package) {
             continue;
         }
-        let Some(scope) = mutable_scope(&meta, &package) else {
+        let Some(scope) = mutable_scope_for(&meta, &package, &filter.mutation_target)? else {
             continue;
         };
         if scope.proc_macro {
             skipped_proc_macro.insert(package);
             continue;
         }
-        let crate_name = pkg
-            .targets
-            .iter()
-            .find(|t| t.src_path.as_std_path() == scope.root_file)
-            .map(|t| t.name.replace('-', "_"))
+        let crate_name = filter
+            .mutation_target
+            .target(&meta, &package)?
+            .map(|t| filter.mutation_target.fqn_root(&package, t))
             .unwrap_or_else(|| package.replace('-', "_"));
         let scope = canonical_scope(scope);
         let scanned = scan_crate_for(&crate_name, &scope.root_file, &target)?;

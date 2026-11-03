@@ -13,7 +13,11 @@ use std::sync::Arc;
 pub fn repo_root_from_cli(manifest: &Option<PathBuf>) -> Result<PathBuf> {
     if let Some(p) = manifest {
         if p.ends_with("Cargo.toml") {
-            return Ok(p.parent().unwrap_or(p).canonicalize()?);
+            let parent = p
+                .parent()
+                .filter(|dir| !dir.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            return Ok(parent.canonicalize()?);
         }
         return Ok(p.canonicalize()?);
     }
@@ -66,6 +70,7 @@ pub fn install_ctrlc() -> Arc<AtomicBool> {
 
 pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
     DiscoverFilter {
+        mutation_target: cfg.mutation_target.clone(),
         cargo_features: cfg.cargo_features.clone(),
         packages: cfg.packages.clone(),
         files: cfg.files.clone(),
