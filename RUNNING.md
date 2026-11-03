@@ -237,6 +237,43 @@ and exact replacement bodies. Join the before/after results on this key;
 `id` remains the identifier used by commands and can change across maps.
 Intent notes and source line numbers do not affect `stable_id`.
 
+### Rebuilding all captured mutants
+
+After a tool fix that changes instrumentation, regenerate the compiled
+variants before testing them. Installing a new quicksilver binary does not
+change previously compiled generations. Reuse the existing map and catalog:
+
+```
+cargo quicksilver build --no-capture --rebuild --json /tmp/qs-rebuilt.json
+cargo quicksilver test --json /tmp/qs-retested.json
+```
+
+`--rebuild` requeues every captured mutant, including Built, Unviable and
+Tested records, and invalidates old verdicts before compiling. It preserves
+the map, original/replacement bodies, mutant IDs, notes and capture times.
+Keep prior result exports outside the checkout if you need their history.
+HEAD must still match the map. No remap or source reset is needed.
+
+Rebuild suppresses implicit checkout capture. You can supply explicit patch
+or import inputs in the same build, for example to restore notes that an
+older tool lost and add a corrected candidate:
+
+```
+cargo quicksilver build --rebuild \
+  --patch old-round2.patch=old-round2.intents.json \
+  --patch old-round6.patch=old-round6.intents.json \
+  --patch repaired.patch=repaired.intents.json \
+  --json /tmp/qs-rebuilt.json
+```
+
+Inputs are checked before the catalog is requeued. Replaying the same
+body fills a missing note on its existing ID; it does not duplicate the
+record. A repaired body adds a new ID, while an old malformed body stays
+in the catalog and is checked again. A genuine compile error can still
+make `build` exit 1; inspect the Unviable records, then test the variants
+that compiled. If a rebuild stops or fails, its requeued records remain
+pending rather than reusing old verdicts.
+
 ### Notes on what a mutant models
 
 A note says what fault a mutant models, such as "off-by-one at the upper
@@ -252,6 +289,8 @@ bound". Survivors are shown with their note.
 - `--patch lane.patch=notes.json`: notes for that patch's mutants only, so
   different mutants of one function can each have their own. These win
   over `--intents`. No notes file is picked up without this form.
+- Repeated copies of one exact mutant are one intent target. Distinct
+  bodies of one function remain ambiguous unless notes are patch-scoped.
 - When a duplicate of an already captured mutant brings a note, it fills a
   missing note but never replaces one; `build` says which happened.
 
