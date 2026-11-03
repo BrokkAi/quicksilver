@@ -12,7 +12,7 @@ Runtime campaign issues #40 and #41 show that generated dispatch can change a mu
 - [x] (2026-11-03) Binding-free dispatch and AST no-binding property pass; real CLI struct/scalar/generic-serializer regression passes.
 - [x] (2026-11-03) Actual frozen receipts confirm repeated file headers; touched files deduplicate before capture and intent groups count distinct identities. Duplicate-note and distinct-variant unit/CLI tests pass.
 - [x] (2026-11-03) Full-catalog rebuild and combined patch/note repair tested across Built/Unviable/Tested states; RUNNING.md documents both exact recovery procedures.
-- [ ] Run full tests, lint and CI, push fixes, and deliver tested install/rebuild handoff.
+- [x] (2026-11-03) All 213 tests, Clippy/format and both CI jobs pass; #40/#41 closed. Delivered executable head d2ed5d2ee4138762cece4bd02ece9d5164c4d7c4 with exact install/frozen-path recovery commands and status/identity checks to session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
 ## Surprises & Discoveries
 
@@ -34,7 +34,7 @@ Runtime campaign issues #40 and #41 show that generated dispatch can change a mu
 
 Local validation complete: all 213 tests pass (194 library, four campaign, three edited, nine engine, three schema), with two existing ignored. Clippy across all targets and formatting pass. The real CLI regression compiles struct/scalar/generic v mutants, demonstrates intended-value MISSED results instead of selector-based false kills, restores lost per-patch notes, adds a repaired candidate while retaining the genuine old Unviable, and verifies full catalog/map/ID/capture-timestamp preservation after repeated rebuilds. Invalid recovery patches leave existing statuses untouched.
 
-A counterfactual check temporarily used the old production dispatcher from f90439c for only this tiny CLI regression. It fails with E0610 and an extra false Unviable, proving the regression catches the reported bug. Fixed source was restored in a finally block before the successful full suite. No Bifrost code/state or mbx policy was modified. Push, CI and install/rebuild handoff remain. No engine repository, mbx settings, target layout, selection policy or cloud changes are in scope.
+A counterfactual check temporarily used the old production dispatcher from f90439c for only this tiny CLI regression. It fails with E0610 and an extra false Unviable, proving the regression catches the reported bug. Fixed source was restored in a finally block before the successful full suite. No Bifrost code/state or mbx policy was modified. The complete implementation is pushed at d2ed5d2ee4138762cece4bd02ece9d5164c4d7c4. CI run 41693120912 passed both jobs. Issues #40/#41 are closed, and the exact combined note-repair/candidate/rebuild procedure was handed off. No required work remains in this batch. No engine repository, mbx settings, target layout, selection policy or cloud changes are in scope.
 
 ## Context and Orientation
 
@@ -79,3 +79,5 @@ Revision note: Expanded recovery to explicit patch/intents repair before rebuild
 Validation logs: `/mnt/optane/tmp/qs40-all-tests.log`, `/mnt/optane/tmp/qs40-clippy.log`, `/mnt/optane/tmp/qs40-campaign.log`, and the expected failing `/mnt/optane/tmp/qs40-old-dispatch-regression.log`. The latter is intentional evidence, not an unresolved current test failure.
 
 Revision note: Completed operational recovery documentation and full validation, including a failing old-dispatcher control and a passing fixed-code full suite. Ready for pushed-head/CI handoff.
+
+Completion note: https://github.com/BrokkAi/quicksilver/actions/runs/41693120912 is green for the tested executable head d2ed5d2ee4138762cece4bd02ece9d5164c4d7c4. Answered the separate feature-selection capability question: no supported consistent QS interface currently exists; the reporter will file separately. This final checkpoint changes plan metadata only.
