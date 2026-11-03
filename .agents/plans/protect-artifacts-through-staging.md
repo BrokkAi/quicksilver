@@ -11,7 +11,7 @@ A successful mutant build must leave usable staged test binaries even if mbx col
 - [x] (2026-11-03) Read both issues and current QS/mbx sources; origin/master matches efe4b09 and the checkout is clean.
 - [x] (2026-11-03) Implement protected Cargo/staging handshake, shared snapshot ownership, original artifact filenames/mtime, and durable first/final-stage failure records.
 - [x] (2026-11-03) Implement exact catalog-backed baseline skip filtering, preserving package/profile filters and supporting an intentionally empty baseline.
-- [ ] Add deterministic lifetime, cleanup and baseline-policy regressions; run full suites/lint.
+- [x] (2026-11-03) Deterministic lifetime, copy-failure cleanup, snapshot fingerprint ordering, real baseline-policy and same-state retry regressions pass; full suites/lint/format pass.
 - [ ] Commit/push, verify CI and deliver tested install head to the paused campaign.
 
 ## Surprises & Discoveries
@@ -32,7 +32,9 @@ mbx 1.28 holds a target usage lease for its wrapped command, but its low-level V
 
 ## Outcomes & Retrospective
 
-Implementation checkpoint: 191 active library tests pass (two existing ignored); the three campaign tests pass, including marker-based baseline skip execution checks and fault-injected copy failure with same-state retry. Full-suite/lint/CI validation remains. No mbx/engine repository changes or cloud launches are in scope.
+Local validation complete: `nice -n 10 mbx test --tests` passed 192 library tests and 18 integrations (three campaign, three edited, nine engine, three schema), for 210 passed and two existing ignored. `mbx clippy --all-targets -- -D warnings`, `cargo fmt --check` and `git diff --check` passed. Full suites exercise real mbx map/shared/direct/built-in builds with the helper. A deterministic collector cannot take the exclusive lease after simulated Cargo exit until copying is acknowledged; removing the original target afterward leaves the snapshots usable. Fault injection proves a copy error releases the helper, removes partial snapshots, saves Cargo/path diagnostics, keeps the captured mutant Pending with the same ID/intent, and permits a no-recapture retry. Baseline marker regressions verify skipped seed and extra tests never execute, same-named tests in other binaries remain selected, workspace/all-skipped baselines work, and an unskipped seed failure still blocks mapping.
+
+Implementation and local validation are complete. Push, CI and install-head handoff remain. No mbx/engine repository changes or cloud launches are in scope.
 
 ## Context and Orientation
 
@@ -67,3 +69,7 @@ Use existing libc, serde_json, reflink-copy and standard library process/filesys
 Revision note: Initial implementation plan for the requested #39/#35 between-crate batch.
 
 Checkpoint note: First copy happens before the acknowledgment releases mbx. Real compiler PATH omits the temporary plugin discovery directory, avoiding changed build-script PATH fingerprints. Final staging refuses to scan unprotected targets when Cargo reported no harnesses. Fault injection preserves the captured mutant ID/intent as Pending and succeeds on retry without recapture.
+
+Validation artifacts: `/mnt/optane/tmp/qs39-all-tests.log`, `/mnt/optane/tmp/qs39-clippy.log`, `/mnt/optane/tmp/qs39-lifetime.log`, and `/mnt/optane/tmp/qs39-campaign.log`. Intentional FAIL/TIMEOUT fixture output is part of the successful policy tests. Initial sandboxed library execution hit the existing Unix socket restriction; unrestricted test runs passed.
+
+Revision note: Recorded complete local validation, documented protected copying and diagnostics, and confirmed no source/cache/layout/GC changes in other repositories. Ready for pushed-head/CI handoff.

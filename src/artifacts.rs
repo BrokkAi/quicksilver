@@ -350,6 +350,58 @@ test "$acknowledgment" = staged || exit 3
     }
 
     #[test]
+    fn snapshots_keep_fingerprint_order_and_reject_unprotected_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("target");
+        fs::create_dir_all(target.join("debug/deps")).unwrap();
+        let newer = target.join("tool-1111111111111111");
+        let older = target.join("tool-2222222222222222");
+        fs::write(&newer, "newer").unwrap();
+        fs::write(&older, "older").unwrap();
+        for (file, seconds) in [(&newer, 200), (&older, 100)] {
+            fs::File::open(file)
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+                .unwrap();
+        }
+        let copies = ArtifactCopies::new(tmp.path()).unwrap();
+        let mut exes = vec![
+            crate::cargo_cmd::BuiltExe {
+                path: newer,
+                manifest_dir: None,
+                artifacts: None,
+            },
+            crate::cargo_cmd::BuiltExe {
+                path: older,
+                manifest_dir: None,
+                artifacts: None,
+            },
+        ];
+        copies.copy(&mut exes).unwrap();
+        let mut test = crate::types::TestInfo {
+            id: "p::test".into(),
+            name: "test".into(),
+            package: "p".into(),
+            binary_id: "p".into(),
+            binary_name: "tool".into(),
+            binary_rel: "debug/deps/tool-0000000000000000".into(),
+            cwd_rel: "".into(),
+            duration_secs: 0.1,
+            cpu_secs: None,
+        };
+        let resolved = crate::exec::build::resolve_binary(&target, &test, &exes).unwrap();
+        assert_eq!(
+            fs::read_to_string(resolved).unwrap(),
+            "newer",
+            "copy order must not choose an older fingerprint"
+        );
+        let ghost = "debug/deps/ghost-0000000000000000";
+        fs::write(target.join(ghost), "stale").unwrap();
+        test.binary_rel = ghost.into();
+        assert!(crate::exec::build::resolve_binary(&target, &test, &exes).is_err());
+    }
+
+    #[test]
     fn copy_error_releases_command_and_removes_partial_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("target");

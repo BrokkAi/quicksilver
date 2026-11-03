@@ -255,6 +255,20 @@ bound". Survivors are shown with their note.
 - When a duplicate of an already captured mutant brings a note, it fills a
   missing note but never replaces one; `build` says which happened.
 
+### Build artifacts
+
+Quicksilver keeps the ordinary mbx build command alive until it has copied
+Cargo's reported test harnesses into QS-owned storage. Final staging uses
+those copies, so collection of the original target after the command ends
+cannot remove a binary that still needs staging. The copies are released
+when no build/staging result uses them. This uses normal mbx scheduling,
+target placement and collection settings.
+
+A staging error stops the build and writes details to
+`<QS index>/last-staging-failure.json`, including paths and Cargo output for
+a protected-copy failure. Captured mutants remain available; retry `build
+--no-capture` to compile the existing pending state without reading new edits.
+
 ### Long test runs
 
 Each mutant runs only the tests that entered the functions it changed,
@@ -478,9 +492,10 @@ switches slow down, can be left out by its id (globs allowed):
 skip-tests = ["my_crate::suite::*::indexes_in_linear_time"]
 ```
 
-`map` and `run` never run it themselves, and count it as left out, not as
-failing. The baseline `cargo nextest run` at the start still runs it, but
-its failure does not stop quicksilver.
+The baseline and schema recording both exclude these tests before execution.
+Quicksilver matches the globs against full catalog IDs, so a same-named test
+in a different binary remains eligible. Skipped tests count as left out,
+not as baseline failures or not green. An all-skipped baseline is valid.
 
 ### Test budgets
 
