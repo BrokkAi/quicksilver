@@ -13,7 +13,7 @@ Issue #42 needs mutation campaigns for code behind Cargo features, including opt
 - [x] (2026-11-03) Real optional dependency/required-feature binary passed default, enabled, rebuild, mismatched replay, no-default, all-features and remap invalidation checks.
 - [x] (2026-11-03) Full local suite: 216 passed, two existing ignores; formatting and Clippy passed. First implementation head 4665522 passed CI run 41696728386.
 - [x] (2026-11-03) Final format protection: new maps use v8; new tool accepts default-only v7 runtime maps. Library 196 passed/two ignored and campaign five passed again; Clippy/fmt passed.
-- [ ] Push final format-protection head, verify its CI and send install handoff.
+- [x] (2026-11-03) Pushed final executable head fbf805f160be959691d3d35d7d9a7a7ed06190b2; CI 41697489540 passed both unit/lint and integration jobs. Ready for campaign install handoff.
 
 ## Surprises & Discoveries
 
@@ -36,7 +36,7 @@ Discovery walks source modules with syn and intentionally leaves feature predica
 
 ## Outcomes & Retrospective
 
-Feature selection is implemented and locally validated end to end. The full suite passed 216 tests with two existing ignores; initial CI was green. Final version-compatibility checks passed as well. CI and install handoff of the final format-protection head remain. Runtime instrumentation fixes, mbx, targets, profiles and engine sources are unchanged.
+Feature selection is implemented and locally validated end to end. The full suite passed 216 tests with two existing ignores; initial CI was green. Final version-compatibility checks passed as well. Final head fbf805f passed CI run 41697489540, including every integration suite, and is ready for the campaign install handoff. Runtime instrumentation fixes, mbx, targets, profiles and engine sources are unchanged.
 
 ## Context and Orientation
 
@@ -69,3 +69,5 @@ Plan created 2026-11-03 after tracing command and persistence boundaries.
 Updated 2026-11-03 after implementation and initial real CLI evidence; full tests and lint are running.
 
 Updated 2026-11-03 with real CLI/full-suite evidence and the downgrade-protection decision. The format-load unit fixture needed only an index directory; it now creates that directly rather than asking for a real git worktree.
+
+Completed 2026-11-03 after independently checking CI head SHA and both job conclusions. Exact install handoff uses executable head fbf805f; this final plan update changes no executable source.
