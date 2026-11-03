@@ -768,7 +768,7 @@ fn build_map_with_failures(
     let originals = read_originals(&worker, &commit, &cfg.prefix, &map_sites, &crate_roots)?;
     let sites: Vec<Site> = map_sites.iter().map(identity_site).collect();
     let test_packages = crate::cargo_cmd::test_packages(cfg, &meta);
-    let isolated = isolate_all(
+    let mut isolated = isolate_all(
         cfg,
         &worker,
         &test_packages,
@@ -803,6 +803,7 @@ fn build_map_with_failures(
         &test_refs,
         &isolated.executables,
     )?;
+    isolated.executables.clear();
     let planned = all_tests_planned(&listed);
     null_schema_gate(cfg, &run_dir, &worker, std::slice::from_ref(&planned))?;
 
@@ -1373,7 +1374,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         &map.crate_roots,
     )?;
     let all_sites: Vec<Site> = sites.into_values().collect();
-    let isolated = isolate_all(
+    let mut isolated = isolate_all(
         cfg,
         &map.worker,
         &map.test_packages,
@@ -1418,6 +1419,7 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         &union_refs,
         &isolated.executables,
     )?;
+    isolated.executables.clear();
     if !union.is_empty() {
         null_schema_gate(cfg, &run_dir, &map.worker, &[all_tests_planned(&union)])?;
     }

@@ -260,8 +260,8 @@ bound". Survivors are shown with their note.
 Quicksilver keeps the ordinary mbx build command alive until it has copied
 Cargo's reported test harnesses into QS-owned storage. Final staging uses
 those copies, so collection of the original target after the command ends
-cannot remove a binary that still needs staging. The copies are released
-when no build/staging result uses them. This uses normal mbx scheduling,
+cannot remove a binary that still needs staging. The temporary copies are released
+as soon as final staging finishes. This uses normal mbx scheduling,
 target placement and collection settings.
 
 A staging error stops the build and writes details to

@@ -344,7 +344,7 @@ fn run_crate(
             break;
         }
         let snap = snapshot_sources(worker, &batch, &crate_root_rel)?;
-        let isolated = isolate(
+        let mut isolated = isolate(
             cfg,
             worker,
             &target,
@@ -373,6 +373,7 @@ fn run_crate(
             &isolated.sites,
             &isolated.executables,
         )?;
+        isolated.executables.clear();
         // Gates, recording and mutant runs all start tests under the worker,
         // which holds this batch's schema source until every mutant of the
         // batch has a verdict.

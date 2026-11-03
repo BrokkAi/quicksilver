@@ -34,7 +34,7 @@ mbx 1.28 holds a target usage lease for its wrapped command, but its low-level V
 
 Local validation complete: `nice -n 10 mbx test --tests` passed 192 library tests and 18 integrations (three campaign, three edited, nine engine, three schema), for 210 passed and two existing ignored. `mbx clippy --all-targets -- -D warnings`, `cargo fmt --check` and `git diff --check` passed. Full suites exercise real mbx map/shared/direct/built-in builds with the helper. A deterministic collector cannot take the exclusive lease after simulated Cargo exit until copying is acknowledged; removing the original target afterward leaves the snapshots usable. Fault injection proves a copy error releases the helper, removes partial snapshots, saves Cargo/path diagnostics, keeps the captured mutant Pending with the same ID/intent, and permits a no-recapture retry. Baseline marker regressions verify skipped seed and extra tests never execute, same-named tests in other binaries remain selected, workspace/all-skipped baselines work, and an unskipped seed failure still blocks mapping.
 
-Implementation and local validation are complete. Push, CI and install-head handoff remain. No mbx/engine repository changes or cloud launches are in scope.
+Implementation and local validation are complete. The initial implementation d4655d1 is pushed, issues #35/#39 are closed, and its CI run 41669371516 passed. The immediate-release follow-up has again passed all 210 tests, Clippy and formatting; its push/CI and final install-head handoff remain. No mbx/engine repository changes or cloud launches are in scope.
 
 ## Context and Orientation
 
@@ -73,3 +73,5 @@ Checkpoint note: First copy happens before the acknowledgment releases mbx. Real
 Validation artifacts: `/mnt/optane/tmp/qs39-all-tests.log`, `/mnt/optane/tmp/qs39-clippy.log`, `/mnt/optane/tmp/qs39-lifetime.log`, and `/mnt/optane/tmp/qs39-campaign.log`. Intentional FAIL/TIMEOUT fixture output is part of the successful policy tests. Initial sandboxed library execution hit the existing Unix socket restriction; unrestricted test runs passed.
 
 Revision note: Recorded complete local validation, documented protected copying and diagnostics, and confirmed no source/cache/layout/GC changes in other repositories. Ready for pushed-head/CI handoff.
+
+Final resource-lifetime note: Clear artifact owners immediately after final staging in map, shared builds and built-in batches, before gates or long test runs. Campaign assertions verify the temporary artifact directory is empty after map/build, while final binaries remain usable. All 210 tests and lint checks passed again after this change.

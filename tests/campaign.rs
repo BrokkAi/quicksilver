@@ -111,6 +111,14 @@ slow-timeout = { period = "10s", terminate-after = 1 }
     );
     let map: SiteMap = serde_json::from_value(json(root, "map-old.json")).unwrap();
     assert_eq!(map.baseline_failures.len(), 2);
+    let paths = support::cfg_for(root).paths();
+    assert!(
+        fs::read_dir(paths.runs.join("artifacts"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "map releases temporary snapshots after final staging"
+    );
     assert!(!map
         .tests
         .iter()
@@ -132,6 +140,13 @@ slow-timeout = { period = "10s", terminate-after = 1 }
     assert_ne!(edited, original);
     fs::write(&lib, edited).unwrap();
     qs(root, &["build", "--json", "build-old.json"], 0);
+    assert!(
+        fs::read_dir(paths.runs.join("artifacts"))
+            .unwrap()
+            .next()
+            .is_none(),
+        "build releases temporary snapshots before test execution"
+    );
     fs::write(&lib, &original).unwrap();
     let tested = qs(root, &["test", "--json", "test-old.json"], 0);
     assert!(String::from_utf8_lossy(&tested.stderr).contains("coverage loss: 2 test(s)"));
