@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const MAP_VERSION: u32 = 7;
+// Version 8 pins Cargo features. Old binaries must refuse its maps instead
+// of ignoring the selection and compiling with defaults. Version 7 maps
+// predate feature selection and remain usable under Cargo defaults.
+pub const MAP_VERSION: u32 = 8;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -125,7 +128,8 @@ impl SiteMap {
         let map: SiteMap =
             serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
         anyhow::ensure!(
-            map.version == MAP_VERSION,
+            map.version == MAP_VERSION
+                || (map.version == 7 && map.cargo_features == Default::default()),
             "{} is map version {}, this build reads {}; run `cargo quicksilver map` again",
             p.display(),
             map.version,

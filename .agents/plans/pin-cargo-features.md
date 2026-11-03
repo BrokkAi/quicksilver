@@ -10,8 +10,10 @@ Issue #42 needs mutation campaigns for code behind Cargo features, including opt
 
 - [x] (2026-11-03) Inspect issue and Cargo/nextest/metadata/build/state boundaries.
 - [x] (2026-11-03) Implement shared selection, forwarding, persistence and mismatch validation.
-- [ ] Exercise optional dependency and feature-gated function/test through real CLI (confirmed coverage, kill, rebuild and mismatch rejection; remaining final no-default/all-features pass).
-- [ ] Run checks, commit, push, verify CI and hand off exact head.
+- [x] (2026-11-03) Real optional dependency/required-feature binary passed default, enabled, rebuild, mismatched replay, no-default, all-features and remap invalidation checks.
+- [x] (2026-11-03) Full local suite: 216 passed, two existing ignores; formatting and Clippy passed. First implementation head 4665522 passed CI run 41696728386.
+- [x] (2026-11-03) Final format protection: new maps use v8; new tool accepts default-only v7 runtime maps. Library 196 passed/two ignored and campaign five passed again; Clippy/fmt passed.
+- [ ] Push final format-protection head, verify its CI and send install handoff.
 
 ## Surprises & Discoveries
 
@@ -28,9 +30,13 @@ Discovery walks source modules with syn and intentionally leaves feature predica
   Rationale: Tests, optional dependencies and type checking change with features; no old verdict is trustworthy under another selection.
   Date/Author: 2026-11-03 Codex.
 
+- Decision: Write map format version 8 and accept legacy version 7 only with default feature settings.
+  Rationale: Previous binaries ignore unknown JSON fields; a version bump makes them refuse new feature maps instead of compiling defaults. The current tool still reads the runtime campaign's original v7 map without remapping.
+  Date/Author: 2026-11-03 Codex.
+
 ## Outcomes & Retrospective
 
-Implementation and validation pending. Runtime instrumentation fixes remain unchanged; this work does not change mbx, targets, profiles or engine sources.
+Feature selection is implemented and locally validated end to end. The full suite passed 216 tests with two existing ignores; initial CI was green. Final version-compatibility checks passed as well. CI and install handoff of the final format-protection head remain. Runtime instrumentation fixes, mbx, targets, profiles and engine sources are unchanged.
 
 ## Context and Orientation
 
@@ -61,3 +67,5 @@ Use existing clap, serde and cargo_metadata dependencies. The shared selection e
 Plan created 2026-11-03 after tracing command and persistence boundaries.
 
 Updated 2026-11-03 after implementation and initial real CLI evidence; full tests and lint are running.
+
+Updated 2026-11-03 with real CLI/full-suite evidence and the downgrade-protection decision. The format-load unit fixture needed only an index directory; it now creates that directly rather than asking for a real git worktree.

@@ -2420,8 +2420,28 @@ mod tests {
         // Old map/state JSON has no setting and means Cargo defaults.
         let mut json = serde_json::to_value(&old).unwrap();
         json.as_object_mut().unwrap().remove("cargo_features");
-        let legacy: SiteMap = serde_json::from_value(json).unwrap();
+        let legacy: SiteMap = serde_json::from_value(json.clone()).unwrap();
         assert_eq!(legacy.cargo_features, Default::default());
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tree(&temp.path().join("worktrees"), "", temp.path());
+        std::fs::create_dir_all(&paths.index).unwrap();
+        json["version"] = serde_json::json!(7);
+        crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
+            .unwrap();
+        assert_eq!(
+            SiteMap::load(&paths).unwrap().unwrap().cargo_features,
+            Default::default()
+        );
+        // A feature-bearing map cannot masquerade as the legacy format.
+        json["cargo_features"] = serde_json::to_value(&new.cargo_features).unwrap();
+        crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
+            .unwrap();
+        assert!(SiteMap::load(&paths).is_err());
+        new.save(&paths).unwrap();
+        assert_eq!(
+            SiteMap::load(&paths).unwrap().unwrap().cargo_features,
+            new.cargo_features
+        );
     }
 
     #[test]

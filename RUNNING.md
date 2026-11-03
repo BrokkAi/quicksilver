@@ -507,7 +507,9 @@ a dependency can re-enable a feature even with `--no-default-features`.
 
 The selection reaches metadata, baseline tests, the nextest catalog and all
 schema builds, including `build --rebuild` and the built-in `run` command.
-Map, baseline, build and test JSON record it as `cargo_features`. Build,
+Map, baseline, build and test JSON record it as `cargo_features`. New maps
+use format version 8, which older binaries refuse; existing version 7 maps
+remain readable with their original Cargo defaults. Build,
 rebuild and test reject settings different from the map. To change the
 selection, map again; captured mutants at the same commit are retained but
 all compiled statuses and verdicts, including kills and compile failures,
