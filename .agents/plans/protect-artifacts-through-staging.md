@@ -12,7 +12,7 @@ A successful mutant build must leave usable staged test binaries even if mbx col
 - [x] (2026-11-03) Implement protected Cargo/staging handshake, shared snapshot ownership, original artifact filenames/mtime, and durable first/final-stage failure records.
 - [x] (2026-11-03) Implement exact catalog-backed baseline skip filtering, preserving package/profile filters and supporting an intentionally empty baseline.
 - [x] (2026-11-03) Deterministic lifetime, copy-failure cleanup, snapshot fingerprint ordering, real baseline-policy and same-state retry regressions pass; full suites/lint/format pass.
-- [ ] Commit/push, verify CI and deliver tested install head to the paused campaign.
+- [x] (2026-11-03) Pushed final executable head 5ff60dc6fb3921e39fffe879b9885198eaba90e1, verified CI success, confirmed #35/#39 closure and delivered the exact head/install command to session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
 ## Surprises & Discoveries
 
@@ -34,7 +34,7 @@ mbx 1.28 holds a target usage lease for its wrapped command, but its low-level V
 
 Local validation complete: `nice -n 10 mbx test --tests` passed 192 library tests and 18 integrations (three campaign, three edited, nine engine, three schema), for 210 passed and two existing ignored. `mbx clippy --all-targets -- -D warnings`, `cargo fmt --check` and `git diff --check` passed. Full suites exercise real mbx map/shared/direct/built-in builds with the helper. A deterministic collector cannot take the exclusive lease after simulated Cargo exit until copying is acknowledged; removing the original target afterward leaves the snapshots usable. Fault injection proves a copy error releases the helper, removes partial snapshots, saves Cargo/path diagnostics, keeps the captured mutant Pending with the same ID/intent, and permits a no-recapture retry. Baseline marker regressions verify skipped seed and extra tests never execute, same-named tests in other binaries remain selected, workspace/all-skipped baselines work, and an unskipped seed failure still blocks mapping.
 
-Implementation and local validation are complete. The initial implementation d4655d1 is pushed, issues #35/#39 are closed, and its CI run 41669371516 passed. The immediate-release follow-up has again passed all 210 tests, Clippy and formatting; its push/CI and final install-head handoff remain. No mbx/engine repository changes or cloud launches are in scope.
+The complete implementation is pushed at 5ff60dc6fb3921e39fffe879b9885198eaba90e1. All 210 tests, Clippy and formatting passed, followed by both jobs in CI run 41670556247. Issues #35/#39 are closed. The exact verified head and `mbx install --path . --locked --force` command were sent to the paused campaign session. No required work remains in this batch. No mbx/engine repository changes or cloud launches are in scope.
 
 ## Context and Orientation
 
@@ -75,3 +75,5 @@ Validation artifacts: `/mnt/optane/tmp/qs39-all-tests.log`, `/mnt/optane/tmp/qs3
 Revision note: Recorded complete local validation, documented protected copying and diagnostics, and confirmed no source/cache/layout/GC changes in other repositories. Ready for pushed-head/CI handoff.
 
 Final resource-lifetime note: Clear artifact owners immediately after final staging in map, shared builds and built-in batches, before gates or long test runs. Campaign assertions verify the temporary artifact directory is empty after map/build, while final binaries remain usable. All 210 tests and lint checks passed again after this change.
+
+Completion note: https://github.com/BrokkAi/quicksilver/actions/runs/41670556247 is green for executable head 5ff60dc6fb3921e39fffe879b9885198eaba90e1. This final checkpoint records completion only; no executable code changes after the tested install-head handoff.
