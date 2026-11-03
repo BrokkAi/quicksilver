@@ -512,8 +512,9 @@ Changing targets needs a new map; previous target records and verdicts are
 not reused. Export a catalog before replacing its map and use `--from`
 only with the same source-target selection.
 
-Shared files compiled by the package's library and binaries retain their
-original bodies in unselected contexts: runtime dispatch is inactive there.
+Shared files compiled by other workspace contexts retain their original
+behavior there: runtime dispatch is inactive in unselected library, binary,
+dependency and extra-test contexts.
 Mutant bodies must still compile in every Cargo context using that physical
 source. No source in your checkout is changed by map/build/test.
 
@@ -527,7 +528,7 @@ staged generations without child identity metadata also need a rebuild.
 Explicit production passes currently refuse edited mutants of `impl Trait`
 functions: their direct builds cannot provide the same target isolation as
 schema arms. `apply` and `prove` also refuse a target-isolated mutant whose
-physical source is shared with another target, since a physical edit would
+physical source is shared with another target in the Cargo workspace, since a physical edit would
 change those other contexts too. Use schema build/test for shared source;
 physical `prove` is available for source unique to the selected target.
 

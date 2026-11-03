@@ -97,6 +97,56 @@ impl Selection {
     }
 }
 
+/// Conservatively include workspace dependencies of every built test package.
+/// Metadata without dependency resolution still describes dependency names,
+/// versions and path constraints; disabled optional edges may overinclude a
+/// package, but a compiled shared context must never be omitted.
+fn compiled_packages<'a>(
+    meta: &'a Metadata,
+    cfg: &crate::config::Config,
+) -> Vec<&'a cargo_metadata::Package> {
+    let workspace = meta.workspace_packages();
+    let seeds = crate::cargo_cmd::test_packages(cfg, meta);
+    if seeds.is_empty() {
+        return workspace;
+    }
+    let mut included: std::collections::BTreeSet<String> = seeds.into_iter().collect();
+    loop {
+        let mut next = included.clone();
+        for pkg in &workspace {
+            if !included.contains(pkg.name.as_str()) {
+                continue;
+            }
+            for dependency in &pkg.dependencies {
+                for candidate in &workspace {
+                    if dependency.name == candidate.name.as_str()
+                        && dependency.req.matches(&candidate.version)
+                    {
+                        let path_matches = dependency.path.as_ref().is_none_or(|p| {
+                            p.as_std_path().canonicalize().ok()
+                                == candidate
+                                    .manifest_path
+                                    .parent()
+                                    .and_then(|p| p.as_std_path().canonicalize().ok())
+                        });
+                        if path_matches {
+                            next.insert(candidate.name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        if next == included {
+            break;
+        }
+        included = next;
+    }
+    workspace
+        .into_iter()
+        .filter(|p| included.contains(p.name.as_str()))
+        .collect()
+}
+
 /// Other crate roots that compile an edited physical source need an inactive
 /// dispatch stub. Their original function bodies remain unchanged.
 pub fn inactive_roots(
@@ -109,11 +159,7 @@ pub fn inactive_roots(
         return Ok(Vec::new());
     }
     let meta = crate::cargo_cmd::load_metadata_with_features(root, &cfg.cargo_features)?;
-    let pkg = meta
-        .workspace_packages()
-        .into_iter()
-        .find(|p| p.name.as_str() == cfg.packages[0])
-        .context("selected package metadata")?;
+    let packages = compiled_packages(&meta, cfg);
     let selected = selected.canonicalize()?;
     let sources: std::collections::BTreeSet<_> = sources
         .iter()
@@ -123,14 +169,7 @@ pub fn inactive_roots(
     let top = repo.toplevel.canonicalize()?;
     let tracked = crate::worktree::tracked_paths(&repo)?;
     let mut roots = std::collections::BTreeSet::new();
-    for target in &pkg.targets {
-        if target
-            .kind
-            .iter()
-            .any(|k| matches!(k.to_string().as_str(), "custom-build" | "proc-macro"))
-        {
-            continue;
-        }
+    for target in packages.iter().flat_map(|p| &p.targets) {
         let path = target.src_path.as_std_path().canonicalize()?;
         if path == selected {
             continue;
@@ -210,8 +249,8 @@ pub fn apply_schema(
     let sources: Vec<_> = sites.iter().map(|s| root.join(&s.path)).collect();
     for extra in inactive_roots(root, cfg, selected, &sources)? {
         let mut source = std::fs::read_to_string(&extra)?;
-        if !source.contains("pub mod __qs_rt") {
-            source.push_str("\n#[doc(hidden)] #[allow(dead_code)] pub mod __qs_rt { #[inline(always)] pub fn active(_: u32) -> Option<u32> { None } }\n");
+        if !source.contains("mod __qs_rt") {
+            source.push_str("\n#[doc(hidden)] #[allow(dead_code)] mod __qs_rt { #[inline(always)] pub fn active(_: u32) -> Option<u32> { None } }\n");
             std::fs::write(extra, source)?;
         }
     }
@@ -259,27 +298,25 @@ pub fn require_physical_target(
         .mutation_target
         .target(&meta, &cfg.packages[0])?
         .context("selected target")?;
-    let pkg = meta
-        .workspace_packages()
-        .into_iter()
-        .find(|p| p.name.as_str() == cfg.packages[0])
-        .context("selected package")?;
+
     let sources: std::collections::BTreeSet<_> = mutant
         .edits
         .iter()
         .map(|e| cfg.repo_root.join(&e.path).canonicalize())
         .collect::<std::io::Result<_>>()?;
-    for other in &pkg.targets {
-        if std::ptr::eq(other, selected)
-            || other.kind.iter().any(|k| k.to_string() == "custom-build")
-        {
+    for (package, other) in meta
+        .workspace_packages()
+        .into_iter()
+        .flat_map(|p| p.targets.iter().map(move |t| (p, t)))
+    {
+        if std::ptr::eq(other, selected) {
             continue;
         }
         if crate::scan::scan_crate(&other.name.replace('-', "_"), other.src_path.as_std_path())?
             .iter()
             .any(|f| sources.contains(&f.path))
         {
-            bail!("target-isolated mutant shares source with target {}; physical apply/prove would change other compilation contexts, so use build/test for this mutant", other.name);
+            bail!("target-isolated mutant shares source with target {} in package {}; physical apply/prove would change other compilation contexts, so use build/test for this mutant", other.name, package.name);
         }
     }
     Ok(())

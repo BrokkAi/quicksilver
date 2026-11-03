@@ -16,9 +16,12 @@ Issue #44 needs explicit source-target selection in mixed library/multi-binary p
 - [x] (2026-11-03) Mixed lib/two-bin required-feature CLI campaign passed entered/caught, capture/rebuild/fresh replay, root/ID, mismatch and missing-child refusal checks.
 - [x] (2026-11-03) Initial full suite passed 222 tests/two existing ignores. Final hyphenated-binary campaign passed schema and built-in run, bare-manifest argv, proof-context and opaque-return refusal checks. Final lint/full-head checks and review remain.
 - [x] (2026-11-03) Reproduced #45 with --manifest-path Cargo.toml from its directory (ENOENT); normalized empty parent to current directory and applied that argv to the real CLI campaign.
-- [ ] Finish local checks, commit, request review, push, verify exact CI head and hand off.
+- [x] (2026-11-03) Full committed-head suite passed 222 tests/two existing ignores, fmt and Clippy. First review of 62334c5 found the cross-package support gap; expanded dependency/extra-test regression failed before correction and passed afterward with Clippy clean.
+- [ ] Commit review correction, obtain clean review, push, verify exact CI head and hand off.
 
 ## Surprises & Discoveries
+
+Both first reviewers identified the same cross-package gap: only selected-package roots received inactive support. A real dependency/extra-test package using the shared file reproduced the missing site before correction (the selected common function was dropped after its prologue could not compile in the consumer). Runtime support now conservatively follows workspace dependencies of all test packages; physical proof checks all workspace targets. Inactive modules are private so proc-macro support roots can also compile them. The expanded CLI case passed with consumer contexts unchanged and binary-unit coverage recorded.
 
 Tests using env!("CARGO_BIN_EXE_name") embed Cargo's absolute output path. Copying the test harness does not redirect this child. The existing protected build copies only test harnesses. The new path needs an ordinary mbx command lifetime while child processes run, plus saved executable content identity. Do not rewrite test source, inject a new rustc wrapper, patch executable strings, change target directories, or overwrite Cargo outputs to hide this boundary.
 
@@ -79,3 +82,5 @@ Plan created 2026-11-03 after investigation and the separate confirmed apply ali
 Updated 2026-11-03 after real CLI/lease/source-context evidence and the confirmed #45 argv normalization control. The separate alias fix 1381ccd passed clean review and CI run 41703957226 and is already on origin/master.
 
 Updated 2026-11-03 with final hyphenated CARGO_BIN_EXE coverage, real mbx-clean-under-lease evidence, child/target refusal checks and the small #45 manifest normalization regression. Explicit binary presence is checked by target name and owning package manifest, so another package cannot satisfy a missing required-feature binary.
+
+Updated 2026-11-03 after both reviewers findings and the reproduced cross-package failure. The corrected real fixture also verifies bin-unit coverage and refuses a physical edit shared only with another workspace package. No findings were overridden.

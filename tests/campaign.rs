@@ -1251,12 +1251,13 @@ name = "mixed"
 version = "0.1.0"
 edition = "2021"
 [workspace]
-members = ["optional-helper"]
+members = ["optional-helper", "consumer"]
 [features]
 default = []
 tooling = ["dep:optional_helper"]
 [dependencies]
 optional_helper = { path = "optional-helper", optional = true }
+consumer = { path = "consumer" }
 [lib]
 path = "src/lib.rs"
 [[bin]]
@@ -1282,12 +1283,25 @@ required-features = ["tooling"]
         "pub fn offset() -> u32 { 0 }\n",
     )
     .unwrap();
+    fs::create_dir_all(root.join("consumer/src")).unwrap();
+    fs::write(
+        root.join("consumer/Cargo.toml"),
+        "[package]\nname='consumer'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(root.join("consumer/src/lib.rs"), "#[path=\"../../src/common.rs\"] mod common; #[path=\"../../src/dependency_shared.rs\"] mod dependency_shared; pub fn consumer_answer() -> u32 { common::answer() + dependency_shared::helper() } #[cfg(test)] mod tests { #[test] fn original_context() { assert_eq!(super::consumer_answer(), 42); } }\n").unwrap();
+    fs::write(
+        root.join("src/dependency_shared.rs"),
+        "pub fn helper() -> u32 { 0 }\n",
+    )
+    .unwrap();
     let library = "mod common; pub fn library_answer() -> u32 { common::answer() }\n";
     let viewer = "mod common; fn main() { println!(\"{}\", common::answer()); }\n";
-    let author = "mod common; fn author_only() -> u32 { optional_helper::offset() } fn opaque() -> impl std::fmt::Debug { 42u32 } fn main() { println!(\"{}\", common::answer() + author_only()); }\n";
+    let author = "mod common; mod dependency_shared; fn author_only() -> u32 { optional_helper::offset() + consumer::consumer_answer() - 42 + dependency_shared::helper() } fn opaque() -> impl std::fmt::Debug { 42u32 } fn main() { println!(\"{}\", common::answer() + author_only()); }\n";
     let common = "pub fn answer() -> u32 { 42 }\n";
     fs::write(root.join("src/lib.rs"), library).unwrap();
     fs::write(root.join("src/viewer.rs"), viewer).unwrap();
+    let author = &(author.to_owned() + "#[cfg(test)] mod tests { #[test] fn bin_unit_context() { assert_eq!(super::author_only(), 0); } }\n");
     fs::write(root.join("src/author.rs"), author).unwrap();
     fs::write(root.join("src/common.rs"), common).unwrap();
     fs::write(root.join("tests/cli.rs"), r#"
@@ -1321,6 +1335,7 @@ fn authoring_cli() {
             "src",
             "tests/cli.rs",
             "optional-helper",
+            "consumer",
         ],
     );
     git(
@@ -1340,6 +1355,8 @@ fn authoring_cli() {
                 "Cargo.toml",
                 "-p",
                 "mixed",
+                "--extra-tests",
+                "consumer",
             ])
             .args(args)
             .output()
@@ -1387,6 +1404,20 @@ fn authoring_cli() {
         .find(|s| s.fqn == "mixed::bin::author-cli.common.answer")
         .unwrap();
     let selected_id = selected.site_id;
+    assert!(!map
+        .tests_entering(&[selected_id])
+        .iter()
+        .any(|t| t.package == "consumer"));
+    let unit_site = map
+        .sites
+        .iter()
+        .find(|s| s.fqn == "mixed::bin::author-cli.author_only")
+        .unwrap();
+    assert!(map
+        .tests_entering(&[unit_site.site_id])
+        .iter()
+        .any(|t| t.binary_id == "mixed::bin/author-cli"));
+
     assert!(map
         .tests_entering(&[selected_id])
         .iter()
@@ -1538,7 +1569,27 @@ fn authoring_cli() {
     );
     assert_eq!(
         fs::read_to_string(root.join("src/author.rs")).unwrap(),
-        author
+        author.as_str()
+    );
+    tool(&["map"], 0);
+    State::default().save(&paths).unwrap();
+    fs::write(
+        root.join("src/dependency_shared.rs"),
+        "pub fn helper() -> u32 { 1 }\n",
+    )
+    .unwrap();
+    tool(&["build", "--json", "dependency-shared-built.json"], 0);
+    fs::write(
+        root.join("src/dependency_shared.rs"),
+        "pub fn helper() -> u32 { 0 }\n",
+    )
+    .unwrap();
+    let shared: State = serde_json::from_value(json(root, "dependency-shared-built.json")).unwrap();
+    let refused = tool(&["apply", &shared.records[0].mutant.id], 2);
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("consumer"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/dependency_shared.rs")).unwrap(),
+        "pub fn helper() -> u32 { 0 }\n"
     );
     tool(
         &[
