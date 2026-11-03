@@ -242,6 +242,7 @@ pub(crate) fn build(
     cmd.args(["quicksilver", "__cargo-build", "--helper-bin"])
         .arg(&bin);
     cmd.args(["--", "build", "--tests", "--message-format=json"]);
+    cfg.cargo_features.apply(&mut cmd);
     crate::cargo_cmd::apply_package_select(&mut cmd, packages);
     crate::scratch::check_free_space(&copies.dir, cfg.max_scratch)?;
     let start = std::time::Instant::now();

@@ -311,7 +311,9 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
         "{}",
         crate::types::baseline_failure_summary(&map.baseline_failures)
     );
-    let state = State::load(&paths)?;
+    map.cargo_features.require_match(&cfg.cargo_features)?;
+    let mut state = State::load(&paths)?;
+    state.reconcile(&map);
     let files = crate::discover::file_globset(&cfg.files)?;
     let records = collect(
         &map,

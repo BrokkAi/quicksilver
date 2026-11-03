@@ -43,6 +43,8 @@ pub struct MapSite {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteMap {
+    #[serde(default)]
+    pub cargo_features: crate::features::CargoFeatures,
     pub version: u32,
     /// Random per `map` run. The mutant state records which map it was built
     /// against, so a new map invalidates old `Built` records.
@@ -696,6 +698,7 @@ mod tests {
             cpu_secs: None,
         };
         let map = SiteMap {
+            cargo_features: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),
             commit: String::new(),
@@ -759,6 +762,7 @@ mod tests {
             cpu_secs: None,
         };
         let mut map = SiteMap {
+            cargo_features: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),
             commit: String::new(),

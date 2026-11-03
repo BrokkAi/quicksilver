@@ -9,6 +9,7 @@ pub mod config;
 pub mod discover;
 pub mod engine;
 pub mod exec;
+pub mod features;
 pub mod index;
 pub mod linediff;
 pub mod locate;
@@ -229,6 +230,7 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
     let (cfg, _) = engine::config_from_cli(common, ConfigExtras::default())?;
     let head = worktree::head(&cfg.repo_root)?;
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
+    map.cargo_features.require_match(&cfg.cargo_features)?;
     if args.not_green {
         print!("{}", not_green_report(&map));
         eprintln!(
@@ -393,6 +395,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
         let report = serde_json::json!({
             "commit": map.as_ref().map(|m| m.commit.clone()),
             "target": map.as_ref().map(|m| m.target.clone()),
+            "cargo_features": state.cargo_features,
             "baseline_failures": map.as_ref().map(|m| &m.baseline_failures),
             "mutants": rows,
         });

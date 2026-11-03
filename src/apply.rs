@@ -301,6 +301,7 @@ pub fn run_prove(common: &CommonOpts, args: ProveArgs) -> Result<i32> {
         let (cfg, _) = crate::engine::config_from_cli(common, ConfigExtras::default())?;
         require_checkout(&cfg.repo_root, &cfg.worktree_root)?;
         let state = State::load(&cfg.paths())?;
+        state.cargo_features.require_match(&cfg.cargo_features)?;
         let mutant = resolve_mutant(&state, &args.id)?;
         prove(
             &cfg.repo_root,

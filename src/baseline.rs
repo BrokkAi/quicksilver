@@ -1,5 +1,5 @@
 use crate::cargo_cmd::{
-    apply_build_env, count_compiling_units, dump_metadata_json, load_metadata, nextest_available,
+    apply_build_env, count_compiling_units, dump_metadata_json, nextest_available,
     write_nextest_config, BuildResult,
 };
 use crate::config::Config;
@@ -31,7 +31,7 @@ pub fn checkout_main(cfg: &Config, paths: &Paths) -> Result<String> {
 
 pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_metadata::Metadata> {
     checkout_main(cfg, paths)?;
-    let meta = load_metadata(&paths.baseline)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     dump_metadata_json(paths, &meta)?;
     Ok(meta)
 }
@@ -39,7 +39,7 @@ pub fn materialize_and_metadata(cfg: &Config, paths: &Paths) -> Result<cargo_met
 pub fn build_baseline(cfg: &Config, paths: &Paths) -> Result<BuildResult> {
     let target = paths.baseline.join("target");
     info!("baseline cargo build --tests");
-    let meta = load_metadata(&paths.baseline)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     let packages = crate::cargo_cmd::test_packages(cfg, &meta);
     crate::cargo_cmd::build_tests(&paths.baseline, &target, cfg, &packages, false)
 }
@@ -52,7 +52,7 @@ pub fn run_green_suite(
         bail!("cargo nextest is required. Install it with: cargo install cargo-nextest");
     }
     let config_path = write_nextest_config(&paths.index, &paths.baseline, &cfg.nextest_profile)?;
-    let meta = load_metadata(&paths.baseline)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     // Resolve QS globs against concrete IDs instead of approximating their
     // semantics in nextest's DSL. Listing builds/runs no test bodies.
     let catalog = if cfg.skip_tests.is_empty() {
@@ -75,6 +75,7 @@ pub fn run_green_suite(
         cmd.current_dir(&paths.baseline);
         apply_build_env(&mut cmd, cfg);
         cmd.args(["nextest", "run"]);
+        cfg.cargo_features.apply(&mut cmd);
         cmd.args(["--profile", &cfg.nextest_profile]);
         cmd.arg("--config-file").arg(&config_path);
         crate::cargo_cmd::apply_package_select(
@@ -396,6 +397,7 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
     // build script can relink a *different* crate; scoping
     // to the mutant package misses the cascade this preflight exists to catch.
     cmd.args(["build", "--tests", "-v"]);
+    cfg.cargo_features.apply(&mut cmd);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let output = cmd.output().context("preflight rebuild")?;
@@ -409,8 +411,15 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
 /// script that hashes sources is what preflight looks for, so an edit to any
 /// of these measures again; an edit to ordinary source does not.
 pub fn preflight_key(root: &Path) -> Result<String> {
+    preflight_key_with_features(root, &Default::default())
+}
+
+pub fn preflight_key_with_features(
+    root: &Path,
+    features: &crate::features::CargoFeatures,
+) -> Result<String> {
     use sha2::Digest;
-    let meta = crate::cargo_cmd::load_metadata(root)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(root, features)?;
     let mut files: Vec<std::path::PathBuf> = vec![
         root.join("Cargo.lock"),
         root.join(".cargo").join("config.toml"),
@@ -426,6 +435,7 @@ pub fn preflight_key(root: &Path) -> Result<String> {
     files.sort();
     files.dedup();
     let mut h = sha2::Sha256::new();
+    h.update(serde_json::to_vec(features)?);
     for f in files {
         let rel = f.strip_prefix(root).unwrap_or(&f);
         h.update(crate::util::rel_slash(rel).as_bytes());
@@ -479,7 +489,7 @@ pub fn load_baseline_report(paths: &Paths) -> Result<Option<BaselineReport>> {
 /// The earlier failures are dropped, because they describe another commit.
 pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<BaselineReport> {
     if let Some(mut earlier) = load_baseline_report(paths)? {
-        if !earlier.tests.is_empty() {
+        if !earlier.tests.is_empty() && earlier.cargo_features == cfg.cargo_features {
             let _meta = materialize_and_metadata(cfg, paths)?;
             info!(
                 "sites selection: reusing {} test durations from an earlier run; no baseline build or suite run",
@@ -497,10 +507,13 @@ pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<B
 pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<BaselineReport> {
     let _meta = materialize_and_metadata(cfg, paths)?;
     if skip {
-        if let Some(existing) = load_baseline_report(paths)? {
+        if let Some(existing) =
+            load_baseline_report(paths)?.filter(|r| r.cargo_features == cfg.cargo_features)
+        {
             return Ok(existing);
         }
         return Ok(BaselineReport {
+            cargo_features: cfg.cargo_features.clone(),
             suite_secs: 0.0,
             tests: Vec::new(),
             package_costs: Vec::new(),
@@ -512,6 +525,7 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     build_baseline(cfg, paths)?;
     let (suite_secs, tests, failures) = run_green_suite(cfg, paths)?;
     let report = BaselineReport {
+        cargo_features: cfg.cargo_features.clone(),
         suite_secs,
         tests,
         package_costs: Vec::new(),

@@ -9,6 +9,8 @@ use std::time::Duration;
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
+    #[serde(default)]
+    pub cargo: crate::features::CargoFeatures,
     #[serde(rename = "build-jobs")]
     pub build_jobs: Option<usize>,
     #[serde(rename = "test-jobs")]
@@ -68,6 +70,7 @@ pub struct SandboxFile {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub cargo_features: crate::features::CargoFeatures,
     pub repo_root: PathBuf,
     /// `<git common dir>/quicksilver`: where QS's worktrees live.
     pub worktree_root: PathBuf,
@@ -162,6 +165,17 @@ pub fn merge_config(
         .unwrap_or_else(|| default_build_jobs(max_build_memory_frac));
     let test_jobs = cli.test_jobs.or(file.test_jobs).unwrap_or_else(nproc);
     let build_env = file.build_env;
+    let mut cargo_features =
+        if !cli.features.is_empty() || cli.all_features || cli.no_default_features {
+            crate::features::CargoFeatures {
+                features: cli.features.clone(),
+                all_features: cli.all_features,
+                no_default_features: cli.no_default_features,
+            }
+        } else {
+            file.cargo.clone()
+        };
+    cargo_features.normalize();
 
     let mut extra_tests = Vec::new();
     for binary in cli.extra_tests.iter().chain(&file.extra_tests).chain(
@@ -177,6 +191,7 @@ pub fn merge_config(
     }
 
     Ok(Config {
+        cargo_features,
         repo_root,
         worktree_root: crate::worktree::root(&repo),
         prefix: repo.prefix,
@@ -286,5 +301,43 @@ extra-tests = ["unselected"]
         let merged = merge_config(root, file, &cli.common, ConfigExtras::default()).unwrap();
         assert_eq!(merged.extra_tests, ["shared", "cli", "global"]);
         assert!(toml::from_str::<FileConfig>("[package.tiny_a]\nunknown = []").is_err());
+    }
+}
+
+#[cfg(test)]
+mod feature_tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn feature_cli_replaces_config_and_canonicalizes_cargo_syntax() {
+        let file: FileConfig = toml::from_str(
+            "[cargo]\nfeatures=['z,a a']\nall-features=true\nno-default-features=true\n",
+        )
+        .unwrap();
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let merge = |args: &[&str]| {
+            let cli = crate::cli::Cli::parse_from(args);
+            merge_config(
+                root.clone(),
+                file.clone(),
+                &cli.common,
+                ConfigExtras::default(),
+            )
+            .unwrap()
+            .cargo_features
+        };
+        let configured = merge(&["qs", "map"]);
+        assert_eq!(configured.features, ["a", "z"]);
+        assert!(configured.all_features && configured.no_default_features);
+        let explicit = merge(&["qs", "map", "--features", "pkg/b,a", "--features", "a c"]);
+        assert_eq!(explicit.features, ["a", "c", "pkg/b"]);
+        assert!(!explicit.all_features && !explicit.no_default_features);
+        assert_eq!(explicit.args(), ["--features", "a,c,pkg/b"]);
+        let none = merge(&["qs", "--no-default-features", "map"]);
+        assert!(none.no_default_features && none.features.is_empty() && !none.all_features);
+        assert_eq!(merge(&["qs", "--features", "", "map"]), Default::default());
+        let all = merge(&["qs", "--all-features", "--no-default-features", "map"]);
+        assert_eq!(all.args(), ["--all-features", "--no-default-features"]);
     }
 }

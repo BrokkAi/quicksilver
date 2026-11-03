@@ -22,6 +22,7 @@ fn prefilter_and_site_ids_on_fixture_sources() {
     let mutants = discover(
         tmp.path(),
         &DiscoverFilter {
+            cargo_features: Default::default(),
             packages: vec!["tiny_schema".into()],
             files: Vec::new(),
             in_diff: None,

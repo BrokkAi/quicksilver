@@ -1,5 +1,4 @@
 use crate::baseline::{preflight_recompile_count, prepare_baseline};
-use crate::cargo_cmd::load_metadata;
 use crate::config::{merge_config, Config, ConfigExtras, FileConfig};
 use crate::discover::DiscoverFilter;
 use crate::index;
@@ -67,6 +66,7 @@ pub fn install_ctrlc() -> Arc<AtomicBool> {
 
 pub fn discover_filter(cfg: &Config) -> DiscoverFilter {
     DiscoverFilter {
+        cargo_features: cfg.cargo_features.clone(),
         packages: cfg.packages.clone(),
         files: cfg.files.clone(),
         in_diff: cfg.in_diff.clone(),
@@ -147,7 +147,7 @@ pub fn prepare(cfg: Config, skip_baseline: bool) -> Result<Prepared> {
             );
         }
     }
-    let meta = load_metadata(&paths.baseline)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     let selector = plan::PackageSelector::new(&meta, &tests);
     let property_tests = crate::proptest::property_tests(&paths.baseline, &meta, &tests)
         .unwrap_or_else(|err| {
@@ -232,7 +232,10 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
     // Preflight costs a whole workspace rebuild, and its answer depends only
     // on manifests and build scripts. Measure once per scratch session and
     // again when one of those changes, not on every per-commit run.
-    let key = match crate::baseline::preflight_key(&prepared.paths.baseline) {
+    let key = match crate::baseline::preflight_key_with_features(
+        &prepared.paths.baseline,
+        &prepared.cfg.cargo_features,
+    ) {
         Ok(key) => Some(key),
         Err(err) => {
             tracing::warn!("preflight key: {err:#}");

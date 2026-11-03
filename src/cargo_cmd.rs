@@ -186,9 +186,17 @@ pub fn apply_build_env(cmd: &mut Command, cfg: &Config) {
 }
 
 pub fn load_metadata(root: &Path) -> Result<Metadata> {
+    load_metadata_with_features(root, &Default::default())
+}
+
+pub fn load_metadata_with_features(
+    root: &Path,
+    features: &crate::features::CargoFeatures,
+) -> Result<Metadata> {
     MetadataCommand::new()
         .manifest_path(root.join("Cargo.toml"))
         .no_deps()
+        .other_options(features.args())
         .exec()
         .context("cargo metadata")
 }
@@ -378,6 +386,7 @@ pub fn build_tests(
     cmd.current_dir(root);
     apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
+    cfg.cargo_features.apply(&mut cmd);
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
     // package pays startup + lock + fingerprint 2-4x on the compile-bound path.
     apply_package_select(&mut cmd, packages);

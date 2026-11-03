@@ -12,6 +12,17 @@ pub struct Cli {
 
 #[derive(Args, Debug, Clone)]
 pub struct CommonOpts {
+    /// Cargo features (comma or space separated; repeatable). Explicit feature
+    /// flags replace the complete [cargo] selection in quicksilver.toml.
+    #[arg(long, global = true)]
+    pub features: Vec<String>,
+    /// Activate all Cargo features.
+    #[arg(long, global = true)]
+    pub all_features: bool,
+    /// Disable Cargo default features.
+    #[arg(long, global = true)]
+    pub no_default_features: bool,
+
     /// Builds to run at once. Defaults to what the machine's memory allows.
     #[arg(long, global = true)]
     pub build_jobs: Option<usize>,

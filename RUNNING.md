@@ -470,6 +470,7 @@ workspace root.
 | `build-jobs`, `test-jobs` | Builds and test processes at once, as `--build-jobs` and `--test-jobs`. |
 | `extra-tests = [...]` | Test binaries of other packages to add, as `--extra-tests`. |
 | `[package.<name>] extra-tests` | The same, only when `--package <name>` is given. |
+| `[cargo]` | Cargo `features`, `all-features` and `no-default-features`, pinned for the campaign. |
 | `[build-env]` | Variables for every build and baseline test run. |
 | `[map] nextest-profile` | Project nextest profile for the baseline and test catalog; defaults to `default`. |
 | `[map] fail-on-extra-baseline` | When true, baseline failures in extra suites also block mapping. |
@@ -477,6 +478,49 @@ workspace root.
 | `[test-budget]` | Minimum seconds per test id, for tests with long deadlines of their own. |
 | `[test-env]` | Variables for every test process; `{sandbox}` is that process's sandbox. |
 | `[sandbox]` | `enabled = false` turns the sandbox off; `dir` moves it. |
+
+### Cargo features
+
+Select features with Cargo's usual flags, including package-qualified names:
+
+```
+cargo quicksilver -p my_crate --features my_crate/release-tooling map
+cargo quicksilver -p my_crate --features my_crate/release-tooling build
+cargo quicksilver -p my_crate --features my_crate/release-tooling test
+```
+
+For a whole campaign, save the selection in `quicksilver.toml`:
+
+```toml
+[cargo]
+features = ["my_crate/release-tooling", "my_crate/download"]
+all-features = false
+no-default-features = false
+```
+
+With no settings, Cargo's normal defaults apply. `--features` accepts comma
+or space separated names and can be repeated. Any explicit feature flag
+(`--features`, `--all-features` or `--no-default-features`) replaces the
+complete `[cargo]` selection for that command. `--features ''` explicitly
+chooses Cargo defaults. Cargo's normal feature unification still applies:
+a dependency can re-enable a feature even with `--no-default-features`.
+
+The selection reaches metadata, baseline tests, the nextest catalog and all
+schema builds, including `build --rebuild` and the built-in `run` command.
+Map, baseline, build and test JSON record it as `cargo_features`. Build,
+rebuild and test reject settings different from the map. To change the
+selection, map again; captured mutants at the same commit are retained but
+all compiled statuses and verdicts, including kills and compile failures,
+require rebuilding. `build --from` carries bodies and notes into the new
+map and recompiles them; it imports no coverage, binaries or verdicts.
+
+The map covers only tests compiled with the selected features. Source scans
+can list functions behind disabled features, but those have no recorded
+hits; that is not evidence that the selected tests exercise them. Features
+must be enabled through Cargo, not through a `RUSTFLAGS --cfg feature=...`
+substitute, which does not activate optional dependencies. For `prove`, use
+the same selection in quicksilver and in the command after `--`; quicksilver
+runs that command as written.
 
 ### Tests that exist only under a cfg
 

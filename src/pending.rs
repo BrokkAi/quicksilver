@@ -95,7 +95,10 @@ pub fn run(common: &CommonOpts, args: PendingArgs) -> Result<i32> {
     let paths = cfg.paths();
     let head = crate::worktree::head(&cfg.repo_root)?;
     let map = crate::exec::edited::map_at(&paths, &head)?;
-    let state = State::load(&paths)?;
+    map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.cargo_features.require_match(&cfg.cargo_features)?;
+    let mut state = State::load(&paths)?;
+    state.reconcile(&map);
     let files = crate::discover::file_globset(&cfg.files)?;
     let rows: Vec<_> = inventory(&map, &state, args.min_lines)
         .into_iter()

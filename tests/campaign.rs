@@ -745,3 +745,238 @@ pub fn malformed() -> u32 { 7 }
     );
     assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), original_map);
 }
+
+/// Real Cargo activation, including an optional dependency and a test binary
+/// with required-features; default mapping must not invent coverage.
+#[test]
+fn cargo_features_pin_optional_dependency_coverage_and_replay() {
+    use cargo_quicksilver::exec::edited::Status;
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    fs::write(root.join(".gitignore"), "*.json\n").unwrap();
+    let manifest = root.join("crate_a/Cargo.toml");
+    let mut text = fs::read_to_string(&manifest).unwrap();
+    text.push_str(
+        r#"
+[features]
+default = ["base-on"]
+base-on = []
+advanced = ["dep:optional-helper"]
+[dependencies]
+optional-helper = { path = "../optional-helper", optional = true }
+[[test]]
+name = "advanced"
+required-features = ["advanced"]
+"#,
+    );
+    fs::write(&manifest, text).unwrap();
+    let workspace = root.join("Cargo.toml");
+    let text = fs::read_to_string(&workspace).unwrap().replace(
+        "\"crate_schema\"]",
+        "\"crate_schema\", \"optional-helper\"]",
+    );
+    fs::write(&workspace, text).unwrap();
+    fs::create_dir_all(root.join("optional-helper/src")).unwrap();
+    fs::write(
+        root.join("optional-helper/Cargo.toml"),
+        "[package]\nname='optional-helper'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("optional-helper/src/lib.rs"),
+        "pub fn increment(n: u32) -> u32 { n + 1 }\n",
+    )
+    .unwrap();
+    let source = root.join("crate_a/src/lib.rs");
+    let original = fs::read_to_string(&source).unwrap()
+        + r#"
+#[cfg(feature = "advanced")]
+pub fn feature_value(n: u32) -> u32 { optional_helper::increment(n) }
+#[cfg(feature = "base-on")]
+pub fn default_value() -> bool { true }
+#[cfg(test)] mod feature_defaults {
+    #[test] fn defaults_are_consistent() {
+        #[cfg(feature = "base-on")] assert!(super::default_value());
+    }
+}
+"#;
+    fs::write(&source, &original).unwrap();
+    fs::create_dir(root.join("crate_a/tests")).unwrap();
+    fs::write(
+        root.join("crate_a/tests/advanced.rs"),
+        "#[test] fn feature_dependency_works() { assert_eq!(tiny_a::feature_value(41), 42); }\n",
+    )
+    .unwrap();
+    // The extra suite must not re-enable tiny_a defaults through its edge.
+    let extra_manifest = root.join("crate_b/Cargo.toml");
+    fs::write(
+        &extra_manifest,
+        fs::read_to_string(&extra_manifest).unwrap().replace(
+            "path = \"../crate_a\"",
+            "path = \"../crate_a\", default-features = false",
+        ),
+    )
+    .unwrap();
+    // Commit all fixture inputs before map; QS tests the committed tree.
+    git(
+        root,
+        &[
+            "add",
+            ".gitignore",
+            "Cargo.toml",
+            "crate_a/Cargo.toml",
+            "crate_b/Cargo.toml",
+            "crate_a/src/lib.rs",
+            "crate_a/tests/advanced.rs",
+            "optional-helper",
+        ],
+    );
+    git(
+        root,
+        &["commit", "-m", "feature-gated optional dependency fixture"],
+    );
+    qs(root, &["map", "--json", "map-default.json"], 0);
+    let defaults: SiteMap = serde_json::from_value(json(root, "map-default.json")).unwrap();
+    let site = defaults
+        .sites
+        .iter()
+        .find(|s| s.fqn.ends_with(".feature_value"))
+        .unwrap()
+        .site_id;
+    assert!(!defaults.hits.values().any(|hits| hits.contains(&site)));
+    assert!(!defaults
+        .tests
+        .iter()
+        .any(|t| t.binary_id == "tiny_a::advanced"));
+    assert_eq!(defaults.cargo_features, Default::default());
+    let baseline: serde_json::Value = serde_json::from_slice(
+        &fs::read(support::cfg_for(root).paths().index.join("baseline.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        baseline["cargo_features"]["features"],
+        serde_json::json!([])
+    );
+
+    // Persistent selection applies to every subsequent command without flags.
+    // Leave the config untracked: it must not change the map's commit.
+    fs::write(
+        root.join("quicksilver.toml"),
+        "[cargo]\nfeatures=['advanced']\n",
+    )
+    .unwrap();
+    qs(root, &["map", "--json", "map-enabled.json"], 0);
+    let enabled: SiteMap = serde_json::from_value(json(root, "map-enabled.json")).unwrap();
+    assert!(enabled.hits.values().any(|hits| hits.contains(&site)));
+    assert!(enabled
+        .tests
+        .iter()
+        .any(|t| t.binary_id == "tiny_a::advanced"));
+    assert_eq!(enabled.cargo_features.features, ["advanced"]);
+    fs::write(
+        &source,
+        original.replace("{ optional_helper::increment(n) }", "{ n }"),
+    )
+    .unwrap();
+    qs(root, &["build", "--json", "feature-built.json"], 0);
+    git(root, &["restore", "crate_a/src/lib.rs"]);
+    qs(root, &["test", "--json", "feature-tested.json"], 0);
+    let tested = json(root, "feature-tested.json");
+    assert_eq!(
+        tested["cargo_features"]["features"],
+        serde_json::json!(["advanced"])
+    );
+    assert_eq!(tested["mutants"][0]["verdict"]["kind"], "caught");
+    assert!(tested["mutants"][0]["verdict"]["test"]
+        .as_str()
+        .unwrap()
+        .contains("feature_dependency_works"));
+    qs(
+        root,
+        &["build", "--rebuild", "--json", "feature-rebuilt.json"],
+        0,
+    );
+    let rebuilt = json(root, "feature-rebuilt.json");
+    assert_eq!(rebuilt["cargo_features"], tested["cargo_features"]);
+    assert_eq!(rebuilt["records"][0]["status"]["status"], "built");
+
+    let paths = support::cfg_for(root).paths();
+    let before_state = fs::read(State::path(&paths)).unwrap();
+    let before_map = fs::read(SiteMap::path(&paths)).unwrap();
+    for args in [
+        vec!["--no-default-features", "test"],
+        vec!["--all-features", "build", "--rebuild"],
+        vec!["--features", "", "build"],
+        vec!["--features", "", "uncovered"],
+    ] {
+        let out = qs(root, &args, 2);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Cargo features differ"));
+        assert_eq!(fs::read(State::path(&paths)).unwrap(), before_state);
+        assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), before_map);
+    }
+    // An explicit CLI selection replaces config. Package-qualified names and
+    // disabling defaults must reach metadata, list, baseline and schema builds.
+    qs(
+        root,
+        &[
+            "--features",
+            "tiny_a/advanced,tiny_a/advanced",
+            "--no-default-features",
+            "map",
+            "--json",
+            "map-no-default.json",
+        ],
+        0,
+    );
+    let changed: SiteMap = serde_json::from_value(json(root, "map-no-default.json")).unwrap();
+    assert!(changed.cargo_features.no_default_features);
+    assert_eq!(changed.cargo_features.features, ["tiny_a/advanced"]);
+    let default_site = changed
+        .sites
+        .iter()
+        .find(|s| s.fqn.ends_with(".default_value"))
+        .unwrap()
+        .site_id;
+    assert!(!changed
+        .hits
+        .values()
+        .any(|hits| hits.contains(&default_site)));
+    qs(
+        root,
+        &[
+            "--features",
+            "tiny_a/advanced",
+            "--no-default-features",
+            "test",
+            "--json",
+            "test-remapped.json",
+        ],
+        0,
+    );
+    let state = State::load(&paths).unwrap();
+    assert_eq!(state.records.len(), 1);
+    assert!(matches!(state.records[0].status, Status::Pending));
+    assert!(json(root, "test-remapped.json")["mutants"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    qs(
+        root,
+        &["--all-features", "map", "--json", "map-all.json"],
+        0,
+    );
+    assert_eq!(
+        json(root, "map-all.json")["cargo_features"]["all-features"],
+        true
+    );
+    qs(root, &["--all-features", "build", "--no-capture"], 0);
+    qs(
+        root,
+        &["--all-features", "test", "--json", "test-all.json"],
+        0,
+    );
+    assert_eq!(
+        json(root, "test-all.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+}

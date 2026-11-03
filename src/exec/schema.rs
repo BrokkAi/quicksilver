@@ -1,6 +1,6 @@
 //! Schema pool + test pool. Test binaries do not change between mutants.
 
-use crate::cargo_cmd::{build_tests_captured, crate_root_source, load_metadata, CapturedBuild};
+use crate::cargo_cmd::{build_tests_captured, crate_root_source, CapturedBuild};
 use crate::config::Config;
 use crate::exec::build::resolve_binary;
 use crate::exec::test::{
@@ -302,7 +302,7 @@ fn run_crate(
     }
 
     let target = worker.join("target");
-    let meta = load_metadata(worker)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(worker, &cfg.cargo_features)?;
     let crate_root_abs =
         crate_root_source(&meta, package).with_context(|| format!("crate root for {package}"))?;
     let crate_root = rebase_to_worker(&crate_root_abs, &paths.baseline, worker);

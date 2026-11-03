@@ -2,8 +2,7 @@
 //! suite's durations attached to it.
 
 use crate::cargo_cmd::{
-    apply_build_env, apply_package_select, load_metadata, package_dir_rel, relative_to_target,
-    test_packages,
+    apply_build_env, apply_package_select, package_dir_rel, relative_to_target, test_packages,
 };
 use crate::config::Config;
 use crate::types::{Paths, TestInfo};
@@ -44,7 +43,7 @@ pub fn drop_skipped(cfg: &Config, tests: &mut Vec<TestInfo>) -> Result<Vec<Strin
 }
 
 pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
-    let meta = load_metadata(&paths.baseline)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     let target_dir = paths.baseline.join("target");
     let mut cmd = crate::cargo_cmd::cargo_command();
     cmd.current_dir(&paths.baseline);
@@ -58,6 +57,7 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
         &cfg.nextest_profile,
     ]);
     apply_package_select(&mut cmd, &test_packages(cfg, &meta));
+    cfg.cargo_features.apply(&mut cmd);
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
         bail!(

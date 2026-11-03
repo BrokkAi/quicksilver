@@ -7,6 +7,7 @@ use std::fs;
 
 fn filter() -> DiscoverFilter {
     DiscoverFilter {
+        cargo_features: Default::default(),
         packages: Vec::new(),
         files: Vec::new(),
         in_diff: None,
@@ -334,6 +335,7 @@ fn in_diff_discovery_matches_full_discovery_for_changed_functions() {
     let diff = discover(
         root,
         &DiscoverFilter {
+            cargo_features: Default::default(),
             in_diff: Some("HEAD^...HEAD".into()),
             ..filter()
         },
@@ -373,6 +375,7 @@ fn in_diff_discovery_matches_full_discovery_for_changed_functions() {
     let scoped = cargo_quicksilver::discover::discover_in_diff(
         root,
         &DiscoverFilter {
+            cargo_features: Default::default(),
             in_diff: Some("HEAD^...HEAD".into()),
             ..filter()
         },

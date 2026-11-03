@@ -33,6 +33,15 @@ pub fn capture_from(map: &SiteMap, repo: &Path, source: &Path) -> Result<Capture
         &std::fs::read(source).with_context(|| format!("read {}", source.display()))?,
     )
     .with_context(|| format!("parse {}", source.display()))?;
+    let prior_features: crate::features::CargoFeatures = serde_json::from_value(
+        json.get("cargo_features")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )
+    .context("read source Cargo feature selection")?;
+    if prior_features != map.cargo_features {
+        eprintln!("carrying bodies to a different Cargo feature selection; previous coverage, binaries and verdicts are not imported");
+    }
     let saved: Vec<SavedMutant> = if let Some(records) =
         json.get("records").and_then(|v| v.as_array())
     {
@@ -182,6 +191,7 @@ mod tests {
             scaffolding: None,
         };
         let map = SiteMap {
+            cargo_features: Default::default(),
             version: crate::sitemap::MAP_VERSION,
             map_id: "new".into(),
             commit: "new-commit".into(),

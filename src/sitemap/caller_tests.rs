@@ -32,6 +32,7 @@ fn site(id: u32, path: &str, name: &str, start: usize, end: usize) -> MapSite {
 
 fn map(repo: &Path, sites: Vec<MapSite>) -> SiteMap {
     SiteMap {
+        cargo_features: Default::default(),
         version: MAP_VERSION,
         map_id: "fixture".into(),
         commit: git(repo, &["rev-parse", "HEAD"]),

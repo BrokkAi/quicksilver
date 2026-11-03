@@ -1,4 +1,4 @@
-use crate::cargo_cmd::{load_metadata, mutable_scope, MutableScope};
+use crate::cargo_cmd::{mutable_scope, MutableScope};
 use crate::scan::scan_crate_for;
 use crate::types::Mutant;
 use crate::util::{hex, line_col_to_offset, rel_slash};
@@ -77,6 +77,7 @@ pub fn kind_is_schema_prefiltered(label: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub struct DiscoverFilter {
+    pub cargo_features: crate::features::CargoFeatures,
     pub packages: Vec<String>,
     pub files: Vec<String>,
     pub in_diff: Option<String>,
@@ -257,7 +258,7 @@ fn scan_functions(
     diff: Option<&DiffSelection>,
     mut test_lines: Option<&mut TestLines>,
 ) -> Result<Vec<FnDecl>> {
-    let meta = load_metadata(root)?;
+    let meta = crate::cargo_cmd::load_metadata_with_features(root, &filter.cargo_features)?;
     let globset = file_globset(&filter.files)?;
     let scan_started = std::time::Instant::now();
     let root_abs = PathBuf::from(meta.workspace_root.as_str());
