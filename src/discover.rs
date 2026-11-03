@@ -234,12 +234,6 @@ fn expand(fns: Vec<FnDecl>) -> Result<Vec<Mutant>> {
     Ok(mutants)
 }
 
-/// `tests/` and `benches/` hold test code whatever their attributes say.
-fn is_test_like_path(rel: &str) -> bool {
-    rel.split('/')
-        .any(|part| part == "tests" || part == "benches")
-}
-
 /// The scope with every path canonicalized, so it compares with the
 /// canonical paths the module walk produces.
 fn canonical_scope(scope: MutableScope) -> MutableScope {
@@ -263,6 +257,9 @@ fn scan_functions(
     let scan_started = std::time::Instant::now();
     let root_abs = PathBuf::from(meta.workspace_root.as_str());
     let root_abs = root_abs.canonicalize().unwrap_or(root_abs);
+    let repo = crate::worktree::repo_of(&root_abs)?;
+    let repo_top = repo.toplevel.canonicalize()?;
+    let tracked = crate::worktree::tracked_paths(&repo)?;
     let mut skipped_proc_macro: BTreeSet<String> = BTreeSet::new();
     let target = crate::target::Target::probe_or_unknown(root);
 
@@ -286,21 +283,36 @@ fn scan_functions(
             .map(|t| t.name.replace('-', "_"))
             .unwrap_or_else(|| package.replace('-', "_"));
         let scope = canonical_scope(scope);
-        for file in scan_crate_for(&crate_name, &scope.root_file, &target)? {
-            let Ok(rel) = file.path.strip_prefix(&root_abs) else {
-                continue;
-            };
-            let rel = rel_slash(rel);
-            if is_test_like_path(&rel) || !scope.contains(&file.path) {
+        let scanned = scan_crate_for(&crate_name, &scope.root_file, &target)?;
+        let production: BTreeSet<_> = scanned
+            .iter()
+            .filter(|f| !f.in_test)
+            .map(|f| &f.path)
+            .collect();
+        for file in &scanned {
+            // A test alias must not label every line of a production source
+            // as test-only. Its production instance carries inner test ranges.
+            if file.in_test && production.contains(&file.path) {
                 continue;
             }
+            let Ok(top) = file.path.strip_prefix(&repo_top) else {
+                tracing::warn!(
+                    "skipping source outside the Git repository: {}",
+                    file.path.display()
+                );
+                continue;
+            };
+            let top = rel_slash(top);
+            if !file.path.starts_with(&root_abs) && !tracked.contains(&top) {
+                tracing::warn!("skipping untracked shared source: {top}");
+                continue;
+            }
+            let rel = crate::worktree::workspace_path(&repo.prefix, &top)?;
             if let Some(lines) = test_lines.as_deref_mut() {
-                if !file.test_lines.is_empty() {
-                    lines
-                        .entry(rel.clone())
-                        .or_default()
-                        .extend(file.test_lines.iter().copied());
-                }
+                lines
+                    .entry(rel.clone())
+                    .or_default()
+                    .extend(file.test_lines.iter().copied());
             }
             if let Some(diff) = diff {
                 if !diff.touches_file(&rel) {
@@ -467,7 +479,7 @@ fn git_diff_lines(root: &Path, spec: &str) -> Result<BTreeMap<String, Vec<Hunk>>
             "--no-color",
             "--no-ext-diff",
             "--no-renames",
-            "--relative",
+            "--no-relative",
             spec,
         ])
         .current_dir(root)
@@ -479,7 +491,11 @@ fn git_diff_lines(root: &Path, spec: &str) -> Result<BTreeMap<String, Vec<Hunk>>
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    let files = parse_unified_zero(&String::from_utf8_lossy(&out.stdout));
+    let prefix = crate::worktree::repo_of(root)?.prefix;
+    let files: BTreeMap<_, _> = parse_unified_zero(&String::from_utf8_lossy(&out.stdout))
+        .into_iter()
+        .map(|(path, hunks)| Ok((crate::worktree::workspace_path(&prefix, &path)?, hunks)))
+        .collect::<Result<_>>()?;
     if let Some(target) = target {
         if !files.is_empty() {
             let same = std::process::Command::new("git")

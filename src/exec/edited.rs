@@ -746,12 +746,18 @@ fn build_map_with_failures(
         "{}",
         crate::types::baseline_failure_summary(&baseline_failures)
     );
-    let files = tracked_file_hashes(&cfg.repo_root)?;
+    let mut files = tracked_file_hashes(&cfg.repo_root)?;
 
     let (fns, test_lines) = crate::discover::scan_workspace_with_tests(
         &paths.baseline,
         &crate::engine::discover_filter(cfg),
     )?;
+    for path in test_lines.keys() {
+        files.insert(
+            path.clone(),
+            crate::util::sha256_file(&cfg.repo_root.join(path))?,
+        );
+    }
     let (map_sites, mut dropped) = sites_from_functions(&fns)?;
     info!(
         "map: {} sites, {} functions without a site",
@@ -767,10 +773,11 @@ fn build_map_with_failures(
         .collect::<BTreeSet<_>>()
     {
         let abs = crate_root_source(&meta, pkg).with_context(|| format!("crate root for {pkg}"))?;
-        let rel = abs
-            .strip_prefix(&paths.baseline)
-            .map(crate::util::rel_slash)
-            .with_context(|| format!("crate root {} is outside the baseline", abs.display()))?;
+        let repo = crate::worktree::repo_of(&paths.baseline)?;
+        let top = abs.strip_prefix(&repo.toplevel).with_context(|| {
+            format!("crate root {} is outside the Git repository", abs.display())
+        })?;
+        let rel = crate::worktree::workspace_path(&cfg.prefix, &crate::util::rel_slash(top))?;
         crate_roots.insert(pkg.to_string(), rel);
     }
 
@@ -2437,6 +2444,13 @@ mod tests {
         crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
             .unwrap();
         assert!(SiteMap::load(&paths).is_err());
+        json["version"] = serde_json::json!(8);
+        crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
+            .unwrap();
+        assert_eq!(
+            SiteMap::load(&paths).unwrap().unwrap().cargo_features,
+            new.cargo_features
+        );
         new.save(&paths).unwrap();
         assert_eq!(
             SiteMap::load(&paths).unwrap().unwrap().cargo_features,

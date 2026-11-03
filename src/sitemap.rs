@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-// Version 8 pins Cargo features. Old binaries must refuse its maps instead
-// of ignoring the selection and compiling with defaults. Version 7 maps
-// predate feature selection and remain usable under Cargo defaults.
-pub const MAP_VERSION: u32 = 8;
+// Version 9 supports tracked shared production sources outside the workspace.
+// Version 8 pins Cargo features; version 7 predates feature selection and
+// remains usable under Cargo defaults. Older binaries refuse newer maps.
+pub const MAP_VERSION: u32 = 9;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -128,13 +128,21 @@ impl SiteMap {
         let map: SiteMap =
             serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
         anyhow::ensure!(
-            map.version == MAP_VERSION
+            (map.version == MAP_VERSION || map.version == 8)
                 || (map.version == 7 && map.cargo_features == Default::default()),
             "{} is map version {}, this build reads {}; run `cargo quicksilver map` again",
             p.display(),
             map.version,
             MAP_VERSION
         );
+        for path in map
+            .files
+            .keys()
+            .chain(map.sites.iter().map(|s| &s.path))
+            .chain(map.crate_roots.values())
+        {
+            crate::worktree::repository_path(&map.prefix, path)?;
+        }
         Ok(Some(map))
     }
 
@@ -222,8 +230,9 @@ fn scan_callers(
         repo_dir,
         |_| true,
         |path, bytes| {
-            let path = path.strip_prefix(&map.prefix).unwrap_or(path);
-            let tests = map.test_lines.get(path);
+            let path = crate::worktree::workspace_path(&map.prefix, path)
+                .unwrap_or_else(|_| path.to_string());
+            let tests = map.test_lines.get(&path);
             let text = String::from_utf8_lossy(bytes);
             for (index, line) in text.lines().enumerate() {
                 let lineno = index + 1;
@@ -428,7 +437,7 @@ fn without_callers_old(
         let Ok(lineno) = lineno.parse::<usize>() else {
             continue;
         };
-        let path = path.strip_prefix(map.prefix.as_str()).unwrap_or(path);
+        let path = crate::worktree::workspace_path(&map.prefix, path)?;
         for word in text.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
             if let Some(name) = names.get(word) {
                 seen.entry(name.as_str())

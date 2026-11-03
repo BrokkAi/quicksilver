@@ -73,7 +73,7 @@ pub fn apply(
     let mut files: BTreeMap<PathBuf, FileEdits> = BTreeMap::new();
     let mut messages = vec![];
     for edit in &mutant.edits {
-        let path = root.join(&edit.path);
+        let path = crate::worktree::checked_source_path(root, &edit.path)?;
         if !files.contains_key(&path) {
             let original = std::fs::read_to_string(&path)
                 .with_context(|| format!("read {} for {}", path.display(), edit.fqn))?;

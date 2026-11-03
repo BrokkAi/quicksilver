@@ -479,6 +479,21 @@ workspace root.
 | `[test-env]` | Variables for every test process; `{sandbox}` is that process's sandbox. |
 | `[sandbox]` | `enabled = false` turns the sandbox off; `dir` moves it. |
 
+### Shared source in nested workspaces
+
+A selected production crate can include tracked source from elsewhere in the
+same Git repository through `#[path = "..."]`. Quicksilver follows those
+modules even when their files live under `tests/`; test-only module context
+still excludes functions under `#[cfg(test)]`. Files outside the repository
+and untracked shared files are omitted with a warning.
+
+Paths in discovery, maps and captured edits stay relative to the Cargo
+workspace. A nested workspace can therefore show `../../tests/shared.rs`.
+Patch headers and repository-relative line intents use normal Git paths,
+such as `tests/shared.rs:12`. Checkout capture, patches, `--rebuild`,
+`--from`, `apply` and `prove` support these mapped shared bodies. A source
+path cannot escape the repository, including through a symbolic link.
+
 ### Cargo features
 
 Select features with Cargo's usual flags, including package-qualified names:
@@ -508,8 +523,8 @@ a dependency can re-enable a feature even with `--no-default-features`.
 The selection reaches metadata, baseline tests, the nextest catalog and all
 schema builds, including `build --rebuild` and the built-in `run` command.
 Map, baseline, build and test JSON record it as `cargo_features`. New maps
-use format version 8, which older binaries refuse; existing version 7 maps
-remain readable with their original Cargo defaults. Build,
+use format version 9, which older binaries refuse; version 8 maps and
+version 7 maps with their original Cargo defaults remain readable. Build,
 rebuild and test reject settings different from the map. To change the
 selection, map again; captured mutants at the same commit are retained but
 all compiled statuses and verdicts, including kills and compile failures,

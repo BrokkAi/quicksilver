@@ -42,6 +42,8 @@ pub struct ScannedFn {
 
 #[derive(Debug, Clone)]
 pub struct ScannedFile {
+    /// Whether this instance of the file was reached through a test-only module.
+    pub in_test: bool,
     pub path: PathBuf,
     pub source: String,
     pub functions: Vec<ScannedFn>,
@@ -76,7 +78,7 @@ pub fn scan_crate_for(
 
 struct Walker<'t> {
     files: Vec<ScannedFile>,
-    visited: HashSet<PathBuf>,
+    visited: HashSet<(PathBuf, bool)>,
     target: &'t Target,
 }
 
@@ -135,7 +137,7 @@ impl Walker<'_> {
         ctx: &Ctx,
         is_root: bool,
     ) -> Result<()> {
-        if !self.visited.insert(path.to_path_buf()) {
+        if !self.visited.insert((path.to_path_buf(), ctx.in_test)) {
             return Ok(());
         }
         let source = match std::fs::read_to_string(path) {
@@ -181,6 +183,7 @@ impl Walker<'_> {
         };
         walk_items(&file.items, module_path, &ctx, &env, &mut sink);
         self.files.push(ScannedFile {
+            in_test: ctx.in_test,
             path: path.to_path_buf(),
             source,
             functions: sink.functions,

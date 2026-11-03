@@ -199,8 +199,97 @@ pub fn state_dir(tree: &Path) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Reduce a workspace-relative path against its repository prefix. Never
+/// allow absolute paths or parent components that escape the Git root.
+pub fn repository_path(prefix: &str, path: &str) -> Result<String> {
+    use std::path::Component;
+    let mut parts = Vec::new();
+    for component in Path::new(prefix)
+        .components()
+        .chain(Path::new(path).components())
+    {
+        match component {
+            Component::Normal(p) => parts.push(p.to_string_lossy().into_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::ensure!(
+                    parts.pop().is_some(),
+                    "source path escapes the Git repository: {prefix}{path}"
+                );
+            }
+            _ => bail!("source path must be relative to the Git repository: {prefix}{path}"),
+        }
+    }
+    anyhow::ensure!(!parts.is_empty(), "source path names the Git root");
+    Ok(parts.join("/"))
+}
+
+/// Express a normalized repository path relative to a nested workspace.
+pub fn workspace_path(prefix: &str, repository: &str) -> Result<String> {
+    let repository = repository_path("", repository)?;
+    let prefix = prefix.trim_end_matches('/');
+    let prefix = if prefix.is_empty() {
+        Vec::new()
+    } else {
+        repository_path("", prefix)?
+            .split('/')
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let target: Vec<_> = repository.split('/').collect();
+    let common = prefix
+        .iter()
+        .zip(&target)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut parts = vec![".."; prefix.len() - common];
+    parts.extend_from_slice(&target[common..]);
+    Ok(parts.join("/"))
+}
+
+/// Resolve an existing source without following a link outside its Git root.
+/// The fallback root supports the body-editing library's non-Git callers.
+pub fn checked_source_path(workspace: &Path, path: &str) -> Result<PathBuf> {
+    let repo = repo_of(workspace).ok();
+    let prefix = repo.as_ref().map(|r| r.prefix.as_str()).unwrap_or("");
+    repository_path(prefix, path)?;
+    let top = repo
+        .as_ref()
+        .map(|r| r.toplevel.as_path())
+        .unwrap_or(workspace)
+        .canonicalize()?;
+    let source = workspace.join(path);
+    let actual = source
+        .canonicalize()
+        .with_context(|| format!("read source {}", source.display()))?;
+    anyhow::ensure!(
+        actual.starts_with(&top),
+        "source path escapes the Git repository through a symbolic link: {}",
+        source.display()
+    );
+    Ok(source)
+}
+
+/// All tracked paths, anchored at the repository top level, including
+/// files outside the current Cargo workspace. No untracked dependencies.
+pub fn tracked_paths(repo: &Repo) -> Result<std::collections::BTreeSet<String>> {
+    let out = Command::new("git")
+        .args(["ls-files", "-z", "--cached"])
+        .current_dir(&repo.toplevel)
+        .output()
+        .context("git ls-files")?;
+    anyhow::ensure!(out.status.success(), "git ls-files failed");
+    Ok(out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|b| !b.is_empty())
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .collect())
+}
+
 /// The committed bytes of `path` (relative to the repository top level).
 pub fn show(dir: &Path, commit: &str, path: &str) -> Result<Vec<u8>> {
+    let path = repository_path("", path)?;
     let out = Command::new("git")
         .args(["cat-file", "blob", &format!("{commit}:{path}")])
         .current_dir(dir)
@@ -228,6 +317,34 @@ pub fn require_mbx() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_paths_normalize_without_escaping_the_git_root() {
+        assert_eq!(
+            repository_path("scripts/tool/", "../../tests/shared.rs").unwrap(),
+            "tests/shared.rs"
+        );
+        assert_eq!(
+            workspace_path("scripts/tool/", "tests/shared.rs").unwrap(),
+            "../../tests/shared.rs"
+        );
+        assert_eq!(
+            workspace_path("scripts/tool/", "scripts/tool/src/main.rs").unwrap(),
+            "src/main.rs"
+        );
+        for path in ["../../../escape.rs", "/tmp/outside.rs"] {
+            assert!(repository_path("scripts/tool/", path).is_err());
+        }
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("file.rs"), "fn outside() {}\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("file.rs"), root.path().join("link.rs"))
+            .unwrap();
+        assert!(checked_source_path(root.path(), "link.rs")
+            .unwrap_err()
+            .to_string()
+            .contains("symbolic link"));
+    }
 
     fn run(dir: &Path, args: &[&str]) {
         let ok = Command::new("git")

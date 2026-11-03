@@ -55,7 +55,9 @@ pub fn unified_diff(old: &str, new: &str, line: usize, path: &str, prefix: &str)
     let (old, new) = (with_newline(old), with_newline(new));
     let a = crate::linediff::lines(&old);
     let b = crate::linediff::lines(&new);
-    let mut out = format!("--- a/{prefix}{path}\n+++ b/{prefix}{path}\n");
+    let path = crate::worktree::repository_path(prefix, path)
+        .unwrap_or_else(|_| format!("{prefix}{path}"));
+    let mut out = format!("--- a/{path}\n+++ b/{path}\n");
     let hunks = crate::linediff::diff(&a, &b);
     let mut groups: Vec<Vec<crate::linediff::Hunk>> = Vec::new();
     for h in hunks {

@@ -980,3 +980,256 @@ pub fn default_value() -> bool { true }
         "caught"
     );
 }
+
+#[test]
+fn nested_workspace_maps_captures_and_replays_shared_production_modules() {
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    let workspace = root.join("scripts/tool");
+    fs::create_dir_all(workspace.join("src")).unwrap();
+    fs::create_dir_all(root.join("tests")).unwrap();
+    fs::create_dir_all(root.join("shared")).unwrap();
+    fs::write(root.join(".gitignore"), "*.json\nscripts/tool/Cargo.lock\n").unwrap();
+    fs::write(
+        workspace.join("Cargo.toml"),
+        "[workspace]\n[package]\nname='nested_tool'\nversion='0.1.0'\nedition='2021'\n",
+    )
+    .unwrap();
+    let main = r#"
+#[cfg(test)]
+#[path = "../../../tests/shared.rs"] mod test_alias;
+#[path = "../../../tests/shared.rs"] mod shared;
+#[path = "../../../shared/other.rs"] mod other;
+#[cfg(test)]
+#[path = "../../../tests/test_only.rs"] mod only_tests;
+fn main() { let _ = shared::answer(20); let _ = other::flag(); }
+#[cfg(test)] mod tests {
+    #[test] fn catches_shared() { assert_eq!(super::shared::answer(41), 42); }
+    #[test] fn catches_other() { assert!(super::other::flag()); }
+    #[test] fn test_only_stays_excluded() { assert!(super::only_tests::hidden()); }
+}
+"#;
+    fs::write(workspace.join("src/main.rs"), main).unwrap();
+    let shared = root.join("tests/shared.rs");
+    let original = "pub fn answer(n: u32) -> u32 { n + 1 }\n";
+    fs::write(&shared, original).unwrap();
+    fs::write(
+        root.join("tests/test_only.rs"),
+        "pub fn hidden() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("shared/other.rs"),
+        "pub fn flag() -> bool { true }\n",
+    )
+    .unwrap();
+    git(
+        root,
+        &["add", ".gitignore", "scripts/tool", "tests", "shared"],
+    );
+    git(
+        root,
+        &[
+            "commit",
+            "-m",
+            "nested production graph shares tracked test-directory sources",
+        ],
+    );
+    let tool = |args: &[&str], code: i32| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(root)
+            .args([
+                "quicksilver",
+                "--manifest-path",
+                "scripts/tool/Cargo.toml",
+                "-p",
+                "nested_tool",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(code),
+            "{args:?}\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+    tool(&["list", "--json", "nested-list.json"], 0);
+    let listed = json(root, "nested-list.json");
+    let mutants = listed.as_array().unwrap();
+    assert!(mutants
+        .iter()
+        .any(|m| m["path"] == "../../tests/shared.rs" && m["fqn"] == "nested_tool.shared.answer"));
+    assert!(mutants.iter().any(|m| m["path"] == "../../shared/other.rs"));
+    assert!(!mutants
+        .iter()
+        .any(|m| m["fqn"].as_str().unwrap().contains("test_alias")
+            || m["fqn"].as_str().unwrap().contains("hidden")));
+    tool(
+        &[
+            "--in-diff",
+            "HEAD^...HEAD",
+            "list",
+            "--json",
+            "nested-diff.json",
+        ],
+        0,
+    );
+    assert!(json(root, "nested-diff.json")
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| m["path"] == "../../tests/shared.rs"));
+    // Only tracked, in-repository shared sources can become mutation inputs.
+    fs::write(
+        root.join("shared/untracked.rs"),
+        "pub fn untracked() -> bool { true }\n",
+    )
+    .unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(
+        outside.path().join("outside.rs"),
+        "pub fn outside() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(workspace.join("src/main.rs"), format!("{main}\n#[path=\"../../../shared/untracked.rs\"] mod untracked;\n#[path={:?}] mod outside;\n", outside.path().join("outside.rs"))).unwrap();
+    let out = tool(&["list", "--json", "nested-boundaries.json"], 0);
+    let diagnostic = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        diagnostic.contains("untracked shared source"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("outside the Git repository"),
+        "{diagnostic}"
+    );
+    assert!(!json(root, "nested-boundaries.json")
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|m| ["untracked", "outside"]
+            .iter()
+            .any(|n| m["fqn"].as_str().unwrap().ends_with(n))));
+    fs::write(workspace.join("src/main.rs"), main).unwrap();
+    fs::remove_file(root.join("shared/untracked.rs")).unwrap();
+    tool(&["map", "--json", "nested-map.json"], 0);
+    let map: SiteMap = serde_json::from_value(json(root, "nested-map.json")).unwrap();
+    assert_eq!(map.prefix, "scripts/tool/");
+    assert!(map.files.contains_key("../../tests/shared.rs"));
+    assert!(map.test_lines["../../tests/shared.rs"].is_empty());
+    let site = map
+        .sites
+        .iter()
+        .find(|s| s.fqn == "nested_tool.shared.answer")
+        .unwrap();
+    assert!(map.hits.values().any(|hits| hits.contains(&site.site_id)));
+    assert!(!map
+        .sites
+        .iter()
+        .any(|s| s.fqn.contains("test_alias") || s.fqn.contains("hidden")));
+    let paths = support::cfg_for(&workspace).paths();
+    let map_bytes = fs::read(SiteMap::path(&paths)).unwrap();
+    // Implicit checkout capture sees changes outside the Cargo root.
+    fs::write(&shared, original.replace("n + 1", "n")).unwrap();
+    tool(&["build", "--json", "nested-build.json"], 0);
+    let captured: State = serde_json::from_value(json(root, "nested-build.json")).unwrap();
+    assert_eq!(captured.records.len(), 1);
+    let id = captured.records[0].mutant.id.clone();
+    let body = captured.records[0].mutant.edits[0].clone();
+    assert_eq!(body.path, "../../tests/shared.rs");
+    assert_eq!(body.original, "{ n + 1 }");
+    fs::write(&shared, original).unwrap();
+    tool(&["test", "--json", "nested-test.json"], 0);
+    assert_eq!(
+        json(root, "nested-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    // A normal root-relative Git patch and line intent name the same body.
+    let patch = root.join("shared.patch");
+    fs::write(&patch, "--- a/tests/shared.rs\n+++ b/tests/shared.rs\n@@ -1 +1 @@\n-pub fn answer(n: u32) -> u32 { n + 1 }\n+pub fn answer(n: u32) -> u32 { n }\n").unwrap();
+    fs::write(
+        root.join("shared-intents.json"),
+        "{\"tests/shared.rs:1\":\"off-by-one in shared production code\"}",
+    )
+    .unwrap();
+    tool(
+        &[
+            "build",
+            "--rebuild",
+            "--patch",
+            "shared.patch=shared-intents.json",
+            "--json",
+            "nested-rebuild.json",
+        ],
+        0,
+    );
+    let rebuilt: State = serde_json::from_value(json(root, "nested-rebuild.json")).unwrap();
+    assert_eq!(rebuilt.records[0].mutant.id, id);
+    assert_eq!(rebuilt.records[0].mutant.edits[0], body);
+    assert_eq!(
+        rebuilt.records[0].mutant.intent.as_deref(),
+        Some("off-by-one in shared production code")
+    );
+    assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), map_bytes);
+    tool(&["test", "--json", "nested-retest.json"], 0);
+    assert_eq!(
+        json(root, "nested-retest.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    assert_eq!(fs::read_to_string(&shared).unwrap(), original);
+    // Explicit body-only replay across a fresh map also preserves identity.
+    tool(&["map"], 0);
+    // Simulate a fresh campaign rather than reusing an already caught record.
+    State::default().save(&paths).unwrap();
+    tool(
+        &[
+            "build",
+            "--from",
+            "nested-retest.json",
+            "--json",
+            "nested-replay.json",
+        ],
+        0,
+    );
+    let replayed: State = serde_json::from_value(json(root, "nested-replay.json")).unwrap();
+    assert_eq!(replayed.records[0].mutant.id, id);
+    assert!(matches!(
+        replayed.records[0].status,
+        cargo_quicksilver::exec::edited::Status::Built { .. }
+    ));
+    assert_eq!(replayed.records[0].mutant.edits[0], body);
+    assert_eq!(
+        replayed.records[0].mutant.intent,
+        rebuilt.records[0].mutant.intent
+    );
+    tool(&["test", "--json", "nested-replayed-test.json"], 0);
+    assert_eq!(
+        json(root, "nested-replayed-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    let before = fs::read(State::path(&paths)).unwrap();
+    fs::write(
+        root.join("tests/test_only.rs"),
+        "pub fn hidden() -> bool { false }\n",
+    )
+    .unwrap();
+    tool(&["build"], 2);
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    fs::write(
+        root.join("tests/test_only.rs"),
+        "pub fn hidden() -> bool { true }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("escape.patch"),
+        "--- a/../../escape.rs\n+++ b/../../escape.rs\n@@ -1 +1 @@\n-a\n+b\n",
+    )
+    .unwrap();
+    let out = tool(&["build", "--patch", "escape.patch"], 2);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("escapes the Git repository"));
+    assert_eq!(fs::read(State::path(&paths)).unwrap(), before);
+    assert_eq!(fs::read_to_string(&shared).unwrap(), original);
+}

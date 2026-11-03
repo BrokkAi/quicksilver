@@ -499,14 +499,23 @@ pub fn capture_checkout(
             &map.commit[..12.min(map.commit.len())]
         )]));
     }
-    let now = tracked_file_hashes(checkout)?;
+    let mut now = tracked_file_hashes(checkout)?;
+    for rel in map.files.keys() {
+        crate::worktree::repository_path(&map.prefix, rel)?;
+        let path = checkout.join(rel);
+        if !now.contains_key(rel) && path.is_file() {
+            let path = crate::worktree::checked_source_path(checkout, rel)?;
+            now.insert(rel.clone(), crate::util::sha256_file(&path)?);
+        }
+    }
     let mut problems = Vec::new();
     let mut files = Vec::new();
     for (rel, hash) in &now {
         match map.files.get(rel) {
             Some(was) if was == hash => {}
             Some(_) => {
-                let edited = std::fs::read_to_string(checkout.join(rel))
+                let path = crate::worktree::checked_source_path(checkout, rel)?;
+                let edited = std::fs::read_to_string(path)
                     .with_context(|| format!("read checkout {rel}"))?;
                 files.push((rel.clone(), edited));
             }
@@ -552,7 +561,11 @@ pub fn capture_patch(
             (Some(old), Some(new)) if old != new => problems.push(format!(
                 "`{old}` is renamed to `{new}` by the patch; a mutant may only change function bodies"
             )),
-            (Some(old), Some(_)) => { touched.insert(old.clone()); },
+            (Some(old), Some(_)) => {
+                let top = crate::worktree::repository_path("", old)?;
+                anyhow::ensure!(top == *old, "patch path must be a normalized repository path: {old}");
+                touched.insert(top);
+            },
             (None, None) => {}
         }
     }
@@ -600,16 +613,10 @@ pub fn capture_patch(
                 String::from_utf8_lossy(&out.stderr).trim()
             )]));
         }
-        let mut problems = problems.clone();
+        let problems = problems.clone();
         let mut files = Vec::new();
         for top in &touched {
-            let Some(rel) = top.strip_prefix(map.prefix.as_str()) else {
-                problems.push(format!(
-                    "`{top}` is outside the mapped workspace `{}`",
-                    map.prefix
-                ));
-                continue;
-            };
+            let rel = crate::worktree::workspace_path(&map.prefix, top)?;
             let edited = std::fs::read_to_string(scratch.join(top))
                 .with_context(|| format!("read patched {top}"))?;
             files.push((rel.to_string(), edited));
@@ -829,11 +836,19 @@ pub fn attach_intents_detailed(
     for (key, text) in intents {
         let by_line = key.rsplit_once(':').and_then(|(path, line)| {
             let line: usize = line.parse().ok()?;
-            Some((path.strip_prefix(prefix).unwrap_or(path), line))
+            Some((path, line))
         });
         let names = |fqn: &str, path: &str, span: (usize, usize)| {
             fqn == key
-                || by_line.is_some_and(|(p, line)| path == p && span.0 <= line && line <= span.1)
+                || by_line.is_some_and(|(p, line)| {
+                    (path == p
+                        || crate::worktree::repository_path(prefix, path)
+                            .ok()
+                            .as_deref()
+                            == Some(p))
+                        && span.0 <= line
+                        && line <= span.1
+                })
         };
         let hits: Vec<usize> = mutants
             .iter()
