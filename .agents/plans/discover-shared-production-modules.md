@@ -12,8 +12,9 @@ Issue #43 reports a standalone nested Cargo workspace whose binary includes thre
 - [x] (2026-11-03) Implement production graph discovery, tracked/shared boundaries, nested path conversion and map format v9 (reads v8 and default-only v7).
 - [x] (2026-11-03) Real nested binary regression passed map hits, caught shared-body fault, implicit capture, repository-root patch/intents, rebuild and fresh-state replay. Also passed diff selection, test-only edit refusal, untracked/out-of-Git exclusion and traversal refusal.
 - [x] (2026-11-03) Final role checks: 197 library tests passed/two existing ignores; all six campaign tests and Clippy/fmt passed.
-- [ ] Finish full-suite run and CI verification.
-- [ ] Run local checks, commit/push, verify CI and hand off exact executable head.
+- [x] (2026-11-03) Full local suite: 218 passed/two existing ignores. Final role handling passed library/campaign/Clippy/fmt checks again.
+- [x] (2026-11-03) Executable head e798cc449df528864df6dd7a8ccf2b59e9fc3064 pushed; CI run 41700050829 passed unit/lint and every integration suite.
+- [x] (2026-11-03) Local checks complete, implementation committed/pushed, exact CI head/conclusions independently verified; ready for install handoff.
 
 ## Surprises & Discoveries
 
@@ -34,7 +35,7 @@ The syn walker already resolves explicit path modules beyond a crate directory. 
 
 ## Outcomes & Retrospective
 
-The reported standalone nested graph now works end to end in a real CLI fixture. Shared source under tests is production when imported that way, while pure cfg(test) source stays excluded. Same-map rebuild and fresh-state body replay preserve ID, body and notes; user source remains unchanged. Final full-suite and CI verification remain. No engine manifests/files, Cargo defaults, profiles, targets, mbx layout or scheduling will change.
+The reported standalone nested graph now works end to end in a real CLI fixture. Shared source under tests is production when imported that way, while pure cfg(test) source stays excluded. Same-map rebuild and fresh-state body replay preserve ID, body and notes; user source remains unchanged. Full local suite passed 218 tests with two existing ignores. Executable head e798cc4 passed CI run 41700050829, including all standard integration suites. The campaign can install this head for its standalone crate-split scope; it also includes the previously verified feature-selection support. No engine manifests/files, Cargo defaults, profiles, targets, mbx layout or scheduling will change.
 
 ## Context and Orientation
 
@@ -65,3 +66,5 @@ Use existing syn, cargo_metadata and Git commands. Add worktree helpers returnin
 Plan created 2026-11-03 after the #42 handoff and read-only triage of #43.
 
 Updated 2026-11-03 after real CLI and role-boundary evidence, path/symlink validation, and initial full-suite progress.
+
+Completed 2026-11-03 after exact-head CI verification: https://github.com/BrokkAi/quicksilver/actions/runs/41700050829 . This final checkpoint changes only the plan; executable source remains e798cc4.
