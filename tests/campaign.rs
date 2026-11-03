@@ -1617,3 +1617,80 @@ fn authoring_cli() {
         common
     );
 }
+
+#[test]
+fn selected_binary_unit_harness_does_not_require_a_standalone_child() {
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join(".gitignore"), "*.json\n").unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\nname='unit-package'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=[]\n").unwrap();
+    let source = "fn answer() -> u32 { 42 } fn main() { println!(\"{}\", answer()); } #[cfg(test)] mod tests { #[test] fn exact_answer() { assert_eq!(super::answer(), 42); } }\n";
+    fs::write(root.join("src/main.rs"), source).unwrap();
+    git(root, &["add", "Cargo.toml", ".gitignore", "src/main.rs"]);
+    git(root, &["commit", "-m", "binary with only unit tests"]);
+    let tool = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(root)
+            .args([
+                "quicksilver",
+                "--manifest-path",
+                "Cargo.toml",
+                "-p",
+                "unit-package",
+                "--bin",
+                "unit-package",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    tool(&["map", "--json", "unit-map.json"]);
+    let map: SiteMap = serde_json::from_value(json(root, "unit-map.json")).unwrap();
+    let site = map
+        .sites
+        .iter()
+        .find(|s| s.fqn == "unit-package::bin::unit-package.answer")
+        .unwrap();
+    assert!(map
+        .tests_entering(&[site.site_id])
+        .iter()
+        .any(|t| t.name == "tests::exact_answer"));
+    fs::write(
+        root.join("src/main.rs"),
+        source.replace("-> u32 { 42 }", "-> u32 { 0 }"),
+    )
+    .unwrap();
+    tool(&["build", "--json", "unit-build.json"]);
+    fs::write(root.join("src/main.rs"), source).unwrap();
+    let state: State = serde_json::from_value(json(root, "unit-build.json")).unwrap();
+    let run = support::cfg_for(root)
+        .paths()
+        .runs
+        .join("edited")
+        .join(format!("gen-{}", state.generation));
+    let manifest: cargo_quicksilver::exec::test::BinariesManifest =
+        serde_json::from_slice(&fs::read(run.join("manifest.json")).unwrap()).unwrap();
+    assert!(
+        manifest.children.is_empty(),
+        "Cargo built only the binary unit harness here"
+    );
+    tool(&["test", "--json", "unit-test.json"]);
+    assert_eq!(
+        json(root, "unit-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    tool(&["build", "--rebuild"]);
+    tool(&["test", "--json", "unit-retest.json"]);
+    assert_eq!(
+        json(root, "unit-retest.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+}

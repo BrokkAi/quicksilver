@@ -214,6 +214,7 @@ mod tests {
             fs::write(&path, name).unwrap();
             BuiltExe {
                 test_harness: true,
+                binary_target: None,
                 original_path: None,
                 path,
                 manifest_dir: Some(self.root.join(pkg_dir)),

@@ -277,10 +277,9 @@ pub fn require_selected_binary(
         .context("selected package directory")?
         .as_std_path()
         .canonicalize()?;
-    ensure!(artifacts.iter().any(|e| !e.test_harness
-        && e.path.file_name().is_some_and(|n| n == name.as_str())
+    ensure!(artifacts.iter().any(|e| e.binary_target.as_deref() == Some(name.as_str())
         && e.manifest_dir.as_ref().and_then(|p| p.canonicalize().ok()).as_ref() == Some(&directory)),
-        "selected binary {name} was not built for package {}; enable its required Cargo features with --features before mapping/building", cfg.packages[0]);
+        "selected binary {name} produced neither a unit-test harness nor a standalone executable for package {}; enable its required Cargo features with --features or provide binary unit/integration tests", cfg.packages[0]);
     Ok(())
 }
 

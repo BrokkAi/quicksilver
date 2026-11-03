@@ -17,7 +17,8 @@ Issue #44 needs explicit source-target selection in mixed library/multi-binary p
 - [x] (2026-11-03) Initial full suite passed 222 tests/two existing ignores. Final hyphenated-binary campaign passed schema and built-in run, bare-manifest argv, proof-context and opaque-return refusal checks. Final lint/full-head checks and review remain.
 - [x] (2026-11-03) Reproduced #45 with --manifest-path Cargo.toml from its directory (ENOENT); normalized empty parent to current directory and applied that argv to the real CLI campaign.
 - [x] (2026-11-03) Full committed-head suite passed 222 tests/two existing ignores, fmt and Clippy. First review of 62334c5 found the cross-package support gap; expanded dependency/extra-test regression failed before correction and passed afterward with Clippy clean.
-- [ ] Commit review correction, obtain clean review, push, verify exact CI head and hand off.
+- [x] (2026-11-03) Cross-package correction 82c0b87 passed its expanded regression and Clippy. Second review found a unit-harness-only binary presence bug. A real no-integration binary reproduced the false missing-features error; Cargo target kind/name metadata now accepts its unit harness. Both unit-only and standalone/cross-package CLI cases passed afterward, with Clippy/fmt clean.
+- [ ] Commit final artifact-identity correction, obtain clean review, push, verify exact CI head and hand off.
 
 ## Surprises & Discoveries
 
@@ -84,3 +85,5 @@ Updated 2026-11-03 after real CLI/lease/source-context evidence and the confirme
 Updated 2026-11-03 with final hyphenated CARGO_BIN_EXE coverage, real mbx-clean-under-lease evidence, child/target refusal checks and the small #45 manifest normalization regression. Explicit binary presence is checked by target name and owning package manifest, so another package cannot satisfy a missing required-feature binary.
 
 Updated 2026-11-03 after both reviewers findings and the reproduced cross-package failure. The corrected real fixture also verifies bin-unit coverage and refuses a physical edit shared only with another workspace package. No findings were overridden.
+
+Updated 2026-11-03 after the second review: selected target presence is now identified from Cargo binary target metadata and owning package, accepting either its unit-test harness or standalone executable. The dedicated unit-only binary test confirms no child executable exists, records unit coverage, catches its mutant and rebuilds/retests successfully.

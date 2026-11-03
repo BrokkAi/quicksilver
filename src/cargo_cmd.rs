@@ -476,6 +476,8 @@ pub fn build_tests_captured(
 #[derive(Debug, Clone, PartialEq)]
 pub struct BuiltExe {
     pub test_harness: bool,
+    /// Cargo target identity, present for ordinary binaries and their unit harnesses.
+    pub binary_target: Option<String>,
     pub original_path: Option<PathBuf>,
     pub path: PathBuf,
     pub manifest_dir: Option<PathBuf>,
@@ -521,6 +523,14 @@ pub(crate) fn parse_all_executables(stdout: &[u8], target_dir: &Path) -> Vec<Bui
                 .and_then(|m| Path::new(m).parent().map(Path::to_path_buf));
             out.push(BuiltExe {
                 test_harness: is_test,
+                binary_target: plain_bin
+                    .then(|| {
+                        v.get("target")
+                            .and_then(|t| t.get("name"))
+                            .and_then(|n| n.as_str())
+                            .map(str::to_owned)
+                    })
+                    .flatten(),
                 original_path: Some(PathBuf::from(exe)),
                 path: PathBuf::from(exe),
                 manifest_dir,

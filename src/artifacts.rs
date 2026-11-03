@@ -328,6 +328,7 @@ test "$acknowledgment" = staged || exit 3
             );
             let mut exes = vec![crate::cargo_cmd::BuiltExe {
                 test_harness: true,
+                binary_target: None,
                 original_path: None,
                 path: target.join("tool-0123456789abcdef"),
                 manifest_dir: None,
@@ -371,6 +372,7 @@ test "$acknowledgment" = staged || exit 3
         let mut exes = vec![
             crate::cargo_cmd::BuiltExe {
                 test_harness: true,
+                binary_target: None,
                 original_path: None,
                 path: newer,
                 manifest_dir: None,
@@ -378,6 +380,7 @@ test "$acknowledgment" = staged || exit 3
             },
             crate::cargo_cmd::BuiltExe {
                 test_harness: true,
+                binary_target: None,
                 original_path: None,
                 path: older,
                 manifest_dir: None,
@@ -420,6 +423,7 @@ test "$acknowledgment" = staged || exit 3
         let error = exchange(&mut wrapped(&lease, &target), None, |_, _| {
             let mut exes = vec![crate::cargo_cmd::BuiltExe {
                 test_harness: true,
+                binary_target: None,
                 original_path: None,
                 path: target.join("missing"),
                 manifest_dir: None,

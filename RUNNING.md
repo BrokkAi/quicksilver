@@ -493,7 +493,9 @@ cargo quicksilver -p my_package --bin authoring_cli --features release-tooling b
 cargo quicksilver -p my_package --bin authoring_cli --features release-tooling test
 ```
 
-`--lib` selects the library explicitly. These flags choose the source root
+A binary with only unit tests is supported through its test harness; it does
+not need a standalone CLI executable. `--lib` selects the library explicitly.
+These flags choose the source root
 to instrument; package integration tests and CLI drivers remain available.
 For a whole campaign, persist the choice alongside Cargo features:
 
