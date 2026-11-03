@@ -68,3 +68,9 @@ Plan created 2026-11-03 after the #42 handoff and read-only triage of #43.
 Updated 2026-11-03 after real CLI and role-boundary evidence, path/symlink validation, and initial full-suite progress.
 
 Completed 2026-11-03 after exact-head CI verification: https://github.com/BrokkAi/quicksilver/actions/runs/41700050829 . This final checkpoint changes only the plan; executable source remains e798cc4.
+
+## Confirmed apply alias follow-up
+
+On 2026-11-03 the campaign's independent source review reported a possible in-repository symlink redirect during apply/prove. An isolated Git fixture reproduced it: a tracked lib.rs replaced with a symlink to an untracked scratch.rs with the same original body let apply return success and overwrite scratch.rs. The regression failed on e798cc4 with `Ok(["applied aabbccdd to lib.rs:1 (pkg.answer)"])`.
+
+The source guard now requires the canonical existing source path to equal the normalized repository path it names, refusing in-repository redirects as well as escapes. This preserves exact mapped file identity instead of accepting any target inside the same Git root. Library checks passed 198 tests with two existing ignores, and Clippy/fmt passed. The clean map/build --patch/test workflow does not write the caller's source and is unaffected. This follow-up is separate from #44 production-target selection.

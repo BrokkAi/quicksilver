@@ -368,6 +368,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_refuses_a_mapped_file_redirected_to_an_untracked_in_repo_file() {
+        let source = "fn answer() -> bool { true }";
+        let dir = setup(source);
+        let root = dir.path();
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["add", "lib.rs"])
+            .current_dir(root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::rename(root.join("lib.rs"), root.join("scratch.rs")).unwrap();
+        std::os::unix::fs::symlink("scratch.rs", root.join("lib.rs")).unwrap();
+        let result = change(root, &sample(), false);
+        assert!(
+            result.is_err(),
+            "mapped source alias must be refused: {result:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("scratch.rs")).unwrap(),
+            source
+        );
+        assert!(std::fs::symlink_metadata(root.join("lib.rs"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
     fn apply_revert_restores_exact_bytes_after_line_movement() {
         let original = "// é moved\r\n\r\nfn answer() -> bool { true }\r\n// keep this\r\n";
         let dir = setup(original);

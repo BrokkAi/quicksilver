@@ -252,7 +252,7 @@ pub fn workspace_path(prefix: &str, repository: &str) -> Result<String> {
 pub fn checked_source_path(workspace: &Path, path: &str) -> Result<PathBuf> {
     let repo = repo_of(workspace).ok();
     let prefix = repo.as_ref().map(|r| r.prefix.as_str()).unwrap_or("");
-    repository_path(prefix, path)?;
+    let relative = repository_path(prefix, path)?;
     let top = repo
         .as_ref()
         .map(|r| r.toplevel.as_path())
@@ -263,8 +263,8 @@ pub fn checked_source_path(workspace: &Path, path: &str) -> Result<PathBuf> {
         .canonicalize()
         .with_context(|| format!("read source {}", source.display()))?;
     anyhow::ensure!(
-        actual.starts_with(&top),
-        "source path escapes the Git repository through a symbolic link: {}",
+        actual == top.join(relative),
+        "source path redirects through a symbolic link instead of naming the mapped file: {}",
         source.display()
     );
     Ok(source)
