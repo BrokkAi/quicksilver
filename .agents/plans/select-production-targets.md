@@ -9,7 +9,7 @@ Issue #44 needs explicit source-target selection in mixed library/multi-binary p
 ## Progress
 
 - [x] (2026-11-03) Read issue, discovery/runtime routing, feature identity and protected artifact boundaries. Delegation refused because this session disables sub-agents; parent retains implementation and validation.
-- [x] (2026-11-03) Separately reproduced the reported #43 apply alias concern in a temporary Git repository; preparing its independent correction/review.
+- [x] (2026-11-03) Separately reproduced and fixed the #43 apply alias concern in a temporary Git repository; reviewed head 1381ccd was pushed and passed CI.
 - [x] (2026-11-03) Selection/config, metadata discovery, target-qualified identities, persistence and stale-state refusal implemented.
 - [x] (2026-11-03) Selected-runtime ownership and inactive shared-source contexts passed real lib/two-bin integration checks.
 - [x] (2026-11-03) Ordinary mbx helper view lease, protected child snapshots, saved digests and pre-test refusal implemented. CLI driver calls mbx clean while recording/testing and confirms its children remain present.
@@ -18,7 +18,7 @@ Issue #44 needs explicit source-target selection in mixed library/multi-binary p
 - [x] (2026-11-03) Reproduced #45 with --manifest-path Cargo.toml from its directory (ENOENT); normalized empty parent to current directory and applied that argv to the real CLI campaign.
 - [x] (2026-11-03) Full committed-head suite passed 222 tests/two existing ignores, fmt and Clippy. First review of 62334c5 found the cross-package support gap; expanded dependency/extra-test regression failed before correction and passed afterward with Clippy clean.
 - [x] (2026-11-03) Cross-package correction 82c0b87 passed its expanded regression and Clippy. Second review found a unit-harness-only binary presence bug. A real no-integration binary reproduced the false missing-features error; Cargo target kind/name metadata now accepts its unit harness. Both unit-only and standalone/cross-package CLI cases passed afterward, with Clippy/fmt clean.
-- [ ] Commit final artifact-identity correction, obtain clean review, push, verify exact CI head and hand off.
+- [x] (2026-11-03) Final executable head 4cab0aabf3dadaf7beb7cdff68f6b8f3a6d8b949 received clean review, was pushed to origin/master and passed exact-head CI run 41711044813 (both jobs/all integration suites). Final local suite: 223 passed/two existing ignores; fmt/Clippy passed. Ready for install handoff.
 
 ## Surprises & Discoveries
 
@@ -46,11 +46,11 @@ A physical source module can compile in both the selected target and an unselect
 
 ## Outcomes & Retrospective
 
-The required-feature mixed-target regression works end to end, including inactive unselected shared contexts and ordinary mbx lease protection. Initial full suite passed 222 tests with two existing ignores; final checks/review/CI remain. The accepted #43 standalone one-bin workflow can proceed at e798cc4 independently. No engine files, Cargo defaults, build profiles, physical targets or mbx scheduling will change.
+The required-feature mixed-target regression works end to end, including inactive unselected shared contexts and ordinary mbx lease protection. Final executable head 4cab0aa passed clean review and exact-head CI run 41711044813. The final local suite passed 223 tests with two existing ignores; formatting and Clippy passed. The unit-only binary and mixed-target dependency/extra-test cases both work. #45 bare manifest normalization is included. The accepted #43 standalone one-bin workflow can proceed at e798cc4 independently. No engine files, Cargo defaults, build profiles, physical targets or mbx scheduling will change.
 
 ## Context and Orientation
 
-`src/cargo_cmd.rs::mutable_scope` and `crate_root_source` choose the current legacy root. `src/discover.rs` walks it and assigns FQNs. `src/schema.rs` inserts crate::__qs_rt dispatch; `src/exec/edited.rs` groups sites by package and persists map/state. `src/exec/schema.rs` handles built-in mutants. `src/features.rs`, `src/config.rs`, `src/sitemap.rs` and `src/types.rs` provide patterns for serializable campaign identity. `src/artifacts.rs` keeps an mbx build session alive until harness copies finish. `src/exec/test.rs::BinariesManifest` records staged tests but currently no ordinary child executable identity.
+`src/cargo_cmd.rs::mutable_scope` and `crate_root_source` preserve the legacy default root; `src/production.rs::Selection` resolves explicit roots and validates target identity. `src/discover.rs` walks it and assigns FQNs. `src/schema.rs` inserts crate::__qs_rt dispatch; `src/exec/edited.rs` groups sites by package and persists map/state. `src/exec/schema.rs` handles built-in mutants. `src/features.rs`, `src/config.rs`, `src/sitemap.rs` and `src/types.rs` provide patterns for serializable campaign identity. `src/artifacts.rs` keeps an mbx build session alive until harness copies finish. `src/exec/test.rs::BinariesManifest` records staged tests, artifact schema version and ordinary child executable identities.
 
 ## Plan of Work
 
@@ -87,3 +87,5 @@ Updated 2026-11-03 with final hyphenated CARGO_BIN_EXE coverage, real mbx-clean-
 Updated 2026-11-03 after both reviewers findings and the reproduced cross-package failure. The corrected real fixture also verifies bin-unit coverage and refuses a physical edit shared only with another workspace package. No findings were overridden.
 
 Updated 2026-11-03 after the second review: selected target presence is now identified from Cargo binary target metadata and owning package, accepting either its unit-test harness or standalone executable. The dedicated unit-only binary test confirms no child executable exists, records unit coverage, catches its mutant and rebuilds/retests successfully.
+
+Completed 2026-11-03 after verifying exact CI head SHA and both job conclusions: https://github.com/BrokkAi/quicksilver/actions/runs/41711044813 . The final plan checkpoint changes no executable source; the tested install head remains 4cab0aa.
