@@ -1017,6 +1017,33 @@ pub(crate) fn stage_tests(
     tests: &[&TestInfo],
     executables: &[crate::cargo_cmd::BuiltExe],
 ) -> Result<()> {
+    let result = stage_tests_inner(cfg, target, run_dir, tests, executables);
+    if let Err(error) = &result {
+        let path = cfg.paths().index.join("last-staging-failure.json");
+        let diagnostic = serde_json::json!({
+            "phase": "final staging", "target": target, "run_dir": run_dir,
+            "target_exists": target.exists(), "error": format!("{error:#}"),
+            "reported_artifacts": executables.iter().map(|e| &e.path).collect::<Vec<_>>(),
+            "tests": tests.iter().map(|t| &t.id).collect::<Vec<_>>()
+        });
+        if let Err(save) = crate::util::write_atomic(&path, serde_json::to_vec_pretty(&diagnostic)?)
+        {
+            tracing::warn!(
+                "could not save staging failure {}: {save:#}",
+                path.display()
+            );
+        }
+    }
+    result
+}
+
+fn stage_tests_inner(
+    cfg: &Config,
+    target: &Path,
+    run_dir: &Path,
+    tests: &[&TestInfo],
+    executables: &[crate::cargo_cmd::BuiltExe],
+) -> Result<()> {
     if let Some(parent) = run_dir.parent() {
         fs::create_dir_all(parent)?;
         crate::scratch::check_free_space(parent, cfg.max_scratch)?;
@@ -1025,17 +1052,9 @@ pub(crate) fn stage_tests(
         let _ = fs::remove_dir_all(run_dir);
     }
     fs::create_dir_all(run_dir)?;
-    let mut built: Vec<crate::cargo_cmd::BuiltExe> = executables.to_vec();
-    if built.is_empty() {
-        built.extend(
-            scan_test_exes(target)
-                .into_values()
-                .map(|path| crate::cargo_cmd::BuiltExe {
-                    path,
-                    manifest_dir: None,
-                }),
-        );
-    }
+    anyhow::ensure!(tests.is_empty() || !executables.is_empty(),
+        "Cargo reported no test harnesses for {} selected tests; refusing to scan unprotected target artifacts", tests.len());
+    let built = executables.to_vec();
     // One staged copy per distinct binary: tests share harnesses, and a copy
     // per test staged 1,380 copies of clap's test binaries.
     let mut staged: HashMap<PathBuf, String> = HashMap::new();
@@ -1095,37 +1114,6 @@ pub(crate) fn stage_tests(
         serde_json::to_vec_pretty(&manifest)?,
     )?;
     Ok(())
-}
-
-fn scan_test_exes(target: &Path) -> HashMap<String, PathBuf> {
-    let mut out = HashMap::new();
-    for profile in ["debug"] {
-        let deps = target.join(profile).join("deps");
-        let Ok(rd) = fs::read_dir(&deps) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let p = e.path();
-            if !p.is_file() {
-                continue;
-            }
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if name.contains('.') {
-                continue;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let Ok(meta) = e.metadata() else { continue };
-                if meta.permissions().mode() & 0o111 == 0 {
-                    continue;
-                }
-            }
-            out.insert(name.into_owned(), p);
-        }
-    }
-    out
 }
 
 pub(crate) fn rebase_to_worker(path: &Path, baseline: &Path, worker: &Path) -> PathBuf {

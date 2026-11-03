@@ -435,62 +435,7 @@ pub fn build_tests_captured(
     packages: &[String],
     progress: Option<&crate::progress::Progress>,
 ) -> Result<CapturedBuild> {
-    let mut cmd = cargo_command();
-    cmd.current_dir(root);
-    apply_build_env(&mut cmd, cfg);
-    cmd.arg("build").arg("--tests");
-    apply_package_select(&mut cmd, packages);
-    cmd.arg("--message-format=json");
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let start = Instant::now();
-    let (status, stdout, stderr) = match progress {
-        None => {
-            let output = cmd
-                .output()
-                .context("cargo build --tests --message-format=json")?;
-            (output.status, output.stdout, output.stderr)
-        }
-        Some(progress) => {
-            use std::io::{BufRead, Read};
-            let mut child = cmd
-                .spawn()
-                .context("cargo build --tests --message-format=json")?;
-            let err = child.stderr.take().context("cargo stderr")?;
-            let mut out = child.stdout.take().context("cargo stdout")?;
-            let stderr = std::thread::scope(|scope| {
-                let reader = scope.spawn(move || {
-                    let mut kept = Vec::new();
-                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                        let trimmed = line.trim_start();
-                        if let Some(rest) = trimmed.strip_prefix("Compiling ") {
-                            progress.set_message(rest.split_whitespace().next().unwrap_or(rest));
-                            progress.inc(1);
-                        } else if trimmed.starts_with("mbx[") {
-                            progress.println(trimmed);
-                        }
-                        kept.extend_from_slice(line.as_bytes());
-                        kept.push(b'\n');
-                    }
-                    kept
-                });
-                let mut stdout = Vec::new();
-                let _ = out.read_to_end(&mut stdout);
-                (stdout, reader.join().unwrap_or_default())
-            });
-            let status = child.wait().context("wait for cargo build")?;
-            (status, stderr.0, stderr.1)
-        }
-    };
-    let secs = start.elapsed().as_secs_f64();
-    let executables = parse_executables(&stdout, target_dir);
-    Ok(CapturedBuild {
-        success: status.success(),
-        secs,
-        stdout,
-        stderr,
-        executables,
-    })
+    crate::artifacts::build(root, target_dir, cfg, packages, progress)
 }
 
 /// Test harnesses built by `cargo build --tests`, in build order.
@@ -506,6 +451,7 @@ pub fn build_tests_captured(
 pub struct BuiltExe {
     pub path: PathBuf,
     pub manifest_dir: Option<PathBuf>,
+    pub(crate) artifacts: Option<std::sync::Arc<crate::artifacts::ArtifactCopies>>,
 }
 
 pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
@@ -536,6 +482,7 @@ pub fn parse_executables(stdout: &[u8], target_dir: &Path) -> Vec<BuiltExe> {
             out.push(BuiltExe {
                 path: PathBuf::from(exe),
                 manifest_dir,
+                artifacts: None,
             });
         }
     }

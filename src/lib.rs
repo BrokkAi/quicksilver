@@ -1,4 +1,5 @@
 pub mod apply;
+mod artifacts;
 pub mod baseline;
 pub mod capture;
 pub mod cargo_cmd;
@@ -48,6 +49,11 @@ pub fn init_tracing() {
 
 pub fn run_cli(cli: cli::Cli) -> Result<i32> {
     init_tracing();
+    // The helper is already inside the mbx command whose lease we extend.
+    if let cli::Command::ProtectedCargo(args) = cli.command {
+        return artifacts::helper(&args.args, &args.helper_bin);
+    }
+    artifacts::remember_executable()?;
     // Before any thread starts: it changes this process's environment.
     mbx_env::leave_enclosing_session();
     let result = match cli.command {
@@ -63,6 +69,7 @@ pub fn run_cli(cli: cli::Cli) -> Result<i32> {
         cli::Command::Apply(args) => apply::run_apply(&cli.common, args),
         cli::Command::Prove(args) => apply::run_prove(&cli.common, args),
         cli::Command::Clean => cmd_clean(&cli.common),
+        cli::Command::ProtectedCargo(_) => unreachable!("handled before session restore"),
     };
     if let Some(line) = sandbox::summary() {
         eprintln!("{line}");

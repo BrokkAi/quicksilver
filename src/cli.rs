@@ -90,6 +90,8 @@ pub struct CommonOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(name = "__cargo-build", hide = true)]
+    ProtectedCargo(ProtectedCargoArgs),
     /// Mutate functions with simple built-in replacements (`0`, `true`,
     /// `None`, ...) and run the tests that reach each one.
     Run(RunArgs),
@@ -123,6 +125,14 @@ pub enum Command {
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
+}
+
+#[derive(Args, Debug)]
+pub struct ProtectedCargoArgs {
+    #[arg(long)]
+    pub helper_bin: PathBuf,
+    #[arg(last = true, required = true, allow_hyphen_values = true)]
+    pub args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Args, Debug, Default)]

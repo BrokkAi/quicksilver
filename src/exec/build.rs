@@ -54,6 +54,9 @@ pub(crate) fn resolve_binary(
         }
         return Ok(e.path.clone());
     }
+    if built.iter().any(|e| e.artifacts.is_some()) {
+        anyhow::bail!("no protected artifact from this build matches test {} (base {}, package path {}); refusing an unstaged target fallback", test.id, want.base, test.cwd_rel);
+    }
     if !built.is_empty() {
         tracing::warn!(
             "resolve {}: no executable from this build matches base {} in {}; falling back to {}",
@@ -211,6 +214,7 @@ mod tests {
             BuiltExe {
                 path,
                 manifest_dir: Some(self.root.join(pkg_dir)),
+                artifacts: None,
             }
         }
     }

@@ -53,6 +53,14 @@ pub fn run_green_suite(
     }
     let config_path = write_nextest_config(&paths.index, &paths.baseline, &cfg.nextest_profile)?;
     let meta = load_metadata(&paths.baseline)?;
+    // Resolve QS globs against concrete IDs instead of approximating their
+    // semantics in nextest's DSL. Listing builds/runs no test bodies.
+    let catalog = if cfg.skip_tests.is_empty() {
+        Vec::new()
+    } else {
+        crate::index::list_tests_plain(cfg, paths)?
+    };
+    let filter = baseline_filter(cfg, &meta, &catalog)?;
     let mut last_tests = Vec::new();
     let mut failures = std::collections::BTreeMap::new();
     let mut last_secs = 0.0;
@@ -73,8 +81,11 @@ pub fn run_green_suite(
             &mut cmd,
             &crate::cargo_cmd::test_packages(cfg, &meta),
         );
-        if let Some(filter) = crate::cargo_cmd::nextest_filter(cfg, &meta) {
+        if let Some(filter) = &filter {
             cmd.arg("-E").arg(filter);
+        }
+        if !cfg.skip_tests.is_empty() {
+            cmd.args(["--no-tests", "pass"]);
         }
         cmd.stdout(Stdio::inherit());
         cmd.stderr(Stdio::inherit());
@@ -157,6 +168,73 @@ pub fn run_green_suite(
             .map(|(id, kind)| BaselineFailure { id, kind })
             .collect(),
     ))
+}
+
+/// Exact-match text in nextest's no-quotes DSL. Escape control and delimiter
+/// characters; escaping as a shell or JSON string would change the matcher.
+fn exact_match(value: &str) -> String {
+    let mut out = String::from("=");
+    for c in value.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            ')' => out.push_str("\\)"),
+            ',' => out.push_str("\\,"),
+            '/' => out.push_str("\\/"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_whitespace() || c == '(' => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn baseline_filter(
+    cfg: &Config,
+    meta: &cargo_metadata::Metadata,
+    catalog: &[TestInfo],
+) -> Result<Option<String>> {
+    let selection = crate::cargo_cmd::nextest_filter(cfg, meta);
+    let Some(skip) = crate::index::skip_globs(&cfg.skip_tests)? else {
+        return Ok(selection);
+    };
+    let mut by_binary: std::collections::BTreeMap<&str, (usize, Vec<&str>)> = Default::default();
+    for test in catalog {
+        let (total, names) = by_binary.entry(&test.binary_id).or_default();
+        *total += 1;
+        if skip.is_match(&test.id) {
+            names.push(&test.name);
+        }
+    }
+    let exclusions: Vec<String> = by_binary
+        .into_iter()
+        .filter_map(|(binary, (total, names))| {
+            if names.is_empty() {
+                return None;
+            }
+            let binary = format!("binary_id({})", exact_match(binary));
+            if names.len() == total {
+                return Some(binary);
+            }
+            Some(format!(
+                "({binary} & ({}))",
+                names
+                    .iter()
+                    .map(|name| format!("test({})", exact_match(name)))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ))
+        })
+        .collect();
+    if exclusions.is_empty() {
+        return Ok(selection);
+    }
+    let omitted = format!("not ({})", exclusions.join(" | "));
+    Ok(Some(match selection {
+        Some(selection) => format!("({selection}) & {omitted}"),
+        None => omitted,
+    }))
 }
 
 pub fn parse_junit(xml: &str, meta: &cargo_metadata::Metadata) -> Result<Vec<TestInfo>> {
@@ -478,6 +556,13 @@ mod tests {
         let warning = crate::types::baseline_failure_summary(&typed);
         assert!(warning.contains("FAIL pkg::extra::assertion"));
         assert!(warning.contains("TIMEOUT pkg::extra::slow"));
+    }
+
+    #[test]
+    fn equality_matchers_escape_nextest_delimiters_without_shell_quotes() {
+        assert_eq!(exact_match("a),x\\z\n"), "=a\\)\\,x\\\\z\\n");
+        assert_eq!(exact_match("(space here)"), "=\\u{28}space\\u{20}here\\)");
+        assert_eq!(exact_match("module::case[0]"), "=module::case[0]");
     }
 
     #[test]
