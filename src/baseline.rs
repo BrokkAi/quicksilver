@@ -1,6 +1,5 @@
 use crate::cargo_cmd::{
-    apply_build_env, count_compiling_units, dump_metadata_json, nextest_available,
-    write_nextest_config, BuildResult,
+    apply_build_env, count_compiling_units, dump_metadata_json, nextest_available, BuildResult,
 };
 use crate::config::Config;
 use crate::discover::{apply_mutant, restore_file};
@@ -62,7 +61,7 @@ pub fn run_green_suite(
     if !nextest_available() {
         bail!("cargo nextest is required. Install it with: cargo install cargo-nextest");
     }
-    let config_path = write_nextest_config(&paths.index, &paths.baseline, &cfg.nextest_profile)?;
+    let config = crate::baseline_env::prepare(cfg, paths)?;
     let meta = crate::cargo_cmd::load_metadata_with_features(&paths.baseline, &cfg.cargo_features)?;
     // Resolve QS globs against concrete IDs instead of approximating their
     // semantics in nextest's DSL. Listing builds/runs no test bodies.
@@ -88,7 +87,7 @@ pub fn run_green_suite(
         cmd.args(["nextest", "run"]);
         cfg.cargo_features.apply(&mut cmd);
         cmd.args(["--profile", &cfg.nextest_profile]);
-        cmd.arg("--config-file").arg(&config_path);
+        cmd.arg("--config-file").arg(&config.path);
         crate::cargo_cmd::apply_package_select(
             &mut cmd,
             &crate::cargo_cmd::test_packages(cfg, &meta),

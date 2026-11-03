@@ -152,8 +152,16 @@ mod tests {
             return;
         };
         let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
-        assert_eq!(std::path::Path::new(&state).parent(), home.parent());
-        let marker = home.join(".cache").join("fixture").join("marker");
+        let direct = std::env::var_os("QS_RECORD_SITES").is_some()
+            || std::env::var_os("QS_MUTANT").is_some();
+        let marker = if direct {
+            assert_eq!(std::path::Path::new(&state).parent(), home.parent());
+            home.join(".cache").join("fixture").join("marker")
+        } else {
+            // Baseline gets test-env too, but retains the caller's HOME.
+            // Its explicit scratch placeholder must still be fresh.
+            std::path::Path::new(&state).join("marker")
+        };
         assert!(!marker.exists(), "{} is left over", marker.display());
         std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
         std::fs::write(&marker, add(1, 2).to_string()).unwrap();
@@ -180,8 +188,7 @@ mod tests {
         assert_eq!(cfg_gated_target(), 5);
     }
 
-    // Like a latency guard that fails under quicksilver's switch: green in
-    // the baseline run, red where `[test-env]` sets FIXTURE_STATE.
+    // Like a latency guard left out by skip-tests before baseline or recording.
     #[test]
     fn timing_guard_red_under_quicksilver() {
         assert!(std::env::var_os("FIXTURE_STATE").is_none(), "too slow");
@@ -211,17 +218,23 @@ mod tests {
         assert_eq!(std::env::var("NEXTEST").unwrap(), "1");
         // `cargo` on PATH is the same toolchain cargo.
         let path = std::env::var_os("PATH").unwrap();
-        assert_eq!(
-            std::env::split_paths(&path).next().as_deref(),
-            cargo.parent()
-        );
+        if std::env::var_os("QS_RECORD_SITES").is_some()
+            || std::env::var_os("QS_MUTANT").is_some()
+        {
+            assert_eq!(
+                std::env::split_paths(&path).next().as_deref(),
+                cargo.parent()
+            );
+        }
     }
 
     #[test]
     fn red_only_when_asked() {
-        // Quicksilver's end-to-end test sets this through `[test-env]`, to
-        // check that a test that is not green keeps its output.
-        if std::env::var_os("FIXTURE_NOT_GREEN").is_some() {
+        // Deliberately fail only during schema recording, to check retained
+        // not-green output. The baseline now receives test-env as well.
+        if std::env::var_os("FIXTURE_NOT_GREEN").is_some()
+            && std::env::var_os("QS_RECORD_SITES").is_some()
+        {
             println!("output before the failure");
             panic!("asked to fail by FIXTURE_NOT_GREEN");
         }

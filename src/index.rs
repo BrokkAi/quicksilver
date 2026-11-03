@@ -56,6 +56,14 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
         "--profile",
         &cfg.nextest_profile,
     ]);
+    let config = if cfg.test_env.is_empty() {
+        None
+    } else {
+        Some(crate::baseline_env::prepare(cfg, paths)?)
+    };
+    if let Some(config) = &config {
+        cmd.arg("--config-file").arg(&config.path);
+    }
     apply_package_select(&mut cmd, &test_packages(cfg, &meta));
     cfg.cargo_features.apply(&mut cmd);
     let out = cmd.output().context("cargo nextest list")?;

@@ -616,8 +616,10 @@ settings; `build` warns when they changed since `map`.
 
 The baseline merges `.config/nextest.toml` from the mapped commit, preserving
 its timeouts, per-test overrides and profile inheritance. Quicksilver changes
-only fail-fast (to collect the whole suite) and the JUnit report path. To
-select a project profile:
+fail-fast (to collect the whole suite) and the JUnit report path. When
+`[test-env]` is configured, it also wraps test subprocesses to apply those
+values without passing them to Cargo or rustc. Existing project wrappers
+and target runners are preserved. To select a project profile:
 
 ```toml
 [map]
@@ -693,12 +695,13 @@ directory fails in the sandbox and selects no mutants.
 
 `--no-sandbox`, or `enabled = false` under `[sandbox]`, runs tests in your
 own environment. The baseline `cargo nextest run`, which runs no mutants,
-always runs in your environment.
+keeps your HOME/TMP defaults, with any explicit `[test-env]` overrides.
 
 ### The test environment
 
-Quicksilver runs each test itself, one process per test, not through
-nextest or mbx. A test gets what nextest gives it: `CARGO` (the toolchain's
+For schema recording and mutant checks, Quicksilver runs each test itself,
+one process per test, outside nextest and mbx. A test gets what nextest
+gives it: `CARGO` (the toolchain's
 own cargo, not a wrapper), `CARGO_MANIFEST_DIR`, the `CARGO_PKG_*`
 variables of its package, `NEXTEST=1`, `NEXTEST_EXECUTION_MODE` and
 `NEXTEST_RUN_ID`. Its `PATH` starts with the toolchain's `bin` directory,
@@ -707,7 +710,11 @@ such as mbx's, comes first in yours. It does not get `CARGO_TARGET_DIR`,
 and it does not run inside mbx's build session.
 
 `[test-env]` sets more variables for every test process, and wins over all
-of the above; `{sandbox}` stands for the process's sandbox directory:
+of the above. These settings also reach baseline tests and test listing,
+while builds receive only `[build-env]`. This requires nextest 0.9.98 or
+later when `[test-env]` is nonempty. `{sandbox}` stands for a private
+directory for that test invocation, including during the baseline; it is
+cleaned up when the test run finishes:
 
 ```toml
 [test-env]

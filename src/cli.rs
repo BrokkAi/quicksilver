@@ -109,6 +109,8 @@ pub struct CommonOpts {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    #[command(name = "__baseline-env", hide = true)]
+    BaselineEnv(BaselineEnvArgs),
     #[command(name = "__hold-target", hide = true)]
     HoldTarget,
     #[command(name = "__cargo-build", hide = true)]
@@ -146,6 +148,16 @@ pub enum Command {
     /// Remove QS's worktrees of this repository and its state, and tell mbx
     /// their build output is no longer needed.
     Clean,
+}
+
+#[derive(Args, Debug)]
+pub struct BaselineEnvArgs {
+    #[arg(long)]
+    pub spec: PathBuf,
+    #[arg(long)]
+    pub wrapper: String,
+    #[arg(last = true, required = true, allow_hyphen_values = true)]
+    pub args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Args, Debug)]

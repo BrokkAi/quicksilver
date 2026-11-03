@@ -1694,3 +1694,255 @@ fn selected_binary_unit_harness_does_not_require_a_standalone_child() {
         "caught"
     );
 }
+
+#[test]
+fn baseline_test_env_reaches_tests_without_reaching_the_build() {
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(root.join("Cargo.toml"), "[package]\nname='test-env-probe'\nversion='0.1.0'\nedition='2021'\n[workspace]\nmembers=[]\n").unwrap();
+    fs::write(root.join(".gitignore"), "*.json\n").unwrap();
+    fs::write(
+        root.join("quicksilver.toml"),
+        "[test-env]\nBIFROST_QS_ENV_PROBE='configured'\n",
+    )
+    .unwrap();
+    fs::write(
+        root.join("build.rs"),
+        r#"
+fn main() {
+    println!("cargo:rerun-if-env-changed=BIFROST_QS_ENV_PROBE");
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    assert!(std::env::var_os("BIFROST_QS_ENV_PROBE").is_none(), "test-env leaked to build.rs");
+}
+"#,
+    )
+    .unwrap();
+    let source = r#"
+pub fn value() -> String { "configured".into() }
+#[cfg(test)] mod tests {
+    #[test] fn requires_test_env() {
+        assert!(option_env!("BIFROST_QS_ENV_PROBE").is_none(), "test-env leaked to rustc");
+        assert_eq!(std::env::var("BIFROST_QS_ENV_PROBE").unwrap(), "configured");
+        assert_eq!(super::value(), std::env::var("BIFROST_QS_ENV_PROBE").unwrap());
+    }
+}
+"#;
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    git(
+        root,
+        &[
+            "add",
+            "Cargo.toml",
+            ".gitignore",
+            "quicksilver.toml",
+            "build.rs",
+            "src/lib.rs",
+        ],
+    );
+    git(
+        root,
+        &[
+            "commit",
+            "-m",
+            "test-only environment must not affect compilation",
+        ],
+    );
+    let tool = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cargo-quicksilver"))
+            .current_dir(root)
+            .env_remove("BIFROST_QS_ENV_PROBE")
+            .args(["quicksilver", "--no-sandbox", "-p", "test-env-probe"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    tool(&["map", "--json", "env-map.json"]);
+    let map: SiteMap = serde_json::from_value(json(root, "env-map.json")).unwrap();
+    let site = map
+        .sites
+        .iter()
+        .find(|s| s.fqn.ends_with(".value"))
+        .unwrap();
+    assert!(!map.tests_entering(&[site.site_id]).is_empty());
+    assert!(map.baseline_failures.is_empty() && map.not_green.is_empty());
+    fs::write(
+        root.join("src/lib.rs"),
+        source.replace("{ \"configured\".into() }", "{ \"wrong\".into() }"),
+    )
+    .unwrap();
+    tool(&["build", "--json", "env-build.json"]);
+    fs::write(root.join("src/lib.rs"), source).unwrap();
+    tool(&["test", "--json", "env-test.json"]);
+    assert_eq!(
+        json(root, "env-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+}
+
+/// Exercise real nextest profile inheritance, wrappers, target runners and
+/// timed-out scratch cleanup without changing Cargo's compilation environment.
+#[test]
+fn baseline_test_env_composes_project_policy_and_cleans_scratch() {
+    let repo = support::setup_tiny();
+    let evidence = tempfile::tempdir().unwrap();
+    let scratch = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    fs::create_dir_all(root.join(".config")).unwrap();
+    fs::create_dir_all(root.join(".cargo")).unwrap();
+    fs::write(root.join("wrapper.sh"), "#!/bin/sh\n[ \"$BASELINE_LITERAL\" = \"$BASELINE_EXPECT_LITERAL\" ] || exit 73\nexport BASELINE_WRAPPER=yes\nexec \"$@\"\n").unwrap();
+    fs::write(
+        root.join("runner.sh"),
+        "#!/bin/sh\nexport BASELINE_RUNNER=yes\nexec \"$@\"\n",
+    )
+    .unwrap();
+    let runner = toml::Value::try_from(vec![
+        "sh".to_owned(),
+        root.join("runner.sh").to_string_lossy().into_owned(),
+    ])
+    .unwrap();
+    fs::write(
+        root.join(".cargo/config.toml"),
+        format!("[target.'cfg(all())']\nrunner = {runner}\n"),
+    )
+    .unwrap();
+    let probe = format!(
+        r#"
+#[cfg(test)] mod baseline_env_probe {{
+    fn check(name: &str, wrapped: bool) {{
+        assert!(option_env!("BASELINE_LITERAL").is_none());
+        assert_eq!(std::env::var("BASELINE_LITERAL").unwrap(), "quote' dollar$ backtick` newline\nend");
+        assert_eq!(std::env::var("BASELINE_OVERRIDE").unwrap(), "test-env");
+        let expected_wrapper = if wrapped {{ std::env::var("BASELINE_EXPECT_WRAPPER").unwrap() }} else {{ "absent".into() }};
+        assert_eq!(std::env::var("BASELINE_WRAPPER").unwrap_or("absent".into()), expected_wrapper);
+        let expected_runner = if wrapped {{ std::env::var("BASELINE_EXPECT_RUNNER").unwrap() }} else {{ "yes".into() }};
+        assert_eq!(std::env::var("BASELINE_RUNNER").unwrap_or("absent".into()), expected_runner);
+        assert_eq!(std::env::var("HOME").unwrap(), {:?});
+        let scratch = std::path::PathBuf::from(std::env::var("BASELINE_SCRATCH").unwrap());
+        assert!(scratch.is_dir());
+        assert!(scratch.join("home").is_dir());
+        assert!(scratch.join("tmp").is_dir());
+        std::fs::write(std::path::Path::new({:?}).join(name), scratch.to_str().unwrap()).unwrap();
+    }}
+    #[test] fn environment() {{ check(module_path!(), module_path!().starts_with("tiny_a")); }}
+}}
+"#,
+        std::env::var("HOME").unwrap(),
+        evidence.path()
+    );
+    for package in ["crate_a", "crate_c"] {
+        let path = root.join(package).join("src/lib.rs");
+        fs::write(
+            &path,
+            format!("{}\n{probe}", fs::read_to_string(&path).unwrap()),
+        )
+        .unwrap();
+    }
+    let extra = root.join("crate_b/src/lib.rs");
+    fs::write(&extra, format!("{}\n#[cfg(test)] mod timeout_probe {{ #[test] fn times_out() {{ let path = std::env::var(\"BASELINE_SCRATCH\").unwrap(); std::fs::write({:?}, path).unwrap(); std::thread::sleep(std::time::Duration::from_secs(10)); }} }}\n", fs::read_to_string(&extra).unwrap(), evidence.path().join("timeout"))).unwrap();
+    let mut cfg = support::cfg_for(root);
+    cfg.packages = vec!["tiny_a".into()];
+    cfg.extra_tests = vec!["tiny_b".into(), "tiny_c".into()];
+    cfg.nextest_profile = "campaign".into();
+    cfg.sandbox = true;
+    cfg.sandbox_dir = Some(scratch.path().to_path_buf());
+    cfg.test_env = [
+        ("BASELINE_SCRATCH", "{sandbox}"),
+        ("BASELINE_OVERRIDE", "test-env"),
+        ("BASELINE_LITERAL", "quote' dollar$ backtick` newline\nend"),
+        (
+            "BASELINE_EXPECT_LITERAL",
+            "quote' dollar$ backtick` newline\nend",
+        ),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.into(), v.into()))
+    .collect();
+    for (policy, wrapper, runner) in [
+        ("within-wrapper", "yes", "yes"),
+        ("around-wrapper", "yes", "yes"),
+        ("ignore", "yes", "absent"),
+        ("overrides-wrapper", "absent", "yes"),
+    ] {
+        fs::write(
+            root.join(".config/nextest.toml"),
+            format!(
+                r#"
+experimental = ["wrapper-scripts"]
+[scripts.wrapper.project]
+command = {{ command-line = ["sh", {:?}], env = {{ BASELINE_OVERRIDE = "wrapper" }} }}
+target-runner = "{policy}"
+[profile.default]
+slow-timeout = {{ period = "10s", terminate-after = 2 }}
+[[profile.default.scripts]]
+filter = 'binary(tiny_a) | binary(tiny_b)'
+run-wrapper = 'project'
+list-wrapper = 'project'
+[profile.campaign]
+inherits = "default"
+[[profile.campaign.overrides]]
+filter = 'test(times_out)'
+slow-timeout = {{ period = "500ms", terminate-after = 1, grace-period = "0s" }}
+"#,
+                root.join("wrapper.sh")
+            ),
+        )
+        .unwrap();
+        git(
+            root,
+            &[
+                "add",
+                ".config",
+                ".cargo",
+                "wrapper.sh",
+                "runner.sh",
+                "crate_a/src/lib.rs",
+                "crate_b/src/lib.rs",
+                "crate_c/src/lib.rs",
+            ],
+        );
+        git(root, &["commit", "-m", policy]);
+        cfg.test_env
+            .insert("BASELINE_EXPECT_WRAPPER".into(), wrapper.into());
+        cfg.test_env
+            .insert("BASELINE_EXPECT_RUNNER".into(), runner.into());
+        // An unwrapped test must still use its original Cargo target runner.
+        // The probe in tiny_c checks that separately from wrapped tiny_a.
+        let paths = cfg.paths();
+        let failures = cargo_quicksilver::baseline::prepare_baseline(&cfg, &paths, false)
+            .unwrap()
+            .failures;
+        assert_eq!(failures.len(), 1, "{policy}: {failures:?}");
+        assert!(failures[0].id.ends_with("timeout_probe::times_out"));
+        assert_eq!(
+            failures[0].kind,
+            cargo_quicksilver::types::BaselineFailureKind::Timeout
+        );
+        let dirs: Vec<_> = fs::read_dir(evidence.path())
+            .unwrap()
+            .map(|entry| {
+                let path = fs::read_to_string(entry.unwrap().path()).unwrap();
+                assert!(!Path::new(&path).exists(), "{policy}: leaked {path}");
+                path
+            })
+            .collect();
+        assert_eq!(dirs.len(), 3);
+        assert_eq!(
+            dirs.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            3
+        );
+        assert!(fs::read_dir(scratch.path()).unwrap().next().is_none());
+        assert!(!fs::read_dir(&paths.index).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("nextest-env-")));
+    }
+}

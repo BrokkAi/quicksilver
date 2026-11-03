@@ -202,6 +202,37 @@ impl Settings {
     /// Set up `cmd` to run in a new sandbox, which the returned guard
     /// deletes when dropped. Without a sandbox, only `[test-env]` is set.
     pub fn prepare(self: &Arc<Self>, cmd: &mut Command) -> Result<Option<Sandbox>> {
+        self.prepare_inner(cmd, true)
+    }
+
+    /// Baseline tests keep their inherited HOME/TMP. Only explicit test-env
+    /// entries change; placeholders still get a private per-process directory.
+    pub(crate) fn prepare_test_env(self: &Arc<Self>, cmd: &mut Command) -> Result<Option<Sandbox>> {
+        self.prepare_inner(cmd, false)
+    }
+
+    pub(crate) fn for_baseline(
+        parent: Option<PathBuf>,
+        env: BTreeMap<String, String>,
+        records: &Path,
+    ) -> Result<Arc<Self>> {
+        let mut settings = Self::new(parent, env, &RealDirs::from_env())?;
+        settings.record = Some(records.join(std::process::id().to_string()));
+        settings.finished.store(true, Ordering::Relaxed);
+        Ok(Arc::new(settings))
+    }
+
+    fn prepare_inner(
+        self: &Arc<Self>,
+        cmd: &mut Command,
+        full_sandbox: bool,
+    ) -> Result<Option<Sandbox>> {
+        if !full_sandbox && !self.test_env.values().any(|v| v.contains(PLACEHOLDER)) {
+            for (key, value) in &self.test_env {
+                cmd.env(key, value);
+            }
+            return Ok(None);
+        }
         let Some(parent) = &self.parent else {
             for (key, value) in &self.test_env {
                 cmd.env(key, value);
@@ -227,11 +258,13 @@ impl Settings {
             fs::copy(from, &to)
                 .with_context(|| format!("copy {} into the sandbox", from.display()))?;
         }
-        for (key, path) in sandbox_vars(&dir) {
-            cmd.env(key, path);
-        }
-        for (key, value) in &self.fixed {
-            cmd.env(key, value);
+        if full_sandbox {
+            for (key, path) in sandbox_vars(&dir) {
+                cmd.env(key, path);
+            }
+            for (key, value) in &self.fixed {
+                cmd.env(key, value);
+            }
         }
         let dir_text = dir.to_string_lossy();
         for (key, value) in &self.test_env {
@@ -494,7 +527,7 @@ impl Settings {
 /// file per process, named by its id, with the path of its sandbox
 /// directory. (Before sandboxes moved out of the repository, each entry was
 /// the sandbox directory itself.)
-fn remove_stale(records: &Path) {
+pub(crate) fn remove_stale(records: &Path) {
     let Ok(entries) = fs::read_dir(records) else {
         return;
     };

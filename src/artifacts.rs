@@ -15,7 +15,7 @@ pub(crate) fn remember_executable() -> Result<()> {
     Ok(())
 }
 
-fn executable() -> Result<PathBuf> {
+pub(crate) fn executable() -> Result<PathBuf> {
     if let Some(path) = EXECUTABLE.get() {
         return Ok(path.clone());
     }
