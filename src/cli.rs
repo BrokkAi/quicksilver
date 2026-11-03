@@ -184,6 +184,11 @@ pub struct BuildArgs {
     /// Compile what is pending without reading the checkout.
     #[arg(long)]
     pub no_capture: bool,
+    /// Recompile every captured mutant, including Unviable and Tested.
+    /// Invalidates old verdicts; reads only explicitly supplied patches or
+    /// imports, never implicit checkout edits. The existing map is reused.
+    #[arg(long)]
+    pub rebuild: bool,
     /// Capture the edits of this patch (against the map's commit, paths as
     /// `git diff` writes them) instead of the checkout. Repeatable; each
     /// patch is captured on its own. Use PATCH=INTENTS to attach notes only

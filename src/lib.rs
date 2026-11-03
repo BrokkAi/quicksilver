@@ -130,10 +130,14 @@ fn cmd_build(common: &cli::CommonOpts, args: cli::BuildArgs) -> Result<i32> {
     let paths = cfg.paths();
     paths.ensure()?;
     let sources = exec::edited::CaptureSources {
-        checkout: (!args.no_capture && args.patches.is_empty() && args.from.is_empty())
-            .then(|| cfg.repo_root.clone()),
+        checkout: (!args.no_capture
+            && !args.rebuild
+            && args.patches.is_empty()
+            && args.from.is_empty())
+        .then(|| cfg.repo_root.clone()),
         patches: args.patches.clone(),
         from: args.from.clone(),
+        rebuild: args.rebuild,
         verbose_intents: args.verbose_intents,
         options: capture::CaptureOptions {
             skip_outside_bodies: args.skip_outside_bodies,

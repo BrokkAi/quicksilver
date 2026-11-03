@@ -11,7 +11,7 @@ use crate::sitemap::{tracked_file_hashes, SiteMap};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 /// One function body in the baseline version of a file: the byte range of
@@ -538,7 +538,9 @@ pub fn capture_patch(
     let text = std::fs::read_to_string(patch)
         .with_context(|| format!("read patch {}", patch.display()))?;
     let mut problems = Vec::new();
-    let mut touched = Vec::new();
+    // Concatenated per-function diffs may repeat a file section. Apply the
+    // complete patch, then capture each final file once.
+    let mut touched = BTreeSet::new();
     for f in patch_files(&text) {
         match (&f.old, &f.new) {
             (None, Some(new)) => problems.push(format!(
@@ -550,7 +552,7 @@ pub fn capture_patch(
             (Some(old), Some(new)) if old != new => problems.push(format!(
                 "`{old}` is renamed to `{new}` by the patch; a mutant may only change function bodies"
             )),
-            (Some(old), Some(_)) => touched.push(old.clone()),
+            (Some(old), Some(_)) => { touched.insert(old.clone()); },
             (None, None) => {}
         }
     }
@@ -839,7 +841,17 @@ pub fn attach_intents_detailed(
             .filter(|(i, m)| m.edits.iter().any(|e| names(&e.fqn, &e.path, spans[*i])))
             .map(|(i, _)| i)
             .collect();
-        match hits.as_slice() {
+        // Positions are not identities: the same body can occur in several
+        // sources, and the final state deduplicates it by runtime ID.
+        let mut distinct = Vec::new();
+        for &i in &hits {
+            if !distinct.iter().any(|&j: &usize| {
+                mutants[j].id == mutants[i].id && mutants[j].edits == mutants[i].edits
+            }) {
+                distinct.push(i);
+            }
+        }
+        match distinct.as_slice() {
             [] if functions
                 .iter()
                 .any(|(fqn, path, span)| names(fqn, path, *span)) =>
@@ -850,7 +862,7 @@ pub fn attach_intents_detailed(
             [] => warnings.push(format!(
                 "intent for `{key}` names no function in the map (a typo, or a name from another commit?)"
             )),
-            [one] => mutants[*one].intent = Some(text.clone()),
+            [_] => { for &i in &hits { mutants[i].intent = Some(text.clone()); } },
             many => warnings.push(format!(
                 "intent for `{key}` matched {} mutants ({}); not applied",
                 many.len(),
@@ -1197,11 +1209,39 @@ mod tests {
     }
 
     #[test]
+    fn repeated_exact_identity_receives_intent_at_every_position() {
+        let (one, span) = mutant_at("p.same", "lib.rs", 1, 3);
+        let mut duplicate = one.clone();
+        duplicate.intent = Some("older note".into());
+        let mut mutants = vec![one, duplicate];
+        let original = mutants[0].edits.clone();
+        let intents = [("p.same".into(), "intended fault".into())]
+            .into_iter()
+            .collect();
+        let warnings = attach_intents(
+            &mut mutants,
+            &[span, span],
+            &intents,
+            "",
+            &[("p.same", "lib.rs", span)],
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(mutants
+            .iter()
+            .all(|m| m.intent.as_deref() == Some("intended fault")));
+        assert!(mutants.iter().all(|m| m.edits == original));
+        assert_eq!(mutants[0].id, mutants[1].id);
+        assert_eq!(mutants[0].stable_id(), mutants[1].stable_id());
+    }
+
+    #[test]
     fn intents_attach_by_full_name_or_line_and_skip_ambiguous_keys() {
         let (a, a_lines) = mutant_at("k.Scope.new", "src/scope.rs", 10, 5);
         let (b, b_lines) = mutant_at("k.SchemaVersionRegistry.new", "src/registry.rs", 40, 3);
         let (c1, c1_lines) = mutant_at("k.twice", "src/t.rs", 1, 2);
-        let (c2, c2_lines) = mutant_at("k.twice", "src/t.rs", 1, 2);
+        let (mut c2, c2_lines) = mutant_at("k.twice", "src/t.rs", 1, 2);
+        c2.edits[0].body = "{ 2 }".into();
+        c2.id = mutant_id(&c2.edits);
         let mut mutants = vec![a, b, c1, c2];
         let spans = vec![a_lines, b_lines, c1_lines, c2_lines];
         let intents: BTreeMap<String, String> = [

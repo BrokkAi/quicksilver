@@ -1019,6 +1019,7 @@ pub struct CaptureSources {
     pub patches: Vec<PatchSource>,
     pub from: Vec<PathBuf>,
     pub verbose_intents: bool,
+    pub rebuild: bool,
     pub options: CaptureOptions,
     /// Author's notes by full function name or `path:line`, applied to the
     /// mutants this build captures (see `capture::attach_intents`).
@@ -1178,11 +1179,11 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
     let started = Instant::now();
     let _lock = StateLock::acquire(paths)?;
     let (map, mut state, mut report) = load_for_build(paths)?;
-    if !sources.from.is_empty() {
+    if !sources.from.is_empty() || sources.rebuild {
         let head = crate::worktree::head(&cfg.repo_root)?;
         anyhow::ensure!(
             head == map.commit,
-            "the map is not for HEAD; run `cargo quicksilver map` before `build --from`"
+            "the map is not for HEAD; run `cargo quicksilver map` before carrying or rebuilding mutants"
         );
     }
     if cfg.build_env != map.build_env {
@@ -1301,7 +1302,18 @@ pub fn build(cfg: &Config, paths: &Paths, sources: &CaptureSources) -> Result<Bu
         report_single_token_changes(&source, &outcome);
         record_capture(&mut state, &source, outcome, &mut report);
     }
-    if captured_any {
+    if sources.rebuild {
+        for record in &mut state.records {
+            record.status = Status::Pending;
+        }
+        eprintln!(
+            "rebuilding all {} captured mutant(s); old builds and verdicts invalidated",
+            state.records.len()
+        );
+    }
+    if captured_any || sources.rebuild {
+        // Save the reset before Cargo: a stopped/failed rebuild must not reuse
+        // old binaries/verdicts. save also removes their folded journal.
         state.save(paths)?;
     }
 

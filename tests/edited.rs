@@ -227,6 +227,7 @@ fn edited_mutants_are_captured_built_and_judged() {
             patches: patches.into_iter().map(Into::into).collect(),
             from: Vec::new(),
             verbose_intents: false,
+            rebuild: false,
             options: CaptureOptions {
                 skip_outside_bodies: skip,
             },

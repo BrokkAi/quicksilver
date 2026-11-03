@@ -467,3 +467,281 @@ fn artifact_copy_failure_keeps_captured_state_for_same_state_retry() {
     assert_eq!(retried.records[0].mutant.id, id);
     assert!(matches!(retried.records[0].status, Status::Built { .. }));
 }
+
+/// Repeated same-file patch sections, real v-parameter execution, and the
+/// full existing-catalog recovery (including note repair and a new variant).
+#[test]
+fn hygienic_variants_keep_inputs_and_rebuild_all_statuses_without_remapping() {
+    use cargo_quicksilver::{
+        capture::{capture_patch, CaptureOptions},
+        exec::edited::Status,
+    };
+    let repo = support::setup_tiny();
+    let root = repo.path();
+    fs::write(root.join(".gitignore"), "*.json\n").unwrap();
+    let lib = root.join("crate_a/src/lib.rs");
+    let mut original = fs::read_to_string(&lib).unwrap();
+    original.push_str(
+        r#"
+#[derive(Clone, Copy, Debug)]
+pub struct Reading { pub nodes: u32, pub edges: u32, pub digest: u32 }
+pub struct Limits { pub max: u32 }
+impl From<Reading> for Limits {
+    fn from(v: Reading) -> Self { Self { max: v.nodes } }
+}
+pub fn bump(v: u32) -> u32 {
+    v + 1
+}
+fn serialize<T: std::fmt::Debug>(value: &T) -> String { format!("{value:?}") }
+pub fn result_digest(v: &Reading) -> String {
+    let normalized = Reading { digest: 0, ..*v };
+    serialize(&normalized)
+}
+pub fn malformed() -> u32 { 7 }
+#[cfg(test)] mod argument_tests {
+    use super::*;
+    // Both the baseline and the intended mutant are allowed. A selector-
+    // based result is not: this distinguishes a real gap from a false kill.
+    #[test] fn struct_input_is_retained() {
+        assert!([41,42].contains(&Limits::from(Reading { nodes:41, edges:42, digest:9 }).max));
+    }
+    #[test] fn scalar_input_is_retained() { assert!([41,42].contains(&bump(40))); }
+    #[test] fn generic_serializer_receives_the_record() {
+        let actual = result_digest(&Reading { nodes:42, edges:43, digest:9 });
+        assert!(actual.contains("nodes: 42") && actual.contains("edges: 43") &&
+            (actual.contains("digest: 0") || actual.contains("digest: 9")), "{actual}");
+    }
+    #[test] fn malformed_baseline() { assert!([7,8].contains(&malformed())); }
+}
+"#,
+    );
+    fs::write(&lib, &original).unwrap();
+    git(root, &["add", ".gitignore", "crate_a/src/lib.rs"]);
+    git(root, &["commit", "-m", "argument hygiene regression"]);
+    qs(root, &["map", "--json", "hygiene-map.json"], 0);
+    let map: SiteMap = serde_json::from_value(json(root, "hygiene-map.json")).unwrap();
+    let paths = support::cfg_for(root).paths();
+    let original_map = fs::read(SiteMap::path(&paths)).unwrap();
+    let archive = tempfile::tempdir().unwrap();
+    let patch = |from: &str, to: &str| {
+        assert!(original.contains(from));
+        fs::write(&lib, original.replacen(from, to, 1)).unwrap();
+        let out = Command::new("git")
+            .current_dir(root)
+            .args(["diff", "--unified=1", "--", "crate_a/src/lib.rs"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::write(&lib, &original).unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let round_a = patch("Self { max: v.nodes }", "Self { max: v.edges }")
+        + &patch("    v + 1\n", "    v + 2\n");
+    let round_b = patch(
+        "let normalized = Reading { digest: 0, ..*v };",
+        "let normalized = v;",
+    ) + &patch(
+        "pub fn malformed() -> u32 { 7 }",
+        "pub fn malformed() -> u32 { \"bad\" }",
+    );
+    let repair = patch(
+        "pub fn malformed() -> u32 { 7 }",
+        "pub fn malformed() -> u32 { 8 }",
+    );
+    let a = archive.path().join("round-a.patch");
+    let b = archive.path().join("round-b.patch");
+    let repaired = archive.path().join("repaired.patch");
+    fs::write(&a, &round_a).unwrap();
+    fs::write(&b, &round_b).unwrap();
+    fs::write(&repaired, repair).unwrap();
+    assert_eq!(round_a.matches("--- a/crate_a/src/lib.rs").count(), 2);
+    for path in [&a, &b] {
+        let captured = capture_patch(&map, root, path, CaptureOptions::default()).unwrap();
+        assert!(captured.problems.is_empty(), "{:?}", captured.problems);
+        assert_eq!(
+            captured.mutants.len(),
+            2,
+            "a final patched file is captured once, not once per header"
+        );
+    }
+    let notes_a = archive.path().join("notes-a.json");
+    let notes_b = archive.path().join("notes-b.json");
+    let notes_repair = archive.path().join("notes-repair.json");
+    fs::write(&notes_a,serde_json::to_vec(&serde_json::json!({
+        "tiny_a.Limits.from":"uses edges instead of nodes", "tiny_a.bump":"adds two instead of one"})).unwrap()).unwrap();
+    fs::write(&notes_b,serde_json::to_vec(&serde_json::json!({
+        "tiny_a.result_digest":"includes the stored digest", "tiny_a.malformed":"genuinely wrong return type"})).unwrap()).unwrap();
+    fs::write(
+        &notes_repair,
+        serde_json::to_vec(&serde_json::json!({"tiny_a.malformed":"repaired candidate body"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let source_a = format!("{}={}", a.display(), notes_a.display());
+    let source_b = format!("{}={}", b.display(), notes_b.display());
+    let source_repair = format!("{}={}", repaired.display(), notes_repair.display());
+    let first_out = qs(
+        root,
+        &[
+            "build",
+            "--patch",
+            &source_a,
+            "--patch",
+            &source_b,
+            "--verbose-intents",
+            "--json",
+            "first-hygiene.json",
+        ],
+        1,
+    );
+    assert!(!String::from_utf8_lossy(&first_out.stderr).contains("matched 2 mutants"));
+    let first: State = serde_json::from_value(json(root, "first-hygiene.json")).unwrap();
+    assert_eq!(first.records.len(), 4);
+    assert_eq!(
+        first
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, Status::Built { .. }))
+            .count(),
+        3,
+        "{}",
+        json(root, "first-hygiene.json")
+    );
+    assert_eq!(
+        first
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, Status::Unviable { .. }))
+            .count(),
+        1
+    );
+    assert!(first.records.iter().all(|r| r.mutant.intent.is_some()));
+    qs(root, &["test", "--json", "first-hygiene-verdicts.json"], 0);
+    let verdicts = json(root, "first-hygiene-verdicts.json");
+    let rows = verdicts["mutants"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter().all(|m| m["verdict"]["kind"] == "missed"),
+        "{verdicts:#}"
+    );
+
+    // Emulate the actual old catalog: false Unviable, old Built, old Tested,
+    // genuine malformed Unviable, and lost notes. Only fixture state is seeded.
+    let mut legacy = State::load(&paths).unwrap();
+    for record in &mut legacy.records {
+        record.mutant.intent = None;
+        if record.mutant.edits[0].fqn.ends_with("Limits.from") {
+            record.status = Status::Unviable {
+                message: "old generated v shadow caused E0610".into(),
+            };
+        } else if record.mutant.edits[0].fqn.ends_with(".bump") {
+            record.status = first.find(&record.mutant.id).unwrap().status.clone();
+        }
+    }
+    legacy.save(&paths).unwrap();
+    let saved_state = fs::read(State::path(&paths)).unwrap();
+    let bad_patch = archive.path().join("invalid.patch");
+    fs::write(&bad_patch, "not a patch").unwrap();
+    qs(
+        root,
+        &["build", "--rebuild", "--patch", bad_patch.to_str().unwrap()],
+        2,
+    );
+    assert_eq!(
+        fs::read(State::path(&paths)).unwrap(),
+        saved_state,
+        "rejected inputs don't clear existing statuses"
+    );
+
+    let recovered_out = qs(
+        root,
+        &[
+            "build",
+            "--rebuild",
+            "--patch",
+            &source_a,
+            "--patch",
+            &source_b,
+            "--patch",
+            &source_repair,
+            "--json",
+            "recovered-hygiene.json",
+        ],
+        1,
+    );
+    assert!(!String::from_utf8_lossy(&recovered_out.stderr).contains("matched 2 mutants"));
+    let recovered: State = serde_json::from_value(json(root, "recovered-hygiene.json")).unwrap();
+    assert_eq!(recovered.records.len(), 5);
+    assert!(recovered.generation > first.generation);
+    for old in &first.records {
+        let kept = recovered.find(&old.mutant.id).unwrap();
+        assert_eq!(
+            kept.mutant, old.mutant,
+            "full names, bodies, IDs and per-patch notes preserved"
+        );
+        assert_eq!(kept.captured_at, old.captured_at);
+        if old.mutant.edits[0].fqn.ends_with(".malformed") {
+            assert!(matches!(kept.status, Status::Unviable { .. }));
+        } else {
+            assert!(matches!(kept.status, Status::Built { .. }));
+        }
+    }
+    let repaired = recovered
+        .records
+        .iter()
+        .find(|r| first.find(&r.mutant.id).is_none())
+        .unwrap();
+    assert_eq!(
+        repaired.mutant.intent.as_deref(),
+        Some("repaired candidate body")
+    );
+    assert!(matches!(repaired.status, Status::Built { .. }));
+    assert_eq!(fs::read_to_string(&lib).unwrap(), original);
+    assert_eq!(
+        fs::read(SiteMap::path(&paths)).unwrap(),
+        original_map,
+        "map is reused unchanged"
+    );
+    qs(
+        root,
+        &["test", "--json", "recovered-hygiene-verdicts.json"],
+        0,
+    );
+    let recovered_verdicts = json(root, "recovered-hygiene-verdicts.json");
+    assert_eq!(recovered_verdicts["mutants"].as_array().unwrap().len(), 4);
+    assert!(recovered_verdicts["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["verdict"]["kind"] == "missed"));
+    for old in rows {
+        assert!(recovered_verdicts["mutants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["stable_id"] == old["stable_id"]));
+    }
+    // The simpler protocol also resets Tested and Unviable, with no new edits.
+    qs(
+        root,
+        &[
+            "build",
+            "--no-capture",
+            "--rebuild",
+            "--json",
+            "repeated-rebuild.json",
+        ],
+        1,
+    );
+    let repeated: State = serde_json::from_value(json(root, "repeated-rebuild.json")).unwrap();
+    assert_eq!(repeated.records.len(), 5);
+    assert_eq!(
+        repeated
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, Status::Built { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), original_map);
+}

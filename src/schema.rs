@@ -253,19 +253,22 @@ pub fn render_prologue(site: &Site) -> String {
 }
 
 pub fn render_prologue_with_ranges(site: &Site) -> (String, Vec<(u32, String, usize, usize)>) {
-    let mut s = format!(
-        " if let Some(v) = crate::__qs_rt::active({:#010x}) {{ match v {{ ",
-        site.site_id
-    );
+    let mut s = format!(" match crate::__qs_rt::active({:#010x}) {{ ", site.site_id);
     let mut ranges = Vec::new();
     for v in &site.variants {
-        let arm = format!("{} => {}, ", v.index, v.return_stmt);
+        let arm = format!(
+            "::core::option::Option::Some({}) => {}, ",
+            v.index, v.return_stmt
+        );
         let start = s.len();
         s.push_str(&arm);
         ranges.push((v.index, v.mutant_id.clone(), start, s.len()));
     }
-    s.push_str(&format!("{} => {{}}, ", site.identity_variant));
-    s.push_str("_ => {} } } ");
+    s.push_str(&format!(
+        "::core::option::Option::Some({}) => {{}}, ",
+        site.identity_variant
+    ));
+    s.push_str("_ => {} } ");
     (s, ranges)
 }
 
@@ -884,7 +887,10 @@ mod tests {
                 a.site_id
             );
             for v in &a.variants {
-                assert_eq!(&text[v.start..v.end], "0 => return 7, ");
+                assert_eq!(
+                    &text[v.start..v.end],
+                    "::core::option::Option::Some(0) => return 7, "
+                );
             }
         }
         let outer = applied.iter().find(|a| a.site_id == 1).unwrap();
@@ -903,6 +909,24 @@ mod tests {
             Some(SpanHit::Site(id)) => assert_eq!(id, 2),
             _ => panic!("expected the inner site"),
         }
+    }
+
+    #[test]
+    fn generated_dispatch_has_no_binding_patterns_that_can_capture_source_names() {
+        let mutant = number_mutant("p.bump", 0, 8, "{ v + 2 }");
+        let (sites, _) = build_sites(&[mutant]).unwrap();
+        let prologue = render_prologue(&sites[0]);
+        let block: syn::Block = syn::parse_str(&format!("{{ {prologue} }}")).unwrap();
+        struct Bindings(Vec<String>);
+        impl<'ast> syn::visit::Visit<'ast> for Bindings {
+            fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+                self.0.push(pat.ident.to_string());
+            }
+        }
+        let mut bindings = Bindings(Vec::new());
+        syn::visit::Visit::visit_block(&mut bindings, &block);
+        assert!(bindings.0.is_empty(), "generated names: {:?}", bindings.0);
+        assert!(prologue.contains("::core::option::Option::Some(0)"));
     }
 
     #[test]
