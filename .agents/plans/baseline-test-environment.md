@@ -4,7 +4,7 @@ This living ExecPlan follows `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
-A baseline currently gets only build-env, while schema and mutant tests get test-env. The campaign reproduced a real test expecting BIFROST_QS_ENV_PROBE=configured that fails in baseline despite its quicksilver.toml setting. Tests must receive the same configured test-only values without passing them to Cargo/rustc. Keep selected nextest profiles, overrides, retries, budgets, wrappers and target runners working. A sandbox placeholder must stay private to a subprocess; baseline HOME/TMP remain in the caller environment unless explicitly overridden.
+The original baseline received only build-env, while schema and mutant tests received test-env; commit e20d852 fixed that mismatch. A scale follow-up now requires reclaiming completed baseline test scratch while nextest is still running, so caches do not accumulate for an entire large suite. The campaign reproduced a real test expecting BIFROST_QS_ENV_PROBE=configured that fails in baseline despite its quicksilver.toml setting. Tests must receive the same configured test-only values without passing them to Cargo/rustc. Keep selected nextest profiles, overrides, retries, budgets, wrappers and target runners working. A sandbox placeholder must stay private to a subprocess; baseline HOME/TMP remain in the caller environment unless explicitly overridden.
 
 ## Progress
 
@@ -15,6 +15,12 @@ A baseline currently gets only build-env, while schema and mutant tests get test
 - [x] (2026-11-03) Format and Clippy clean; 226 tests passed across all suites, two existing unit ignores. Adapt the old schema fixture to distinguish recording from baseline explicitly, then rerun its failure and finish the previously unrun suites.
 - [x] (2026-11-03) Commit e20d852, obtain clean required review (tree 2199c69), push origin/master, verify exact-head CI success and send install/map clearance to Bifrost session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
+- [x] (2026-11-03) Follow-up source diagnosis: exec replaces the helper guard; only Prepared::drop sweeps records, retaining every completed invocation until nextest exits. Peer reports ENOSPC at about 11k tests; total disk attribution remains unconfirmed.
+- [x] (2026-11-03) Prove the bug with a real-nextest barrier: original e20 cleanup fails after 8 seconds with completed scratch retained; fixed code passes for normal, SIGTERM and TIMEOUT exits while observer scratch stays live, in all four wrapper/runner modes.
+- [x] (2026-11-03) Add a joined owner-side Reaper, sweeping recorded dead PIDs during list/run at a 100 ms interval. No helper exec, runner, timeout or build-env changes. Retain failed-removal records for retry and cover retry/final join with a unit test.
+- [x] (2026-11-03) Full local checks pass: format, Clippy and 227 tests (202 unit, 10 campaign, three edited, nine engine, three schema), with two existing unit ignores; log /tmp/qs-test-scratch-checks.log.
+- [ ] Obtain committed review, push, verify exact-head CI and hand off the corrected lifetime.
+
 ## Surprises & Discoveries
 
 Nextest supports list/run wrapper scripts since 0.9.98, enabled with experimental wrapper-scripts in the generated configuration. A wrapper receives the target runner and test argv according to its target-runner policy. Only the first matching wrapper is used, so a blanket new wrapper rule would overwrite user wrappers. Existing wrapper commands must instead be composed with QS's environment helper, while a lowest-priority fallback handles tests without a project wrapper. Nextest binaries-only metadata provides paths without executing test processes.
@@ -22,6 +28,8 @@ Nextest supports list/run wrapper scripts since 0.9.98, enabled with experimenta
 The first full check found that the existing schema fixture treated FIXTURE_STATE and FIXTURE_NOT_GREEN as schema-only flags, relying on the very omission being fixed. It now checks QS_RECORD_SITES/QS_MUTANT for direct-run-only assertions and deliberately fails its diagnostic test only during recording. Baseline scratch freshness is still checked, without writing to real HOME.
 
 Evidence logs: /tmp/qs-test-env-control.log (red baseline before fix); /tmp/qs-test-env-fixed.log (initial real CLI pass); /tmp/qs-test-env-policy.log (runner policies); /tmp/qs-test-env-checks.log (Clippy, units, campaign and original fixture failure); /tmp/qs-test-env-edited-retry.log (fixed failing case); /tmp/qs-test-env-remaining.log (engine/schema). The initial check passed 201 unit and 10 campaign tests; the edited suite passed its other two tests and its failing case passed on rerun; engine nine and schema three then passed. Two unit tests retain their existing ignored status.
+
+The scale report describes ENOSPC during a root CLI baseline with per-test XDG_CACHE_HOME placeholders. Source conclusively shows completed-cache retention; the report does not yet attribute all remote disk usage to it. The new acceptance test observes cleanup before suite completion, unlike the original test which checked only after prepare_baseline returned. Evidence is /tmp/qs-test-scratch-control.log (old code fails the barrier) and /tmp/qs-test-scratch-fixed.log (four policies pass). /tmp/qs-test-scratch-checks.log captures full checks. Cleanup latency is the sweep interval plus any deletion backlog, not a hard storage-byte limit; no remote disk attribution or benchmark claim is inferred.
 
 ## Decision Log
 
@@ -35,9 +43,13 @@ Evidence logs: /tmp/qs-test-env-control.log (red baseline before fix); /tmp/qs-t
   Rationale: Project timeouts, inherited overrides, setup scripts and wrappers must not be silently replaced.
   Date/Author: 2026-11-03 Codex.
 
+- Decision: Supersede suite-end-only cleanup with an owner-side thread that periodically reclaims recorded dead test PIDs during list/run and joins with a final sweep on teardown. Keep helper exec unchanged.
+  Rationale: Completed test cache retention then follows process completion plus sweep backlog, not total suite length, while nextest still directly owns the process it signals and observes. No extra per-test supervising process, concurrency cap, filesystem/target relocation or mbx policy change is needed. Allocate this worker only for settings containing the sandbox placeholder; retry failed removals by retaining their records.
+  Date/Author: 2026-11-03 Codex.
+
 ## Outcomes & Retrospective
 
-The implementation and local acceptance checks are complete. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Commit e20d85255c7805e3f19e278d0f11ead80f9699de passed required review and is on origin/master. Exact-head CI succeeded in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/41740977340 . The peer received the verified install/map handoff. This completion record changes no executable source; e20d852 remains the tested install head.
+The original environment fix and local acceptance checks are complete. The scratch-lifetime follow-up is implemented and all 227 local tests plus format/Clippy pass; committed review and push/CI/handoff remain. The original final-only cleanup proved insufficient at scale. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Commit e20d85255c7805e3f19e278d0f11ead80f9699de passed required review and is on origin/master. Exact-head CI succeeded in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/41740977340 . The peer received the verified install/map handoff. That original completion record changed no executable source. e20d852 remains the last accepted install head until the lifetime follow-up completes review and CI.
 
 ## Context and Orientation
 
@@ -57,13 +69,15 @@ Milestone 1 reproduces the mismatch at the real CLI boundary and supplies test-e
 
 Milestone 2 preserves project policy and operational behavior. A real nextest campaign exercises all four runner policies, an inherited timeout override, private scratch cleanup and literal values. Existing schema diagnostics keep their recording-specific behavior. Complete local checks, committed review, exact-head CI and the verified peer handoff close this milestone.
 
+Milestone 3 corrects completed-cache lifetime. Extend the real nextest regression with an observer test that stays alive until normal-exit, SIGTERM and TIMEOUT scratch is gone. Use tiny cache files and a bounded wait, not a large disk benchmark. Run it first against the original source and retain its failure evidence. Add an interruptible owner-side cleanup worker with a short polling interval, retaining records when deletion fails and joining it before Prepared teardown. Keep active test scratch untouched. Repeat all runner modes and existing build-env separation checks, then finish the normal reviewed push/CI/handoff.
+
 ## Concrete Steps
 
 From repository root run targeted CLI tests through nice -n 10 mbx test --test campaign, then the full suite and Clippy, plus mbx fmt --check. Do not redirect targets or alter mbx scheduling/GC. Commit only owned files on the current branch. Request review of committed work before every push and address findings. Verify exact-head CI before handing off to session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
 ## Validation and Acceptance
 
-The CLI map succeeds when the outer environment lacks the probe and test-env supplies it. Build scripts and compile-time option_env must show the value absent, while baseline, schema recording and mutant tests see it. An exact caught mutant proves the full path. Existing nextest profile timeout/failure kinds, skipped tests, custom wrappers and runners must remain in effect. Placeholder directories are distinct per subprocess and are cleaned even after a timed-out baseline test.
+The CLI map succeeds when the outer environment lacks the probe and test-env supplies it. Build scripts and compile-time option_env must show the value absent, while baseline, schema recording and mutant tests see it. An exact caught mutant proves the full path. Existing nextest profile timeout/failure kinds, skipped tests, custom wrappers and runners must remain in effect. Placeholder directories are distinct per subprocess. Completed normal, signaled and timed-out invocation directories must disappear while the observer test and nextest remain active, and the observer directory must stay available until that test ends. The cleanup worker must also join and perform a final sweep on owner teardown.
 
 ## Idempotence and Recovery
 
@@ -74,3 +88,7 @@ Use disposable committed repositories. Generated wrapper data lives under QS sta
 Use existing serde/toml/Command/Unix exec and sandbox helpers. Add shell-words for nextest-compatible command parsing instead of a shell or custom parser. The hidden helper accepts a specification file, wrapper key and trailing argv; it emits no protocol text into test output. Generated config enables nextest wrapper-scripts without removing existing experimental flags or profile rules.
 
 Plan created 2026-11-03 after reading the campaign report and nextest's primary wrapper/environment documentation.
+
+Plan reopened 2026-11-03 for the reported large-suite scratch lifetime issue: early cleanup now has a barrier-based acceptance test, preserving exec signal and timeout ownership. Sub-agent startup was attempted again and refused by session configuration, so parent owns this slice.
+
+Follow-up implementation checkpoint 2026-11-03: the barrier fails before and passes after in all four runner policies; full checks pass. Cleanup now runs during nextest rather than only after it, and failed removals retain records for retry. Remote ENOSPC attribution remains qualified.

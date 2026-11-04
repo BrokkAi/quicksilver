@@ -713,8 +713,10 @@ and it does not run inside mbx's build session.
 of the above. These settings also reach baseline tests and test listing,
 while builds receive only `[build-env]`. This requires nextest 0.9.98 or
 later when `[test-env]` is nonempty. `{sandbox}` stands for a private
-directory for that test invocation, including during the baseline; it is
-cleaned up when the test run finishes:
+directory for that test invocation, including during the baseline. During
+nextest runs, QS reclaims completed tests' directories in the background
+and performs a final cleanup when nextest exits. Live tests keep their
+scratch directories:
 
 ```toml
 [test-env]

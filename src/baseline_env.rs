@@ -29,13 +29,12 @@ struct Specification {
 pub(crate) struct Prepared {
     pub path: PathBuf,
     owned: Vec<PathBuf>,
-    records: Option<PathBuf>,
+    cleanup: Option<crate::sandbox::Reaper>,
 }
 impl Drop for Prepared {
     fn drop(&mut self) {
-        if let Some(records) = &self.records {
-            crate::sandbox::remove_stale(records);
-        }
+        // Join the owner-side sweep before removing its invocation files.
+        drop(self.cleanup.take());
         for path in &self.owned {
             let _ = fs::remove_file(path);
         }
@@ -158,7 +157,7 @@ pub(crate) fn prepare(cfg: &Config, paths: &Paths) -> Result<Prepared> {
     let mut prepared = Prepared {
         path: base.clone(),
         owned: Vec::new(),
-        records: None,
+        cleanup: None,
     };
     if cfg.test_env.is_empty() {
         return Ok(prepared);
@@ -180,7 +179,6 @@ pub(crate) fn prepare(cfg: &Config, paths: &Paths) -> Result<Prepared> {
         .owned
         .extend([spec_path.clone(), prepared.path.clone()]);
     let records = paths.session.join("sandbox");
-    prepared.records = Some(records.clone());
     let mut specification = Specification {
         env: cfg.test_env.clone(),
         parent: cfg
@@ -301,6 +299,15 @@ pub(crate) fn prepare(cfg: &Config, paths: &Paths) -> Result<Prepared> {
         .open(&spec_path)?;
     file.write_all(&serde_json::to_vec(&specification)?)?;
     crate::util::write_atomic(&prepared.path, toml::to_string_pretty(&config)?)?;
+    if cfg
+        .test_env
+        .values()
+        .any(|v| v.contains(crate::sandbox::PLACEHOLDER))
+    {
+        prepared.cleanup = Some(crate::sandbox::Reaper::start(
+            paths.session.join("sandbox"),
+        )?);
+    }
     Ok(prepared)
 }
 

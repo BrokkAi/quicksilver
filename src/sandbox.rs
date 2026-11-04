@@ -523,6 +523,48 @@ impl Settings {
     }
 }
 
+/// Reclaim exec-based test scratch while nextest is still running. The test
+/// keeps its native PID/status; this owner-side worker only removes roots whose
+/// recorded process is gone. A final joined sweep handles the last invocations.
+pub(crate) struct Reaper {
+    stop: std::sync::mpsc::Sender<()>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Reaper {
+    pub(crate) fn start(records: PathBuf) -> Result<Self> {
+        let (stop, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::Builder::new()
+            .name("qs-test-scratch".into())
+            .spawn(move || {
+                loop {
+                    remove_stale(&records);
+                    match receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        _ => break,
+                    }
+                }
+                remove_stale(&records);
+            })
+            .context("start completed-test scratch cleanup")?;
+        Ok(Self {
+            stop,
+            worker: Some(worker),
+        })
+    }
+}
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                tracing::warn!("completed-test scratch cleanup thread panicked");
+            }
+        }
+    }
+}
+
 /// Delete the sandboxes of QS processes that are gone. `records` holds one
 /// file per process, named by its id, with the path of its sandbox
 /// directory. (Before sandboxes moved out of the repository, each entry was
@@ -553,8 +595,9 @@ pub(crate) fn remove_stale(records: &Path) {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with(ROOT_PREFIX));
-            if root.is_absolute() && named {
-                let _ = remove_tree(&root);
+            if root.is_absolute() && named && remove_tree(&root).is_err() {
+                // Keep the record so a later sweep can retry a transient error.
+                continue;
             }
         }
         let _ = fs::remove_file(&path);
@@ -751,6 +794,28 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, vec!["1".to_string()]);
+    }
+
+    #[test]
+    fn failed_cleanup_keeps_its_record_for_a_later_sweep() {
+        let tmp = tempfile::tempdir().unwrap();
+        let records = tmp.path().join("records");
+        fs::create_dir(&records).unwrap();
+        let root = tmp.path().join(format!("{ROOT_PREFIX}retry"));
+        let record = records.join("999999000");
+        // A file where a directory belongs provokes a deterministic cleanup
+        // error even when these tests run as root.
+        fs::write(&root, "not a directory yet").unwrap();
+        fs::write(&record, root.to_str().unwrap()).unwrap();
+        remove_stale(&records);
+        assert!(record.is_file());
+        fs::remove_file(&root).unwrap();
+        fs::create_dir(&root).unwrap();
+        // Owner teardown joins its worker and performs a final cleanup.
+        let reaper = Reaper::start(records).unwrap();
+        drop(reaper);
+        assert!(!root.exists());
+        assert!(!record.exists());
     }
 
     #[test]

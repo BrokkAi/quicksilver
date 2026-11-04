@@ -1829,6 +1829,7 @@ fn baseline_test_env_composes_project_policy_and_cleans_scratch() {
         assert!(scratch.is_dir());
         assert!(scratch.join("home").is_dir());
         assert!(scratch.join("tmp").is_dir());
+        std::fs::write(scratch.join("cached-data"), vec![42u8; 1024 * 1024]).unwrap();
         std::fs::write(std::path::Path::new({:?}).join(name), scratch.to_str().unwrap()).unwrap();
     }}
     #[test] fn environment() {{ check(module_path!(), module_path!().starts_with("tiny_a")); }}
@@ -1845,8 +1846,36 @@ fn baseline_test_env_composes_project_policy_and_cleans_scratch() {
         )
         .unwrap();
     }
+    let observer = format!(
+        r#"
+#[cfg(test)] mod cleanup_barrier {{
+    #[test] fn completed_scratch_is_reclaimed_before_suite_exit() {{
+        let own = std::path::PathBuf::from(std::env::var("BASELINE_SCRATCH").unwrap());
+        let evidence = std::path::Path::new({:?});
+        let start = std::time::Instant::now();
+        loop {{
+            assert!(own.is_dir(), "live test scratch was removed");
+            let complete = ["tiny_a::baseline_env_probe", "tiny_c::baseline_env_probe", "timeout", "signal"].iter().all(|name| {{
+                std::fs::read_to_string(evidence.join(name)).is_ok_and(|path| !std::path::Path::new(&path).exists())
+            }});
+            if complete {{ break; }}
+            assert!(start.elapsed() < std::time::Duration::from_secs(8), "completed test scratch retained while nextest is still running");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }}
+        std::fs::write(evidence.join("observer"), own.to_str().unwrap()).unwrap();
+    }}
+}}
+"#,
+        evidence.path()
+    );
+    let seed = root.join("crate_a/src/lib.rs");
+    fs::write(
+        &seed,
+        format!("{}\n{observer}", fs::read_to_string(&seed).unwrap()),
+    )
+    .unwrap();
     let extra = root.join("crate_b/src/lib.rs");
-    fs::write(&extra, format!("{}\n#[cfg(test)] mod timeout_probe {{ #[test] fn times_out() {{ let path = std::env::var(\"BASELINE_SCRATCH\").unwrap(); std::fs::write({:?}, path).unwrap(); std::thread::sleep(std::time::Duration::from_secs(10)); }} }}\n", fs::read_to_string(&extra).unwrap(), evidence.path().join("timeout"))).unwrap();
+    fs::write(&extra, format!("{}\n#[cfg(test)] mod timeout_probe {{ #[test] fn times_out() {{ let path = std::env::var(\"BASELINE_SCRATCH\").unwrap(); std::fs::write({:?}, path).unwrap(); std::thread::sleep(std::time::Duration::from_secs(10)); }} #[test] fn signal_exit() {{ let path = std::env::var(\"BASELINE_SCRATCH\").unwrap(); std::fs::write({:?}, path).unwrap(); unsafe extern \"C\" {{ fn raise(signal: i32) -> i32; }} unsafe {{ raise(15); }} panic!(\"SIGTERM did not terminate the test\"); }} }}\n", fs::read_to_string(&extra).unwrap(), evidence.path().join("timeout"), evidence.path().join("signal"))).unwrap();
     let mut cfg = support::cfg_for(root);
     cfg.packages = vec!["tiny_a".into()];
     cfg.extra_tests = vec!["tiny_b".into(), "tiny_c".into()];
@@ -1871,6 +1900,9 @@ fn baseline_test_env_composes_project_policy_and_cleans_scratch() {
         ("ignore", "yes", "absent"),
         ("overrides-wrapper", "absent", "yes"),
     ] {
+        for entry in fs::read_dir(evidence.path()).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
         fs::write(
             root.join(".config/nextest.toml"),
             format!(
@@ -1880,7 +1912,8 @@ experimental = ["wrapper-scripts"]
 command = {{ command-line = ["sh", {:?}], env = {{ BASELINE_OVERRIDE = "wrapper" }} }}
 target-runner = "{policy}"
 [profile.default]
-slow-timeout = {{ period = "10s", terminate-after = 2 }}
+test-threads = 4
+slow-timeout = {{ period = "20s", terminate-after = 1 }}
 [[profile.default.scripts]]
 filter = 'binary(tiny_a) | binary(tiny_b)'
 run-wrapper = 'project'
@@ -1919,12 +1952,15 @@ slow-timeout = {{ period = "500ms", terminate-after = 1, grace-period = "0s" }}
         let failures = cargo_quicksilver::baseline::prepare_baseline(&cfg, &paths, false)
             .unwrap()
             .failures;
-        assert_eq!(failures.len(), 1, "{policy}: {failures:?}");
-        assert!(failures[0].id.ends_with("timeout_probe::times_out"));
-        assert_eq!(
-            failures[0].kind,
-            cargo_quicksilver::types::BaselineFailureKind::Timeout
-        );
+        assert_eq!(failures.len(), 2, "{policy}: {failures:?}");
+        assert!(failures
+            .iter()
+            .any(|f| f.id.ends_with("timeout_probe::times_out")
+                && f.kind == cargo_quicksilver::types::BaselineFailureKind::Timeout));
+        assert!(failures
+            .iter()
+            .any(|f| f.id.ends_with("timeout_probe::signal_exit")
+                && f.kind == cargo_quicksilver::types::BaselineFailureKind::Fail));
         let dirs: Vec<_> = fs::read_dir(evidence.path())
             .unwrap()
             .map(|entry| {
@@ -1933,10 +1969,10 @@ slow-timeout = {{ period = "500ms", terminate-after = 1, grace-period = "0s" }}
                 path
             })
             .collect();
-        assert_eq!(dirs.len(), 3);
+        assert_eq!(dirs.len(), 5);
         assert_eq!(
             dirs.iter().collect::<std::collections::BTreeSet<_>>().len(),
-            3
+            5
         );
         assert!(fs::read_dir(scratch.path()).unwrap().next().is_none());
         assert!(!fs::read_dir(&paths.index).unwrap().any(|e| e
