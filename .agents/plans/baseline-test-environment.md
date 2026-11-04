@@ -19,7 +19,7 @@ The original baseline received only build-env, while schema and mutant tests rec
 - [x] (2026-11-03) Prove the bug with a real-nextest barrier: original e20 cleanup fails after 8 seconds with completed scratch retained; fixed code passes for normal, SIGTERM and TIMEOUT exits while observer scratch stays live, in all four wrapper/runner modes.
 - [x] (2026-11-03) Add a joined owner-side Reaper, sweeping recorded dead PIDs during list/run at a 100 ms interval. No helper exec, runner, timeout or build-env changes. Retain failed-removal records for retry and cover retry/final join with a unit test.
 - [x] (2026-11-03) Full local checks pass: format, Clippy and 227 tests (202 unit, 10 campaign, three edited, nine engine, three schema), with two existing unit ignores; log /tmp/qs-test-scratch-checks.log.
-- [ ] Obtain committed review, push, verify exact-head CI and hand off the corrected lifetime.
+- [x] (2026-11-03) Commit 2e35d9c, obtain clean required review (tree 40c8d0d), push origin/master and verify exact-head CI success: https://github.com/BrokkAi/quicksilver/actions/runs/41748356081 . Send verified install handoff to Bifrost session 5b9275ef422b8eb3146a4a11fb9dd1aa; remote diagnostics retain responsibility for rerun readiness.
 
 ## Surprises & Discoveries
 
@@ -49,7 +49,7 @@ The scale report describes ENOSPC during a root CLI baseline with per-test XDG_C
 
 ## Outcomes & Retrospective
 
-The original environment fix and local acceptance checks are complete. The scratch-lifetime follow-up is implemented and all 227 local tests plus format/Clippy pass; committed review and push/CI/handoff remain. The original final-only cleanup proved insufficient at scale. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Commit e20d85255c7805e3f19e278d0f11ead80f9699de passed required review and is on origin/master. Exact-head CI succeeded in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/41740977340 . The peer received the verified install/map handoff. That original completion record changed no executable source. e20d852 remains the last accepted install head until the lifetime follow-up completes review and CI.
+The original environment fix and local acceptance checks are complete. The scratch-lifetime follow-up is complete at reviewed, pushed commit 2e35d9c6f337630daffd4a6c63bf66e7168341b3. All 227 local tests plus format/Clippy pass; exact-head CI passed both jobs at https://github.com/BrokkAi/quicksilver/actions/runs/41748356081 . The peer received the verified install handoff. The original final-only cleanup proved insufficient at scale. Baseline and listing tests receive configured test-only values while Cargo/rustc do not. Existing nextest wrappers/runners and timeout policy remain effective; placeholder storage is private and removed after the nextest run. No Bifrost source/config workaround, target layout, mbx policy or engine change is needed. Commit e20d85255c7805e3f19e278d0f11ead80f9699de passed required review and is on origin/master. Exact-head CI succeeded in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/41740977340 . The peer received the verified install/map handoff. That original completion record changed no executable source. The accepted executable install head is now 2e35d9c, superseding e20d852.
 
 ## Context and Orientation
 
@@ -92,3 +92,5 @@ Plan created 2026-11-03 after reading the campaign report and nextest's primary 
 Plan reopened 2026-11-03 for the reported large-suite scratch lifetime issue: early cleanup now has a barrier-based acceptance test, preserving exec signal and timeout ownership. Sub-agent startup was attempted again and refused by session configuration, so parent owns this slice.
 
 Follow-up implementation checkpoint 2026-11-03: the barrier fails before and passes after in all four runner policies; full checks pass. Cleanup now runs during nextest rather than only after it, and failed removals retain records for retry. Remote ENOSPC attribution remains qualified.
+
+Follow-up completion 2026-11-03: source commit 2e35d9c passed required review and exact-head CI, and the verified install handoff was sent. Remote rerun readiness remains subject to the peer storage diagnostics; no remote retry, disk/layout, mbx policy or concurrency changes were made here. This completion note changes no executable source.
