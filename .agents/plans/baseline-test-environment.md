@@ -94,3 +94,13 @@ Plan reopened 2026-11-03 for the reported large-suite scratch lifetime issue: ea
 Follow-up implementation checkpoint 2026-11-03: the barrier fails before and passes after in all four runner policies; full checks pass. Cleanup now runs during nextest rather than only after it, and failed removals retain records for retry. Remote ENOSPC attribution remains qualified.
 
 Follow-up completion 2026-11-03: source commit 2e35d9c passed required review and exact-head CI, and the verified install handoff was sent. Remote rerun readiness remains subject to the peer storage diagnostics; no remote retry, disk/layout, mbx policy or concurrency changes were made here. This completion note changes no executable source.
+
+## Registry trust boundary and nonblocking resilience follow-up
+
+Source review after the lifetime fix confirms a qualified cleanup contract: for a readable valid record of an owned scratch root whose test PID is gone, a failed remove_tree leaves the record available for retry. The registry is owner-controlled QS state, not an authenticated ownership registry or a defense against same-user state tampering. An absolute path with a qs-sandbox-* basename is a guardrail, not evidence that QS owns the named directory. Acceptance covers valid owned records and the tested normal, SIGTERM and TIMEOUT invocation paths.
+
+The existing remove_stale implementation drops unreadable or malformed dead-PID record files, so transient read errors and damaged records do not have the removal-retry guarantee. Settings::make_root publishes with fs::write, which can leave a partial record if interrupted; it warns on a reported write failure. Publication occurs before the test exec, when the root is still new and empty. No claim is made that this publication race explains large completed-cache retention or total remote ENOSPC. Reaper::drop logs a worker panic but has no independent fallback final sweep; no ordinary panic was demonstrated.
+
+Atomic record publication, distinct read-error handling, stronger owned-root validation and a panic fallback final sweep are nonblocking resilience follow-up ideas, not implemented behavior or new acceptance guarantees. This preserves the scope and verified executable head 2e35d9c. The peer source-review report is /tmp/qs21-root/tool-2e35-source-review.{json,md} on session 5b9275ef422b8eb3146a4a11fb9dd1aa; its counterexamples are source-only, not observations of unowned deletion or damaged registry state on the benchmark host.
+
+Qualification recorded 2026-11-03 after checking make_root, remove_stale and Reaper::drop against the peer report. No executable change or new benchmark was needed; the accepted fix and remote disk-attribution limits remain unchanged.
