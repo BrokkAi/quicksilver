@@ -14,7 +14,7 @@ The Bifrost campaign requires a project-defined Cargo compilation profile named 
 - [x] (2026-11-05) Focused CLI regression passes baseline/schema attribution retries, separate opaque direct build, independent nextest policy, provenance, drift refusal without state/map/journal writes, same-commit remap invalidation and body-only imports. Source audit removes debug/deps guess; full mixed target/child/lease and built-in run regression now uses a custom profile.
 - [x] (2026-11-05) Format and Clippy clean; all 207 unit tests pass, two existing ignored.
 - [x] (2026-11-05) Full checks pass: format, Clippy and 233 tests (207 unit, 11 campaign, three edited, nine engine, three schema), two existing ignored. Mixed custom-profile library/binary/child staging and built-in run passes.
-- [ ] Commit, obtain required review, push, verify exact-head CI and send peer handoff.
+- [x] (2026-11-05) Commit 5563ae5, obtain clean required review (tree 8422b49), push origin/master and verify exact-head CI success in both jobs: https://github.com/BrokkAi/quicksilver/actions/runs/42081690593 . Send verified install handoff to Bifrost session 5b9275ef422b8eb3146a4a11fb9dd1aa.
 
 ## Surprises & Discoveries
 
@@ -40,7 +40,7 @@ Evidence: /tmp/qs-cargo-profile-check.log (all-target compilation), /tmp/qs-carg
 
 ## Outcomes & Retrospective
 
-Implementation and all local acceptance checks are complete. Format, Clippy and 233 tests pass with two existing ignores; committed review, push and exact-head CI handoff remain. The independent custom-profile CLI and mixed production-binary tests verify compilation, staging/leases, nextest policy separation, provenance, status invalidation, imports and built-in run. No Bifrost source/profile changes or cloud resources are required. The separate reported identity-gate failure has no QS bug attribution and is outside this profile capability.
+Implementation and acceptance are complete at reviewed, pushed source commit 5563ae53b09e71945afc8d1612cc9e2aad019470. Format, Clippy and 233 tests pass with two existing ignores. Exact-head CI succeeded in both jobs at https://github.com/BrokkAi/quicksilver/actions/runs/42081690593 and the peer received the verified install handoff. The independent custom-profile CLI and mixed production-binary tests verify compilation, staging/leases, nextest policy separation, provenance, status invalidation, imports and built-in run. No Bifrost source/profile changes or cloud resources are required. The separate reported identity-gate failure has no QS bug attribution and is outside this profile capability.
 
 ## Context and Orientation
 
@@ -85,3 +85,5 @@ Plan created 2026-11-05 for the campaign's explicit compilation-profile requirem
 Implementation update 2026-11-05: focused CLI passes; full checks running. Added built-in resume provenance after audit found it bypassed captured-state checks. A mixed malformed/direct candidate test was separated to keep profile forwarding verification independent of attribution behavior; no unrelated engine fix was made.
 
 Local acceptance completed 2026-11-05: 233 tests passed with two existing ignores, format/Clippy clean. The mixed custom-profile production target regression includes child-path assertions, lease/staging protection, missing-child refusal and built-in run JSON/resume provenance. Source is ready for committed review, push and exact-head CI.
+
+Completion recorded 2026-11-05: executable head 5563ae5 is reviewed, on origin/master and green in exact-head CI. The peer may install it for the authorized profile-selected lanes; separate campaign identity/storage gates are not bypassed. This completion note changes no executable source.
