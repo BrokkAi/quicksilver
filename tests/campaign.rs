@@ -1252,6 +1252,8 @@ version = "0.1.0"
 edition = "2021"
 [workspace]
 members = ["optional-helper", "consumer"]
+[profile.measure]
+inherits = "dev"
 [features]
 default = []
 tooling = ["dep:optional_helper"]
@@ -1351,6 +1353,8 @@ fn authoring_cli() {
             .current_dir(root)
             .args([
                 "quicksilver",
+                "--cargo-profile",
+                "measure",
                 "--manifest-path",
                 "Cargo.toml",
                 "-p",
@@ -1392,6 +1396,7 @@ fn authoring_cli() {
     tool(&["map", "--json", "author-map.json"], 0);
     let map: SiteMap = serde_json::from_value(json(root, "author-map.json")).unwrap();
     assert_eq!(map.mutation_target.bin.as_deref(), Some("author-cli"));
+    assert_eq!(map.cargo_profile.0.as_deref(), Some("measure"));
     assert_eq!(map.crate_roots["mixed"], "src/author.rs");
     assert!(map.tests.iter().any(|t| t.binary_id == "mixed::cli"));
     assert!(!map
@@ -1468,6 +1473,11 @@ fn authoring_cli() {
         .join(format!("gen-{}", built.generation));
     let manifest: BinariesManifest =
         serde_json::from_slice(&fs::read(run.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest.cargo_profile.0.as_deref(), Some("measure"));
+    assert!(manifest
+        .children
+        .iter()
+        .all(|c| c.path.components().any(|p| p.as_os_str() == "measure")));
     let child = manifest
         .children
         .iter()
@@ -1607,6 +1617,14 @@ fn authoring_cli() {
         ],
         0,
     );
+    assert_eq!(
+        json(root, "author-builtin.json")["cargo_profile"],
+        "measure"
+    );
+    let profile: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.state.join("outcomes.profile.json")).unwrap())
+            .unwrap();
+    assert_eq!(profile, "measure");
     assert!(json(root, "author-builtin.json")["outcomes"]
         .as_array()
         .unwrap()
@@ -1981,4 +1999,273 @@ slow-timeout = {{ period = "500ms", terminate-after = 1, grace-period = "0s" }}
             .to_string_lossy()
             .starts_with("nextest-env-")));
     }
+}
+
+#[test]
+fn cargo_profiles_pin_compilation_and_refuse_stale_state() {
+    use cargo_quicksilver::exec::edited::Status;
+    let repo = support::setup_tiny();
+    let evidence = tempfile::tempdir().unwrap();
+    let root = repo.path();
+    let paths = support::cfg_for(root).paths();
+    fs::write(root.join(".gitignore"), "*.json\nquicksilver.toml\n").unwrap();
+    let manifest = root.join("Cargo.toml");
+    fs::write(
+        &manifest,
+        format!(
+            "{}\n[profile.measure]\ninherits='dev'\n[profile.alternate]\ninherits='dev'\n",
+            fs::read_to_string(&manifest).unwrap()
+        ),
+    )
+    .unwrap();
+    fs::create_dir_all(root.join(".config")).unwrap();
+    fs::write(
+        root.join(".config/nextest.toml"),
+        r#"
+experimental = ["wrapper-scripts"]
+[scripts.wrapper.project]
+command = ['sh', '-c', 'exec "$@"', 'project-wrapper']
+[[profile.default.scripts]]
+filter = 'all()'
+run-wrapper = 'project'
+list-wrapper = 'project'
+[profile.lane-policy]
+inherits = 'default'
+default-filter = 'not test(profile_filter_omitted)'
+"#,
+    )
+    .unwrap();
+    fs::write(
+        root.join("crate_a/build.rs"),
+        format!(
+            r#"
+use std::io::Write;
+fn main() {{
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let profile = out.ancestors().nth(3).unwrap().file_name().unwrap().to_str().unwrap();
+    println!("cargo:rustc-env=COMPILED_CARGO_PROFILE={{profile}}");
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open({:?}).unwrap();
+    writeln!(file, "{{}}", out.display()).unwrap();
+}}
+"#,
+            evidence.path().join("build-paths")
+        ),
+    )
+    .unwrap();
+    let source_path = root.join("crate_a/src/lib.rs");
+    let original = format!(
+        "{}\n{}",
+        fs::read_to_string(&source_path).unwrap(),
+        r#"
+pub fn compiled_profile() -> &'static str { env!("COMPILED_CARGO_PROFILE") }
+pub fn iterator_value() -> impl Iterator<Item=u32> { std::iter::once(1) }
+#[cfg(test)] mod profile_probes {
+    #[test] fn compilation_matches_selected_profile() {
+        assert_eq!(super::compiled_profile(), std::env::var("EXPECTED_CARGO_PROFILE").unwrap());
+        assert_eq!(super::iterator_value().collect::<Vec<_>>(), vec![1]);
+    }
+    #[test] fn profile_filter_omitted() { panic!("nextest policy must stay independent"); }
+}
+"#
+    );
+    fs::write(&source_path, &original).unwrap();
+    git(
+        root,
+        &[
+            "add",
+            ".gitignore",
+            "Cargo.toml",
+            ".config",
+            "crate_a/build.rs",
+            "crate_a/src/lib.rs",
+        ],
+    );
+    git(
+        root,
+        &[
+            "commit",
+            "-m",
+            "custom compiler profiles and independent nextest policy",
+        ],
+    );
+    let configure = |profile: &str| {
+        fs::write(root.join("quicksilver.toml"), format!("[cargo]\nprofile='{profile}'\n[map]\nnextest-profile='lane-policy'\n[test-env]\nEXPECTED_CARGO_PROFILE='{profile}'\n")).unwrap();
+    };
+    configure("measure");
+    qs(root, &["map", "--json", "profile-map.json"], 0);
+    let map: SiteMap = serde_json::from_value(json(root, "profile-map.json")).unwrap();
+    assert_eq!(map.cargo_profile.0.as_deref(), Some("measure"));
+    assert!(map.baseline_failures.is_empty() && map.not_green.is_empty());
+    assert!(!map
+        .tests
+        .iter()
+        .any(|t| t.name.ends_with("profile_filter_omitted")));
+    assert!(
+        map.tests.iter().all(|t| t.binary_rel.contains("measure/")),
+        "{:?}",
+        map.tests
+    );
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&fs::read(paths.index.join("baseline.json")).unwrap()).unwrap();
+    assert_eq!(baseline["cargo_profile"], "measure");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(map.run_dir.join("manifest.json")).unwrap()).unwrap();
+    assert_eq!(manifest["cargo_profile"], "measure");
+    let config: toml::Value =
+        toml::from_str(&fs::read_to_string(paths.index.join("nextest.toml")).unwrap()).unwrap();
+    assert_eq!(
+        config["profile"]["lane-policy"]["default-filter"].as_str(),
+        Some("not test(profile_filter_omitted)")
+    );
+    let edited = original.replace("a + b\n", "a - b\n").replace(
+        "pub fn flag() -> bool {\n    true",
+        "pub fn flag() -> bool {\n    \"not a bool\"",
+    );
+    fs::write(&source_path, edited).unwrap();
+    qs(root, &["build", "--json", "profile-build.json"], 1);
+    fs::write(&source_path, &original).unwrap();
+    let built: State = serde_json::from_value(json(root, "profile-build.json")).unwrap();
+    assert_eq!(built.cargo_profile, map.cargo_profile);
+    assert_eq!(built.records.len(), 2);
+    assert_eq!(
+        built
+            .records
+            .iter()
+            .filter(|r| matches!(r.status, Status::Unviable { .. }))
+            .count(),
+        1
+    );
+
+    qs(root, &["test", "--json", "profile-test.json"], 0);
+    let tested = json(root, "profile-test.json");
+    assert_eq!(tested["cargo_profile"], "measure");
+    assert_eq!(tested["mutants"].as_array().unwrap().len(), 1);
+    assert!(tested["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|m| m["verdict"]["kind"] == "caught"));
+    let builds = fs::read_to_string(evidence.path().join("build-paths")).unwrap();
+    assert!(!builds.is_empty());
+    assert!(
+        builds.lines().all(|p| Path::new(p)
+            .components()
+            .any(|c| c.as_os_str() == "measure")),
+        "{builds}"
+    );
+    let before_state = fs::read(State::path(&paths)).unwrap();
+    let before_map = fs::read(SiteMap::path(&paths)).unwrap();
+    let before_journal = fs::read(State::journal_path(&paths)).ok();
+    for args in [
+        vec!["--cargo-profile", "alternate", "build"],
+        vec!["build", "--rebuild", "--cargo-profile", "alternate"],
+        vec!["test", "--cargo-profile", "alternate"],
+        vec!["survivors", "--cargo-profile", "alternate"],
+        vec!["uncovered", "--cargo-profile", "alternate"],
+        vec!["pending", "--cargo-profile", "alternate"],
+    ] {
+        let out = qs(root, &args, 2);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("Cargo compilation profile differs"));
+        assert_eq!(fs::read(State::path(&paths)).unwrap(), before_state);
+        assert_eq!(fs::read(SiteMap::path(&paths)).unwrap(), before_map);
+        assert_eq!(fs::read(State::journal_path(&paths)).ok(), before_journal);
+    }
+    // Config-only drift also refuses; explicit flag replaces only the profile.
+    configure("alternate");
+    qs(root, &["test"], 2);
+    qs(
+        root,
+        &[
+            "--cargo-profile",
+            "measure",
+            "test",
+            "--json",
+            "profile-reused.json",
+        ],
+        0,
+    );
+    assert_eq!(
+        json(root, "profile-reused.json")["cargo_profile"],
+        "measure"
+    );
+    // Same-commit remap changes the build context: bodies stay, every status resets.
+    qs(root, &["map", "--json", "profile-remap.json"], 0);
+    // The first state-consuming command reconciles the remap before it can
+    // load a compiled generation or reuse a verdict.
+    qs(root, &["test", "--json", "profile-unbuilt.json"], 0);
+    assert!(json(root, "profile-unbuilt.json")["mutants"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    let state = State::load(&paths).unwrap();
+    assert_eq!(state.cargo_profile.0.as_deref(), Some("alternate"));
+    assert_eq!(state.records.len(), 2);
+    assert!(state
+        .records
+        .iter()
+        .all(|r| matches!(r.status, Status::Pending)));
+    // Imports across profiles revalidate bodies and never import verdicts.
+    let out = qs(
+        root,
+        &[
+            "build",
+            "--from",
+            "profile-test.json",
+            "--json",
+            "profile-import.json",
+        ],
+        1,
+    );
+    assert!(String::from_utf8_lossy(&out.stderr)
+        .contains("previous coverage, binaries and verdicts are not imported"));
+    let imported: State = serde_json::from_value(json(root, "profile-import.json")).unwrap();
+    assert_eq!(imported.cargo_profile.0.as_deref(), Some("alternate"));
+    assert!(imported
+        .records
+        .iter()
+        .all(|r| !matches!(r.status, Status::Tested { .. })));
+    qs(root, &["test", "--json", "profile-final.json"], 0);
+    assert_eq!(
+        json(root, "profile-final.json")["cargo_profile"],
+        "alternate"
+    );
+    // An independent direct build exercises the same profile forwarding.
+    // Keep it separate from intentionally malformed candidates so isolation
+    // diagnostics are not coupled to an unrelated opaque-return site.
+    State::default().save(&paths).unwrap();
+    fs::write(
+        &source_path,
+        original.replace("{ std::iter::once(1) }", "{ std::iter::once(2) }"),
+    )
+    .unwrap();
+    qs(root, &["build", "--json", "profile-direct.json"], 0);
+    fs::write(&source_path, &original).unwrap();
+    let direct: State = serde_json::from_value(json(root, "profile-direct.json")).unwrap();
+    assert!(matches!(
+        direct.records[0].status,
+        Status::Built { direct: true, .. }
+    ));
+    assert_eq!(direct.cargo_profile, state.cargo_profile);
+    qs(root, &["test", "--json", "profile-direct-test.json"], 0);
+    assert_eq!(
+        json(root, "profile-direct-test.json")["mutants"][0]["verdict"]["kind"],
+        "caught"
+    );
+    // Profile is part of preflight reuse, apart from feature selection.
+    let features = Default::default();
+    assert_ne!(
+        cargo_quicksilver::baseline::preflight_key_with_profile(
+            root,
+            &features,
+            &map.cargo_profile
+        )
+        .unwrap(),
+        cargo_quicksilver::baseline::preflight_key_with_profile(
+            root,
+            &features,
+            &state.cargo_profile
+        )
+        .unwrap(),
+    );
 }

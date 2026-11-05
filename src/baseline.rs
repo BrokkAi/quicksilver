@@ -86,6 +86,8 @@ pub fn run_green_suite(
         apply_build_env(&mut cmd, cfg);
         cmd.args(["nextest", "run"]);
         cfg.cargo_features.apply(&mut cmd);
+        cfg.cargo_profile
+            .apply(&mut cmd, crate::cargo_profile::Frontend::Nextest);
         cmd.args(["--profile", &cfg.nextest_profile]);
         cmd.arg("--config-file").arg(&config.path);
         crate::cargo_cmd::apply_package_select(
@@ -408,6 +410,8 @@ pub fn preflight_recompile_count(cfg: &Config, paths: &Paths, mutant: &Mutant) -
     // to the mutant package misses the cascade this preflight exists to catch.
     cmd.args(["build", "--tests", "-v"]);
     cfg.cargo_features.apply(&mut cmd);
+    cfg.cargo_profile
+        .apply(&mut cmd, crate::cargo_profile::Frontend::Cargo);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     let output = cmd.output().context("preflight rebuild")?;
@@ -428,6 +432,14 @@ pub fn preflight_key_with_features(
     root: &Path,
     features: &crate::features::CargoFeatures,
 ) -> Result<String> {
+    preflight_key_with_profile(root, features, &Default::default())
+}
+
+pub fn preflight_key_with_profile(
+    root: &Path,
+    features: &crate::features::CargoFeatures,
+    profile: &crate::cargo_profile::CargoProfile,
+) -> Result<String> {
     use sha2::Digest;
     let meta = crate::cargo_cmd::load_metadata_with_features(root, features)?;
     let mut files: Vec<std::path::PathBuf> = vec![
@@ -446,6 +458,7 @@ pub fn preflight_key_with_features(
     files.dedup();
     let mut h = sha2::Sha256::new();
     h.update(serde_json::to_vec(features)?);
+    h.update(serde_json::to_vec(profile)?);
     for f in files {
         let rel = f.strip_prefix(root).unwrap_or(&f);
         h.update(crate::util::rel_slash(rel).as_bytes());
@@ -501,6 +514,7 @@ pub fn prepare_baseline_reusing_timings(cfg: &Config, paths: &Paths) -> Result<B
     if let Some(mut earlier) = load_baseline_report(paths)? {
         if !earlier.tests.is_empty()
             && earlier.cargo_features == cfg.cargo_features
+            && earlier.cargo_profile == cfg.cargo_profile
             && earlier.mutation_target == cfg.mutation_target
         {
             let _meta = materialize_and_metadata(cfg, paths)?;
@@ -521,13 +535,16 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     let _meta = materialize_and_metadata(cfg, paths)?;
     if skip {
         if let Some(existing) = load_baseline_report(paths)?.filter(|r| {
-            r.cargo_features == cfg.cargo_features && r.mutation_target == cfg.mutation_target
+            r.cargo_features == cfg.cargo_features
+                && r.mutation_target == cfg.mutation_target
+                && r.cargo_profile == cfg.cargo_profile
         }) {
             return Ok(existing);
         }
         return Ok(BaselineReport {
             mutation_target: cfg.mutation_target.clone(),
             cargo_features: cfg.cargo_features.clone(),
+            cargo_profile: cfg.cargo_profile.clone(),
             suite_secs: 0.0,
             tests: Vec::new(),
             package_costs: Vec::new(),
@@ -541,6 +558,7 @@ pub fn prepare_baseline(cfg: &Config, paths: &Paths, skip: bool) -> Result<Basel
     let report = BaselineReport {
         mutation_target: cfg.mutation_target.clone(),
         cargo_features: cfg.cargo_features.clone(),
+        cargo_profile: cfg.cargo_profile.clone(),
         suite_secs,
         tests,
         package_costs: Vec::new(),

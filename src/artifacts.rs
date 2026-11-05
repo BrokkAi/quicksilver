@@ -243,6 +243,8 @@ pub(crate) fn build(
         .arg(&bin);
     cmd.args(["--", "build", "--tests", "--message-format=json"]);
     cfg.cargo_features.apply(&mut cmd);
+    cfg.cargo_profile
+        .apply(&mut cmd, crate::cargo_profile::Frontend::Cargo);
     crate::cargo_cmd::apply_package_select(&mut cmd, packages);
     crate::scratch::check_free_space(&copies.dir, cfg.max_scratch)?;
     let start = std::time::Instant::now();

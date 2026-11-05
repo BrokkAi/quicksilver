@@ -304,6 +304,7 @@ pub fn run_prove(common: &CommonOpts, args: ProveArgs) -> Result<i32> {
         require_checkout(&cfg.repo_root, &cfg.worktree_root)?;
         let state = State::load(&cfg.paths())?;
         state.cargo_features.require_match(&cfg.cargo_features)?;
+        state.cargo_profile.require_match(&cfg.cargo_profile)?;
         state.mutation_target.require_match(&cfg.mutation_target)?;
         let mutant = resolve_mutant(&state, &args.id)?;
         crate::production::require_physical_target(&cfg, mutant)?;

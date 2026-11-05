@@ -8,6 +8,8 @@ use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonReport {
+    #[serde(default)]
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     /// The target triple the verdicts were measured on: a survivor on one
     /// platform can be killed on another.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -116,8 +118,18 @@ pub fn print_outcomes(outcomes: &[Outcome], cargo_invocations: u64) {
 }
 
 pub fn write_json(path: &Path, outcomes: &[Outcome], cargo_invocations: u64) -> Result<()> {
+    write_json_with_profile(path, outcomes, cargo_invocations, &Default::default())
+}
+
+pub fn write_json_with_profile(
+    path: &Path,
+    outcomes: &[Outcome],
+    cargo_invocations: u64,
+    profile: &crate::cargo_profile::CargoProfile,
+) -> Result<()> {
     let counts = OutcomeCounts::from_outcomes(outcomes);
     let mut report = JsonReport {
+        cargo_profile: profile.clone(),
         target: crate::target::host_triple(Path::new(".")).ok(),
         outcomes: outcomes.to_vec(),
         counts: CountReport::from(&counts),

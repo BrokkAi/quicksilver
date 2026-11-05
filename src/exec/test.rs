@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BinariesManifest {
+    #[serde(default)]
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     /// Version 1 records ordinary child outputs as well as test harnesses.
     #[serde(default)]
     pub artifact_schema: u32,

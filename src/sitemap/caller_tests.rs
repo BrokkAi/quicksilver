@@ -34,6 +34,7 @@ fn map(repo: &Path, sites: Vec<MapSite>) -> SiteMap {
     SiteMap {
         mutation_target: Default::default(),
         cargo_features: Default::default(),
+        cargo_profile: Default::default(),
         version: MAP_VERSION,
         map_id: "fixture".into(),
         commit: git(repo, &["rev-parse", "HEAD"]),

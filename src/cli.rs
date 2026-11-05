@@ -21,7 +21,7 @@ pub struct CommonOpts {
     pub bin: Option<String>,
 
     /// Cargo features (comma or space separated; repeatable). Explicit feature
-    /// flags replace the complete [cargo] selection in quicksilver.toml.
+    /// flags replace the [cargo] feature selection in quicksilver.toml.
     #[arg(long, global = true)]
     pub features: Vec<String>,
     /// Activate all Cargo features.
@@ -30,6 +30,11 @@ pub struct CommonOpts {
     /// Disable Cargo default features.
     #[arg(long, global = true)]
     pub no_default_features: bool,
+
+    /// Cargo compilation profile; overrides [cargo] profile. Omit for Cargo's
+    /// command defaults. Independent of [map] nextest-profile test policy.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub cargo_profile: Option<String>,
 
     /// Builds to run at once. Defaults to what the machine's memory allows.
     #[arg(long, global = true)]

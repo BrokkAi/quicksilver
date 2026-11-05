@@ -209,6 +209,8 @@ pub(crate) fn prepare(cfg: &Config, paths: &Paths) -> Result<Prepared> {
             &crate::cargo_cmd::test_packages(cfg, &meta),
         );
         cfg.cargo_features.apply(&mut cmd);
+        cfg.cargo_profile
+            .apply(&mut cmd, crate::cargo_profile::Frontend::Nextest);
         let output = cmd
             .output()
             .context("list nextest binaries for wrapper composition")?;

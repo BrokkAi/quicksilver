@@ -66,6 +66,8 @@ pub fn list_tests_plain(cfg: &Config, paths: &Paths) -> Result<Vec<TestInfo>> {
     }
     apply_package_select(&mut cmd, &test_packages(cfg, &meta));
     cfg.cargo_features.apply(&mut cmd);
+    cfg.cargo_profile
+        .apply(&mut cmd, crate::cargo_profile::Frontend::Nextest);
     let out = cmd.output().context("cargo nextest list")?;
     if !out.status.success() {
         bail!(

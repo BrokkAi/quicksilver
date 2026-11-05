@@ -122,6 +122,8 @@ pub struct State {
     pub mutation_target: crate::production::Selection,
     #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
+    #[serde(default)]
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     /// The map these records were built against.
     pub map_id: String,
     /// That map's commit and test packages. A new map of the same commit
@@ -238,11 +240,12 @@ impl State {
     /// stay valid too. With other test packages, the generation lacks the
     /// new test binaries: unviable mutants and kills stay, and every other
     /// mutant goes back to pending, to be compiled by the next `build` and
-    /// tested against the new map's tests. A feature selection change resets
+    /// tested against the new map's tests. A feature or compilation profile change resets
     /// every retained status, including kills and compile failures.
     pub(crate) fn reconcile(&mut self, map: &SiteMap) -> Reconciled {
         if self.map_id == map.map_id
             && self.cargo_features == map.cargo_features
+            && self.cargo_profile == map.cargo_profile
             && self.mutation_target == map.mutation_target
         {
             return Reconciled::default();
@@ -258,6 +261,7 @@ impl State {
                 test_packages: map.test_packages.clone(),
                 mutation_target: map.mutation_target.clone(),
                 cargo_features: map.cargo_features.clone(),
+                cargo_profile: map.cargo_profile.clone(),
                 build_env: map.build_env.clone(),
                 generation: 0,
                 records: Vec::new(),
@@ -279,7 +283,7 @@ impl State {
             kept: self.records.len(),
             ..Reconciled::default()
         };
-        if self.cargo_features != map.cargo_features {
+        if self.cargo_features != map.cargo_features || self.cargo_profile != map.cargo_profile {
             for r in &mut self.records {
                 if !matches!(r.status, Status::Pending) {
                     done.recompile += 1;
@@ -303,6 +307,7 @@ impl State {
         self.test_packages = map.test_packages.clone();
         self.build_env = map.build_env.clone();
         self.cargo_features = map.cargo_features.clone();
+        self.cargo_profile = map.cargo_profile.clone();
         done
     }
 }
@@ -316,7 +321,7 @@ pub struct Reconciled {
     /// Records kept from an earlier map of the same commit.
     pub kept: usize,
     /// Kept records that need compiling again, because the new map has
-    /// other test packages.
+    /// other test packages, features or compilation profile.
     pub recompile: usize,
 }
 
@@ -331,7 +336,7 @@ impl Reconciled {
         }
         if self.kept > 0 && self.recompile > 0 {
             eprintln!(
-                "kept {} mutant(s) captured against an earlier map of this commit; {} of them will be compiled again for the new map's test packages or build settings and tested against its tests (kills and unviable mutants stay)",
+                "kept {} mutant(s) captured against an earlier map of this commit; {} of them will be compiled again for the new map's test packages or build settings and tested against its tests",
                 self.kept, self.recompile
             );
         } else if self.kept > 0 {
@@ -714,6 +719,10 @@ pub fn build_map(cfg: &Config, paths: &Paths) -> Result<SiteMap> {
         "Cargo feature selection: {}",
         serde_json::to_string(&cfg.cargo_features)?
     );
+    info!(
+        "Cargo compilation profile: {}",
+        serde_json::to_string(&cfg.cargo_profile)?
+    );
     crate::baseline::checkout_main(cfg, paths)?;
     let _target_lease = crate::artifacts::TargetLease::if_needed(cfg, &paths.baseline)?;
     let baseline = crate::baseline::prepare_baseline(cfg, paths, false)?;
@@ -904,6 +913,7 @@ fn build_map_with_failures(
     let map = SiteMap {
         mutation_target: cfg.mutation_target.clone(),
         cargo_features: cfg.cargo_features.clone(),
+        cargo_profile: cfg.cargo_profile.clone(),
         version: crate::sitemap::MAP_VERSION,
         map_id: crate::sitemap::random_id(),
         commit: commit.clone(),
@@ -1013,6 +1023,7 @@ fn load_for_build(cfg: &Config, paths: &Paths) -> Result<(SiteMap, State, BuildR
     let map = SiteMap::load(paths)?
         .context("no map for this repository; run `cargo quicksilver map` first")?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.cargo_profile.require_match(&cfg.cargo_profile)?;
     map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(paths)?;
     let reconciled = state.reconcile(&map);
@@ -1891,6 +1902,7 @@ pub fn test(
     let map = SiteMap::load(paths)?
         .context("no map in this scratch session; run `cargo quicksilver map` first")?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.cargo_profile.require_match(&cfg.cargo_profile)?;
     map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(paths)?;
     let reconciled = state.reconcile(&map);
@@ -2345,6 +2357,7 @@ mod tests {
         SiteMap {
             mutation_target: Default::default(),
             cargo_features: Default::default(),
+            cargo_profile: Default::default(),
             version: crate::sitemap::MAP_VERSION,
             map_id: map_id.into(),
             commit: commit.into(),
@@ -2420,6 +2433,7 @@ mod tests {
             test_packages: map.test_packages.clone(),
             mutation_target: map.mutation_target.clone(),
             cargo_features: map.cargo_features.clone(),
+            cargo_profile: map.cargo_profile.clone(),
             build_env: map.build_env.clone(),
             generation: 3,
             records: vec![
@@ -2474,6 +2488,56 @@ mod tests {
                 (r.mutant.id.clone(), s)
             })
             .collect()
+    }
+
+    #[test]
+    fn profile_changes_invalidate_every_status_and_legacy_maps_require_defaults() {
+        let old = map_of("same-map", "c1", &["p"]);
+        let mut state = state_for(&old);
+        let mut new = old.clone();
+        new.cargo_profile = crate::cargo_profile::CargoProfile(Some("measure".into()));
+        let done = state.reconcile(&new);
+        assert_eq!(done.recompile, 4);
+        assert_eq!(done.kept, 5);
+        assert!(state
+            .records
+            .iter()
+            .all(|r| matches!(r.status, Status::Pending)));
+        assert_eq!(state.cargo_profile, new.cargo_profile);
+        let mut serialized_state = serde_json::to_value(state_for(&old)).unwrap();
+        serialized_state
+            .as_object_mut()
+            .unwrap()
+            .remove("cargo_profile");
+        assert!(serde_json::from_value::<State>(serialized_state)
+            .unwrap()
+            .cargo_profile
+            .is_default());
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = Paths::for_tree(&tmp.path().join("worktrees"), "", tmp.path());
+        std::fs::create_dir_all(&paths.index).unwrap();
+        let mut json = serde_json::to_value(&old).unwrap();
+        json.as_object_mut().unwrap().remove("cargo_profile");
+        for version in [7, 8, 9, 10] {
+            json["version"] = version.into();
+            crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
+                .unwrap();
+            assert!(SiteMap::load(&paths)
+                .unwrap()
+                .unwrap()
+                .cargo_profile
+                .is_default());
+            json["cargo_profile"] = serde_json::json!("measure");
+            crate::util::write_atomic(&SiteMap::path(&paths), serde_json::to_vec(&json).unwrap())
+                .unwrap();
+            assert!(SiteMap::load(&paths).is_err());
+            json.as_object_mut().unwrap().remove("cargo_profile");
+        }
+        new.save(&paths).unwrap();
+        assert_eq!(
+            SiteMap::load(&paths).unwrap().unwrap().cargo_profile,
+            new.cargo_profile
+        );
     }
 
     #[test]

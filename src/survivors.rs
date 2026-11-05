@@ -314,6 +314,7 @@ pub fn run(common: &CommonOpts, args: SurvivorsArgs) -> Result<i32> {
         crate::types::baseline_failure_summary(&map.baseline_failures)
     );
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.cargo_profile.require_match(&cfg.cargo_profile)?;
     map.mutation_target.require_match(&cfg.mutation_target)?;
     let mut state = State::load(&paths)?;
     state.reconcile(&map);

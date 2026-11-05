@@ -90,6 +90,7 @@ pub fn cfg_for(repo: &Path) -> cargo_quicksilver::config::Config {
     Config {
         mutation_target: Default::default(),
         cargo_features: Default::default(),
+        cargo_profile: Default::default(),
         repo_root: repo.to_path_buf(),
         worktree_root: cargo_quicksilver::worktree::root(&git),
         prefix: git.prefix,

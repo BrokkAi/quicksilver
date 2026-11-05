@@ -4,6 +4,7 @@ pub mod baseline;
 mod baseline_env;
 pub mod capture;
 pub mod cargo_cmd;
+pub mod cargo_profile;
 pub mod carry;
 pub mod cli;
 pub mod config;
@@ -241,6 +242,7 @@ fn cmd_uncovered(common: &cli::CommonOpts, args: cli::UncoveredArgs) -> Result<i
     let head = worktree::head(&cfg.repo_root)?;
     let map = exec::edited::map_at(&cfg.paths(), &head)?;
     map.cargo_features.require_match(&cfg.cargo_features)?;
+    map.cargo_profile.require_match(&cfg.cargo_profile)?;
     map.mutation_target.require_match(&cfg.mutation_target)?;
     if args.not_green {
         print!("{}", not_green_report(&map));
@@ -407,6 +409,7 @@ fn cmd_test(common: &cli::CommonOpts, args: cli::TestArgs) -> Result<i32> {
             "commit": map.as_ref().map(|m| m.commit.clone()),
             "target": map.as_ref().map(|m| m.target.clone()),
             "cargo_features": state.cargo_features,
+            "cargo_profile": state.cargo_profile,
             "mutation_target": state.mutation_target,
             "baseline_failures": map.as_ref().map(|m| &m.baseline_failures),
             "mutants": rows,

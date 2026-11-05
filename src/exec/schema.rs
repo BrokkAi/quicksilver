@@ -7,7 +7,7 @@ use crate::exec::test::{
     run_mutant_tests_observed, run_mutant_tests_with_env, BinariesManifest, ManifestTest,
     TestRunPolicy,
 };
-use crate::exec::{append_outcome, load_resume, ExecResult};
+use crate::exec::{append_outcome, prepare_outcomes, ExecResult};
 use crate::plan::Plan;
 use crate::schema::{
     attribute_spans, build_sites, chunk_sites, disable_attributed, disable_sites, inject_runtime,
@@ -49,11 +49,11 @@ pub fn execute(
     limit: usize,
 ) -> Result<ExecResult> {
     let mut outcomes = Vec::new();
-    let decided = if cfg.resume {
-        load_resume(&paths.state.join("outcomes.jsonl"))?
-    } else {
-        Vec::new()
-    };
+    let decided = prepare_outcomes(
+        &paths.state.join("outcomes.jsonl"),
+        &cfg.cargo_profile,
+        cfg.resume,
+    )?;
     let decided_ids: std::collections::HashSet<String> =
         decided.iter().map(|o| o.mutant.id.clone()).collect();
     outcomes.extend(decided);
@@ -1123,6 +1123,7 @@ fn stage_tests_inner(
         .collect::<Result<Vec<_>>>()?;
     crate::production::require_selected_binary(cfg, tree, executables)?;
     let manifest = BinariesManifest {
+        cargo_profile: cfg.cargo_profile.clone(),
         artifact_schema: 1,
         children,
         mutant_id: "schema".into(),

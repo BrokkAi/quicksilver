@@ -237,9 +237,10 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
     // Preflight costs a whole workspace rebuild, and its answer depends only
     // on manifests and build scripts. Measure once per scratch session and
     // again when one of those changes, not on every per-commit run.
-    let key = match crate::baseline::preflight_key_with_features(
+    let key = match crate::baseline::preflight_key_with_profile(
         &prepared.paths.baseline,
         &prepared.cfg.cargo_features,
+        &prepared.cfg.cargo_profile,
     ) {
         Ok(key) => Some(key),
         Err(err) => {
@@ -279,7 +280,12 @@ pub fn maybe_preflight(prepared: &Prepared) -> Result<Option<u64>> {
 pub fn write_outputs(cfg: &Config, outcomes: &[Outcome], cargo_invocations: u64) -> Result<()> {
     crate::report::print_outcomes(outcomes, cargo_invocations);
     if let Some(path) = &cfg.json {
-        crate::report::write_json(path, outcomes, cargo_invocations)?;
+        crate::report::write_json_with_profile(
+            path,
+            outcomes,
+            cargo_invocations,
+            &cfg.cargo_profile,
+        )?;
     }
     Ok(())
 }

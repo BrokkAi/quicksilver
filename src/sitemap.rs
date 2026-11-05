@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+// Version 11 pins the optional Cargo compilation profile.
 // Version 10 pins explicit production target selection.
 // Version 9 supports tracked shared production sources outside the workspace.
 // Version 8 pins Cargo features; version 7 predates feature selection and
 // remains usable under Cargo defaults. Older binaries refuse newer maps.
-pub const MAP_VERSION: u32 = 10;
+pub const MAP_VERSION: u32 = 11;
 
 /// (path, fqn, why) for a function without a site.
 pub type Dropped = (String, String, String);
@@ -51,6 +52,8 @@ pub struct SiteMap {
     pub mutation_target: crate::production::Selection,
     #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
+    #[serde(default)]
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     pub version: u32,
     /// Random per `map` run. The mutant state records which map it was built
     /// against, so a new map invalidates old `Built` records.
@@ -132,9 +135,12 @@ impl SiteMap {
             serde_json::from_str(&text).with_context(|| format!("parse {}", p.display()))?;
         anyhow::ensure!(
             map.version == MAP_VERSION
-                || (map.mutation_target.is_default()
-                    && (matches!(map.version, 8 | 9)
-                        || (map.version == 7 && map.cargo_features == Default::default()))),
+                || (map.cargo_profile.is_default()
+                    && (map.version == 10
+                        || (map.mutation_target.is_default()
+                            && (matches!(map.version, 8 | 9)
+                                || (map.version == 7
+                                    && map.cargo_features == Default::default()))))),
             "{} is map version {}, this build reads {}; run `cargo quicksilver map` again",
             p.display(),
             map.version,
@@ -718,6 +724,7 @@ mod tests {
         let map = SiteMap {
             mutation_target: Default::default(),
             cargo_features: Default::default(),
+            cargo_profile: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),
             commit: String::new(),
@@ -783,6 +790,7 @@ mod tests {
         let mut map = SiteMap {
             mutation_target: Default::default(),
             cargo_features: Default::default(),
+            cargo_profile: Default::default(),
             version: MAP_VERSION,
             map_id: "x".into(),
             commit: String::new(),

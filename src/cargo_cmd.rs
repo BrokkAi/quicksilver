@@ -402,6 +402,8 @@ pub fn build_tests(
     apply_build_env(&mut cmd, cfg);
     cmd.arg("build").arg("--tests");
     cfg.cargo_features.apply(&mut cmd);
+    cfg.cargo_profile
+        .apply(&mut cmd, crate::cargo_profile::Frontend::Cargo);
     // One cargo invocation with repeated -p. Separate `cargo build -p X` per
     // package pays startup + lock + fingerprint 2-4x on the compile-bound path.
     apply_package_select(&mut cmd, packages);

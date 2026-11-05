@@ -49,6 +49,15 @@ pub fn capture_from(map: &SiteMap, repo: &Path, source: &Path) -> Result<Capture
     if prior_features != map.cargo_features {
         eprintln!("carrying bodies to a different Cargo feature selection; previous coverage, binaries and verdicts are not imported");
     }
+    let prior_profile: crate::cargo_profile::CargoProfile = serde_json::from_value(
+        json.get("cargo_profile")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .context("read source Cargo compilation profile")?;
+    if prior_profile != map.cargo_profile {
+        eprintln!("carrying bodies to a different Cargo compilation profile; previous coverage, binaries and verdicts are not imported");
+    }
     let saved: Vec<SavedMutant> = if let Some(records) =
         json.get("records").and_then(|v| v.as_array())
     {
@@ -200,6 +209,7 @@ mod tests {
         let map = SiteMap {
             mutation_target: Default::default(),
             cargo_features: Default::default(),
+            cargo_profile: Default::default(),
             version: crate::sitemap::MAP_VERSION,
             map_id: "new".into(),
             commit: "new-commit".into(),

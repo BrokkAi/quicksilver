@@ -368,6 +368,8 @@ pub struct BaselineReport {
     pub mutation_target: crate::production::Selection,
     #[serde(default)]
     pub cargo_features: crate::features::CargoFeatures,
+    #[serde(default)]
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     pub suite_secs: f64,
     pub tests: Vec<TestInfo>,
     pub package_costs: Vec<PackageCost>,

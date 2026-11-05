@@ -471,7 +471,7 @@ workspace root.
 | `extra-tests = [...]` | Test binaries of other packages to add, as `--extra-tests`. |
 | `[package.<name>] extra-tests` | The same, only when `--package <name>` is given. |
 | `[mutation]` | One production source target: `bin = "name"` or `lib = true`, with exactly one package. |
-| `[cargo]` | Cargo `features`, `all-features` and `no-default-features`, pinned for the campaign. |
+| `[cargo]` | Cargo compilation `profile` and feature selection, pinned for the campaign. |
 | `[build-env]` | Variables for every build and baseline test run. |
 | `[map] nextest-profile` | Project nextest profile for the baseline and test catalog; defaults to `default`. |
 | `[map] fail-on-extra-baseline` | When true, baseline failures in extra suites also block mapping. |
@@ -571,17 +571,16 @@ no-default-features = false
 With no settings, Cargo's normal defaults apply. `--features` accepts comma
 or space separated names and can be repeated. Any explicit feature flag
 (`--features`, `--all-features` or `--no-default-features`) replaces the
-complete `[cargo]` selection for that command. `--features ''` explicitly
-chooses Cargo defaults. Cargo's normal feature unification still applies:
+`[cargo]` feature selection for that command; it preserves the Cargo
+profile. `--features ''` explicitly chooses Cargo defaults. Cargo's normal feature unification still applies:
 a dependency can re-enable a feature even with `--no-default-features`.
 
 The selection reaches metadata, baseline tests, the nextest catalog and all
 schema builds, including `build --rebuild` and the built-in `run` command.
 Map, baseline, build and test JSON record it as `cargo_features`. New maps
-use format version 10, which older binaries refuse; versions 8–9 maps and
-version 7 maps with their original Cargo defaults remain readable under
-their original implicit production-target selection. Build,
-rebuild and test reject settings different from the map. To change the
+use format version 11, which older binaries refuse. Versions 7–10 remain
+readable with their original default compilation profile and existing
+feature/production-target restrictions. Build, rebuild and test reject settings different from the map. To change the
 selection, map again; captured mutants at the same commit are retained but
 all compiled statuses and verdicts, including kills and compile failures,
 require rebuilding. `build --from` carries bodies and notes into the new
@@ -611,6 +610,42 @@ RUSTFLAGS = "--cfg scheduled_tests"
 As with cargo, `RUSTFLAGS` replaces the rustflags from `.cargo/config.toml`
 and from your environment, so repeat any you need. The map records these
 settings; `build` warns when they changed since `map`.
+
+### Cargo compilation profile
+
+Use a profile defined by the project, for example `measure`:
+
+```
+cargo quicksilver --cargo-profile measure map
+cargo quicksilver --cargo-profile measure build
+cargo quicksilver --cargo-profile measure test
+```
+
+Or save it independently of nextest's test policy in `quicksilver.toml`:
+
+```toml
+[cargo]
+profile = "measure"
+
+[map]
+nextest-profile = "scheduled"
+```
+
+With no Cargo profile setting, each Cargo command uses its normal defaults.
+`--cargo-profile` overrides only `[cargo] profile`; feature flags override
+only the feature selection. The option reaches baseline builds and tests,
+test listing, schema retries and bisection, direct variants and the built-in
+`run` command. Quicksilver uses Cargo's reported output paths and existing
+mbx target leases for custom-profile artifacts.
+
+Map, baseline, build state, staged manifests and test/run JSON record the
+selection as `cargo_profile` (null for command defaults). Build, rebuild and
+test refuse a profile different from the map before changing saved mutant
+state. To change profile, map again and build: retained bodies require fresh
+compilation and verdicts, including former kills and unviable mutants.
+`build --from` imports bodies and notes across profiles, with no verdicts,
+coverage or binaries. Built-in `run --resume` also refuses outcomes recorded
+under another profile; start a new run without `--resume` in that case.
 
 ### Baseline policy and excluded tests
 

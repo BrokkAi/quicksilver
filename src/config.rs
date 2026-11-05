@@ -12,7 +12,7 @@ pub struct FileConfig {
     #[serde(default)]
     pub mutation: crate::production::Selection,
     #[serde(default)]
-    pub cargo: crate::features::CargoFeatures,
+    pub cargo: CargoFile,
     #[serde(rename = "build-jobs")]
     pub build_jobs: Option<usize>,
     #[serde(rename = "test-jobs")]
@@ -36,6 +36,15 @@ pub struct FileConfig {
     pub sandbox: SandboxFile,
     #[serde(default)]
     pub map: MapFile,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, deny_unknown_fields, rename_all = "kebab-case")]
+pub struct CargoFile {
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -74,6 +83,7 @@ pub struct SandboxFile {
 pub struct Config {
     pub mutation_target: crate::production::Selection,
     pub cargo_features: crate::features::CargoFeatures,
+    pub cargo_profile: crate::cargo_profile::CargoProfile,
     pub repo_root: PathBuf,
     /// `<git common dir>/quicksilver`: where QS's worktrees live.
     pub worktree_root: PathBuf,
@@ -176,9 +186,17 @@ pub fn merge_config(
                 no_default_features: cli.no_default_features,
             }
         } else {
-            file.cargo.clone()
+            crate::features::CargoFeatures {
+                features: file.cargo.features.clone(),
+                all_features: file.cargo.all_features,
+                no_default_features: file.cargo.no_default_features,
+            }
         };
     cargo_features.normalize();
+    let cargo_profile = crate::cargo_profile::CargoProfile(
+        cli.cargo_profile.clone().or(file.cargo.profile.clone()),
+    );
+    cargo_profile.validate()?;
     let mutation_target = if cli.lib || cli.bin.is_some() {
         crate::production::Selection {
             lib: cli.lib,
@@ -205,6 +223,7 @@ pub fn merge_config(
     Ok(Config {
         mutation_target,
         cargo_features,
+        cargo_profile,
         repo_root,
         worktree_root: crate::worktree::root(&repo),
         prefix: repo.prefix,
@@ -321,6 +340,39 @@ extra-tests = ["unselected"]
 mod feature_tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn profile_and_feature_overrides_are_independent() {
+        let file: FileConfig = toml::from_str("[cargo]\nprofile='measure'\nfeatures=['advanced']\n[map]\nnextest-profile='scheduled'\n").unwrap();
+        let merge = |args: &[&str]| {
+            let cli = crate::cli::Cli::parse_from(args);
+            merge_config(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")),
+                file.clone(),
+                &cli.common,
+                ConfigExtras::default(),
+            )
+            .unwrap()
+        };
+        let configured = merge(&["qs", "map"]);
+        assert_eq!(configured.cargo_profile.0.as_deref(), Some("measure"));
+        assert_eq!(configured.nextest_profile, "scheduled");
+        let explicit_features = merge(&["qs", "map", "--features", ""]);
+        assert_eq!(explicit_features.cargo_features, Default::default());
+        assert_eq!(explicit_features.cargo_profile, configured.cargo_profile);
+        let explicit_profile = merge(&["qs", "map", "--cargo-profile", "dev"]);
+        assert_eq!(explicit_profile.cargo_profile.0.as_deref(), Some("dev"));
+        assert_eq!(explicit_profile.cargo_features, configured.cargo_features);
+        assert_eq!(explicit_profile.nextest_profile, "scheduled");
+        assert_eq!(
+            merge(&["qs", "--cargo-profile", "test", "map"])
+                .cargo_profile
+                .0
+                .as_deref(),
+            Some("test")
+        );
+        assert!(toml::from_str::<FileConfig>("[cargo]\nunknown=true").is_err());
+    }
 
     #[test]
     fn feature_cli_replaces_config_and_canonicalizes_cargo_syntax() {

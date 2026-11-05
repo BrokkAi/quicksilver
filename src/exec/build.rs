@@ -75,13 +75,6 @@ pub(crate) fn resolve_binary(
     if candidate.is_file() {
         return Ok(candidate);
     }
-    if let Some(key) = &exact_name {
-        // cargo uses the profile dir name; tests build in `debug`.
-        let p = target_dir.join("debug").join("deps").join(key);
-        if p.is_file() {
-            return Ok(p);
-        }
-    }
     anyhow::bail!(
         "could not locate test binary for {} (rel {}, base {})",
         test.id,
@@ -235,6 +228,20 @@ mod tests {
             duration_secs: 0.1,
             cpu_secs: None,
         }
+    }
+
+    #[test]
+    fn a_custom_profile_never_falls_back_to_a_debug_artifact() {
+        let w = Worker::new();
+        let name = "core-1111111111111111";
+        fs::create_dir_all(w.target().join("debug/deps")).unwrap();
+        fs::write(w.target().join("debug/deps").join(name), "stale").unwrap();
+        let t = test(&format!("measure/deps/{name}"), "");
+        assert!(resolve_binary(&w.target(), &t, &[]).is_err());
+        fs::create_dir_all(w.target().join("measure/deps")).unwrap();
+        let expected = w.target().join(&t.binary_rel);
+        fs::write(&expected, "right profile").unwrap();
+        assert_eq!(resolve_binary(&w.target(), &t, &[]).unwrap(), expected);
     }
 
     #[test]
